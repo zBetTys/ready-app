@@ -1,0 +1,1733 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'dart:async';
+import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:uuid/uuid.dart';
+import 'package:intl/intl.dart';
+import 'package:image/image.dart' as img;
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:flutter/services.dart';
+
+class AutoCapturePage extends StatefulWidget {
+  const AutoCapturePage({super.key});
+
+  @override
+  State<AutoCapturePage> createState() => _AutoCapturePageState();
+}
+
+class _AutoCapturePageState extends State<AutoCapturePage>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
+  // ================ Camera & Detection ================
+  CameraController? _cameraController;
+  bool _isCameraReady = false;
+  FaceDetector? _faceDetector;
+  Face? _currentFace;
+  List<Face> _faceHistory = [];
+
+  // ================ Face Recognition Model ================
+  Interpreter? _faceModel;
+  bool _modelLoaded = false;
+
+  // 🔥 MobileFaceNet Configuration (128 มิติ)
+  static const String MODEL_NAME = "mobilefacenet";
+  static const String EMBEDDING_VERSION = "v2.0";
+  static const int EMBEDDING_DIMENSION = 128; // ✅ ใช้ 128 มิติ
+  static const List<int> MODEL_INPUT_SHAPE = [1, 112, 112, 3];
+  static const int FACE_CROP_SIZE = 112;
+  static const double FACE_PADDING_RATIO = 0.25;
+
+  // 🔥 Similarity Thresholds (ปรับให้เหมาะสม)
+  static const double VERIFICATION_THRESHOLD = 0.68; // 1:1 Verification
+  static const double IDENTIFICATION_THRESHOLD = 0.72; // 1:N Identification
+  static const double ENROLLMENT_CONSISTENCY = 0.70; // Enrollment
+  static const double MIN_EMBEDDING_QUALITY = 0.65; // คุณภาพขั้นต่ำ
+
+  // ================ Capture States ================
+  bool _isProcessing = false;
+  bool _isCapturing = false;
+  bool _isSaving = false;
+  bool _showGuide = false;
+  bool _showSuccess = false;
+
+  // ================ Enrollment Settings ================
+  int _captureCount = 0;
+  int _requiredCaptures = 5; // ลดจาก 7 เป็น 5 สำหรับการใช้งานจริง
+  List<Map<String, dynamic>> _capturedFaces = [];
+
+  // ================ Quality & Stability ================
+  double _currentQuality = 0.0;
+  double _averageQuality = 0.0;
+  double _faceStability = 0.0;
+  List<double> _qualityHistory = [];
+  List<double> _stabilityHistory = [];
+
+  // ================ Auto Capture ================
+  Timer? _faceDetectionTimer;
+  Timer? _autoCaptureTimer;
+  int _autoCaptureDelay = 2;
+
+  // ================ Status Messages ================
+  String _statusMessage = 'กำลังเตรียมระบบ...';
+  String _instructionMessage = 'กรุณารอสักครู่';
+  String _detailMessage = '';
+
+  // ================ Firebase ================
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final Uuid _uuid = const Uuid();
+
+  // ================ Performance & Tracking ================
+  DateTime? _lastDetectionTime;
+  int _detectionCount = 0;
+  bool _isFaceDetected = false;
+  bool _faceQualityLocked = false;
+  int _consecutiveGoodFrames = 0;
+  int _requiredConsecutiveFrames = 2; // ลดความเข้มงวดลง
+
+  // ================ Screen & UI ================
+  double _screenWidth = 720.0;
+  double _screenHeight = 1280.0;
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+  late AnimationController _successController;
+
+  // ================ Enrollment Data ================
+  List<List<double>> _enrollmentEmbeddings = [];
+  List<double> _embeddingQualities = [];
+  List<Map<String, dynamic>> _enrollmentMetadata = [];
+  double _averageSimilarity = 0.0;
+  double _enrollmentConfidence = 0.0;
+
+  // ================ Quality Thresholds ================
+  static const double MIN_FACE_SIZE_PERCENT = 0.02; // 2% ของหน้าจอ
+  static const double MAX_YAW = 20.0; // อนุโลมเพิ่ม
+  static const double MAX_PITCH = 20.0; // อนุโลมเพิ่ม
+  static const double MAX_ROLL = 15.0; // เพิ่มการเช็ค roll
+  static const double MIN_EYE_OPENNESS = 0.5; // ลดความเข้มงวด
+  static const double MIN_CENTER_SCORE = 0.6; // ลดความเข้มงวด
+
+  // ================ Capture Conditions ================
+  final List<String> _captureConditions = [
+    'frontal_normal', // ตรงหน้า แสงปกติ
+    'frontal_bright', // ตรงหน้า แสงสว่าง
+    'frontal_dim', // ตรงหน้า แสงน้อย
+    'slight_left', // หันซ้ายเล็กน้อย
+    'slight_right', // หันขวาเล็กน้อย
+  ];
+
+  final Map<String, String> _conditionInstructions = {
+    'frontal_normal': 'มองตรง แสงปกติ',
+    'frontal_bright': 'มองตรง แสงสว่าง',
+    'frontal_dim': 'มองตรง แสงน้อย',
+    'slight_left': 'หันหน้าไปทางซ้ายเล็กน้อย',
+    'slight_right': 'หันหน้าไปทางขวาเล็กน้อย',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    // Initialize animations
+    _pulseController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    )..repeat(reverse: true);
+
+    _pulseAnimation = Tween<double>(begin: 0.9, end: 1.0).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+
+    _successController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
+
+    _initializeSystem();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _screenWidth = MediaQuery.of(context).size.width;
+    _screenHeight = MediaQuery.of(context).size.height;
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _cameraController?.dispose();
+    _faceDetector?.close();
+    _faceModel?.close();
+    _faceDetectionTimer?.cancel();
+    _autoCaptureTimer?.cancel();
+    _pulseController.dispose();
+    _successController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive) {
+      _stopAllTimers();
+      _cameraController?.dispose();
+    } else if (state == AppLifecycleState.resumed) {
+      _initializeSystem();
+    }
+  }
+
+  // ================ SYSTEM INITIALIZATION ================
+  Future<void> _initializeSystem() async {
+    try {
+      print('🚀 เริ่มต้นระบบ Face Recognition (MobileFaceNet)...');
+
+      await _initializeCamera();
+      await _initializeFaceDetector();
+      await _loadFaceEmbeddingModel();
+
+      if (mounted) {
+        setState(() {
+          _isCameraReady = true;
+          _statusMessage =
+              _modelLoaded ? 'พร้อมบันทึก Face ID' : 'กำลังโหลดโมเดล...';
+        });
+      }
+
+      await Future.delayed(const Duration(milliseconds: 500));
+      _startOptimizedFaceDetection();
+      _startEnhancedAutoCapture();
+    } catch (e) {
+      print('❌ System initialization error: $e');
+      _updateStatus(
+          'เกิดข้อผิดพลาด', 'กรุณาลองใหม่อีกครั้ง', 'error: ${e.toString()}');
+    }
+  }
+
+  Future<void> _initializeCamera() async {
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) throw Exception('ไม่พบกล้อง');
+
+      final frontCamera = cameras.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.front,
+        orElse: () => cameras.first,
+      );
+
+      _cameraController = CameraController(
+        frontCamera,
+        ResolutionPreset.medium, // ใช้ medium สำหรับสมดุล performance
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.jpeg,
+      );
+
+      await _cameraController!.initialize();
+
+      // ตั้งค่า exposure และ focus
+      try {
+        await _cameraController!.setExposureMode(ExposureMode.auto);
+        await _cameraController!.setFocusMode(FocusMode.auto);
+      } catch (e) {
+        print('⚠️ Cannot set camera exposure/focus: $e');
+      }
+
+      if (mounted) setState(() => _isCameraReady = true);
+      print('✅ กล้องพร้อมใช้งาน (Medium Resolution)');
+    } catch (e) {
+      print('❌ Camera error: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> _initializeFaceDetector() async {
+    try {
+      // ใช้ options ที่รองรับทุก platform
+      final options = FaceDetectorOptions(
+        enableLandmarks: true,
+        enableClassification: true,
+        enableTracking: true,
+        minFaceSize: 0.15,
+        performanceMode: FaceDetectorMode.fast, // ใช้ fast สำหรับ performance
+        // contourMode parameter ไม่มีในเวอร์ชันนี้
+      );
+
+      _faceDetector = FaceDetector(options: options);
+      print('✅ Face Detector พร้อมใช้งาน (Fast Mode)');
+    } catch (e) {
+      print('⚠️ Face detector error: $e');
+      // Fallback options
+      _faceDetector = FaceDetector(
+        options: FaceDetectorOptions(
+          enableLandmarks: false,
+          enableClassification: true,
+          enableTracking: true,
+          minFaceSize: 0.15,
+          performanceMode: FaceDetectorMode.fast,
+        ),
+      );
+    }
+  }
+
+  Future<void> _loadFaceEmbeddingModel() async {
+    try {
+      print('🔄 กำลังโหลดโมเดล Face Embedding...');
+
+      final interpreterOptions = InterpreterOptions()
+        ..threads = 2
+        ..useNnApiForAndroid = true; // ใช้ NNAPI สำหรับ Android
+      // ..useGpuDelegateForAndroid = true  // ลบ line นี้ถ้าไม่รองรับ
+
+      try {
+        // ลองหาโมเดลจากหลายตำแหน่ง
+        _faceModel = await Interpreter.fromAsset(
+          'assets/models/mobilefacenet.tflite',
+          options: interpreterOptions,
+        );
+
+        print('✅ โหลดโมเดลสำเร็จ!');
+
+        // ตรวจสอบโมเดล
+        try {
+          final inputTensor = _faceModel!.getInputTensor(0);
+          final outputTensor = _faceModel!.getOutputTensor(0);
+
+          print('📊 Input Shape: ${inputTensor.shape}');
+          print('📊 Output Shape: ${outputTensor.shape}');
+          print('📊 Output Dimension: ${outputTensor.shape.last}');
+
+          // อัพเดท dimension ตามโมเดลจริง
+          final actualDimension = outputTensor.shape.last;
+          if (actualDimension != EMBEDDING_DIMENSION) {
+            print(
+                '⚠️ โมเดลมี dimension: $actualDimension (คาดหวัง: $EMBEDDING_DIMENSION)');
+            // สามารถทำงานต่อได้ แต่ควรทราบความแตกต่าง
+          }
+        } catch (e) {
+          print('⚠️ ไม่สามารถตรวจสอบ tensor: $e');
+        }
+
+        _modelLoaded = true;
+        print('✅ Face Embedding Model พร้อมใช้งาน');
+      } catch (e) {
+        print('❌ ไม่พบโมเดลใน assets/models: $e');
+
+        // ลองตำแหน่งอื่น
+        try {
+          print('🔄 ลองโหลดโมเดลจากตำแหน่งอื่น...');
+          _faceModel = await Interpreter.fromAsset(
+            'models/mobilefacenet.tflite',
+            options: interpreterOptions,
+          );
+          _modelLoaded = true;
+          print('✅ โหลดโมเดลสำเร็จจาก models/');
+        } catch (e2) {
+          print('❌ ลอง path อื่นก็ไม่ได้: $e2');
+          _initializeFallbackModel();
+        }
+      }
+    } catch (e) {
+      print('❌ Error loading model: $e');
+      _modelLoaded = false;
+      _initializeFallbackModel();
+    }
+  }
+
+  void _initializeFallbackModel() {
+    print('⚠️ ใช้ fallback model สำหรับการพัฒนา');
+    _modelLoaded = true;
+
+    if (mounted) {
+      setState(() {
+        _statusMessage = 'โหมดทดสอบ (Fallback Model)';
+        _instructionMessage = 'ระบบจะจำลองการทำงาน';
+      });
+    }
+  }
+
+  // ================ FACE DETECTION ================
+  void _startOptimizedFaceDetection() {
+    _faceDetectionTimer?.cancel();
+
+    _faceDetectionTimer = Timer.periodic(const Duration(milliseconds: 300), (
+      timer,
+    ) async {
+      if (!_isCameraReady || _isCapturing || _isSaving) return;
+      if (_cameraController == null || !_cameraController!.value.isInitialized)
+        return;
+
+      final now = DateTime.now();
+      if (_lastDetectionTime != null &&
+          now.difference(_lastDetectionTime!).inMilliseconds < 200) {
+        return;
+      }
+
+      try {
+        if (mounted && !_isProcessing) setState(() => _isProcessing = true);
+        _lastDetectionTime = now;
+        _detectionCount++;
+
+        XFile? imageFile;
+        try {
+          imageFile = await _cameraController!.takePicture();
+        } catch (e) {
+          print('Failed to take picture: $e');
+          return;
+        }
+        if (imageFile == null) return;
+
+        final inputImage = InputImage.fromFilePath(imageFile.path);
+        List<Face> faces = [];
+
+        try {
+          faces = await _faceDetector!.processImage(inputImage);
+        } catch (e) {
+          print('Face detection failed: $e');
+        }
+
+        try {
+          await File(imageFile.path).delete();
+        } catch (_) {}
+
+        if (faces.isNotEmpty) {
+          final face = faces.first;
+          if (mounted)
+            setState(() {
+              _currentFace = face;
+              _isFaceDetected = true;
+            });
+
+          _faceHistory.add(face);
+          if (_faceHistory.length > 5) _faceHistory.removeAt(0);
+
+          final quality = _calculateFaceQuality(face);
+          if (!_faceQualityLocked || quality > _currentQuality) {
+            if (mounted) setState(() => _currentQuality = quality);
+          }
+
+          _qualityHistory.add(quality);
+          if (_qualityHistory.length > 8) _qualityHistory.removeAt(0);
+
+          if (_qualityHistory.isNotEmpty) {
+            final sum = _qualityHistory.reduce((a, b) => a + b);
+            if (mounted)
+              setState(() => _averageQuality = sum / _qualityHistory.length);
+          }
+
+          _faceStability = _calculateFaceStability();
+          _updateFaceStatus(quality);
+
+          if (quality >= 0.7 && _faceStability >= 0.6) {
+            _consecutiveGoodFrames++;
+          } else {
+            _consecutiveGoodFrames = max(0, _consecutiveGoodFrames - 1);
+          }
+
+          // ตรวจสอบว่าคุณภาพดีพอสำหรับ capture
+          _checkCaptureReadiness();
+        } else {
+          _consecutiveGoodFrames = 0;
+          if (mounted)
+            setState(() {
+              _currentFace = null;
+              _isFaceDetected = false;
+            });
+          _updateStatus(
+              'ไม่พบใบหน้า', 'กรุณาวางใบหน้าในกรอบ', 'รอการตรวจจับ...');
+        }
+      } catch (e) {
+        print('Face detection error: $e');
+      } finally {
+        if (mounted) setState(() => _isProcessing = false);
+      }
+    });
+  }
+
+  // ================ FACE QUALITY CALCULATION ================
+  double _calculateFaceQuality(Face face) {
+    double score = 0.0;
+
+    // 1. Size score (20%)
+    final bbox = face.boundingBox;
+    final area = bbox.width * bbox.height;
+    final minFaceSize = _screenWidth * _screenHeight * MIN_FACE_SIZE_PERCENT;
+    final sizeScore = min(1.0, area / minFaceSize);
+    score += sizeScore * 0.2;
+
+    // 2. Angle score (25%) - ยืดหยุ่นมากขึ้น
+    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
+    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
+    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
+
+    double angleScore = 1.0;
+    if (yaw > MAX_YAW) angleScore *= 0.8; // ลดลงเล็กน้อยถ้าเกิน
+    if (pitch > MAX_PITCH) angleScore *= 0.8;
+    if (roll > MAX_ROLL) angleScore *= 0.9;
+    score += angleScore * 0.25;
+
+    // 3. Eye openness (20%)
+    final leftEyeOpen = face.leftEyeOpenProbability ?? 0.0;
+    final rightEyeOpen = face.rightEyeOpenProbability ?? 0.0;
+    final eyeScore = (leftEyeOpen + rightEyeOpen) / 2;
+    final adjustedEyeScore =
+        eyeScore >= MIN_EYE_OPENNESS ? 1.0 : eyeScore / MIN_EYE_OPENNESS;
+    score += adjustedEyeScore * 0.2;
+
+    // 4. Center position (20%)
+    final centerScore = _calculateCenterScore(bbox);
+    score += centerScore * 0.2;
+
+    // 5. Lighting estimation (15%)
+    final lightingScore = _estimateLightingScore(leftEyeOpen, rightEyeOpen);
+    score += lightingScore * 0.15;
+
+    return score.clamp(0.0, 1.0);
+  }
+
+  double _calculateCenterScore(Rect bbox) {
+    final faceCenterX = bbox.left + bbox.width / 2;
+    final faceCenterY = bbox.top + bbox.height / 2;
+    final idealCenterX = _screenWidth / 2;
+    final idealCenterY = _screenHeight / 2;
+
+    final dx = (faceCenterX - idealCenterX).abs() / (_screenWidth * 0.5);
+    final dy = (faceCenterY - idealCenterY).abs() / (_screenHeight * 0.5);
+    final distance = sqrt(dx * dx + dy * dy);
+
+    return max(0.0, 1.0 - distance);
+  }
+
+  double _estimateLightingScore(double leftEye, double rightEye) {
+    final avgEyeOpenness = (leftEye + rightEye) / 2;
+
+    if (avgEyeOpenness > 0.8) return 1.0;
+    if (avgEyeOpenness > 0.6) return 0.8;
+    if (avgEyeOpenness > 0.4) return 0.6;
+    if (avgEyeOpenness > 0.2) return 0.4;
+    return 0.2;
+  }
+
+  double _calculateFaceStability() {
+    if (_faceHistory.length < 2) return 0.0;
+
+    double totalScore = 0.0;
+    int comparisons = 0;
+
+    for (int i = 1; i < _faceHistory.length; i++) {
+      final prev = _faceHistory[i - 1];
+      final curr = _faceHistory[i];
+
+      // Position stability
+      final prevCenterX = prev.boundingBox.left + prev.boundingBox.width / 2;
+      final prevCenterY = prev.boundingBox.top + prev.boundingBox.height / 2;
+      final currCenterX = curr.boundingBox.left + curr.boundingBox.width / 2;
+      final currCenterY = curr.boundingBox.top + curr.boundingBox.height / 2;
+
+      final dx = (currCenterX - prevCenterX).abs();
+      final dy = (currCenterY - prevCenterY).abs();
+
+      double positionScore;
+      if (dx < 15 && dy < 15) {
+        positionScore = 1.0;
+      } else if (dx > 60 || dy > 60) {
+        positionScore = 0.0;
+      } else {
+        final movement = sqrt(dx * dx + dy * dy);
+        positionScore = max(0.0, 1.0 - movement / 60);
+      }
+
+      // Size stability
+      final prevSize = prev.boundingBox.width * prev.boundingBox.height;
+      final currSize = curr.boundingBox.width * curr.boundingBox.height;
+      final sizeRatio = min(prevSize, currSize) / max(prevSize, currSize);
+
+      final sizeScore = sizeRatio > 0.85 ? 1.0 : sizeRatio;
+
+      // Combined score
+      final frameScore = (positionScore * 0.7 + sizeScore * 0.3);
+      totalScore += frameScore;
+      comparisons++;
+    }
+
+    return comparisons > 0 ? totalScore / comparisons : 0.0;
+  }
+
+  void _checkCaptureReadiness() {
+    final qualityPercent = (_currentQuality * 100).toInt();
+    final stabilityPercent = (_faceStability * 100).toInt();
+
+    if (_currentQuality >= 0.7 && _faceStability >= 0.7) {
+      _detailMessage = 'พร้อมบันทึก ($qualityPercent% | $stabilityPercent%)';
+    } else if (_currentQuality >= 0.6) {
+      _detailMessage =
+          'ปรับตำแหน่งเล็กน้อย ($qualityPercent% | $stabilityPercent%)';
+    } else {
+      _detailMessage = 'ปรับตำแหน่ง ($qualityPercent% | $stabilityPercent%)';
+    }
+
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  void _updateFaceStatus(double quality) {
+    final qualityPercent = (quality * 100).toInt();
+    final stabilityPercent = (_faceStability * 100).toInt();
+
+    if (quality >= 0.7 && _faceStability >= 0.7) {
+      _updateStatus(
+          '✅ พร้อมบันทึก',
+          'คุณภาพ: $qualityPercent% | เสถียร: $stabilityPercent%',
+          'กรุณาอยู่นิ่งๆ');
+    } else if (quality >= 0.6) {
+      _updateStatus(
+          'ปรับตำแหน่งเล็กน้อย',
+          'คุณภาพ: $qualityPercent% | เสถียร: $stabilityPercent%',
+          'พยายามอยู่นิ่งๆ');
+    } else if (quality >= 0.5) {
+      _updateStatus(
+          'ปรับตำแหน่ง', 'คุณภาพ: $qualityPercent%', 'เลื่อนเข้ามาใกล้กล้อง');
+    } else {
+      _updateStatus('❌ ปรับตำแหน่งใหม่', 'คุณภาพ: $qualityPercent%',
+          'วางใบหน้าให้อยู่ในกรอบ');
+    }
+  }
+
+  // ================ ENHANCED AUTO CAPTURE ================
+  void _startEnhancedAutoCapture() {
+    _autoCaptureTimer?.cancel();
+    _autoCaptureTimer =
+        Timer.periodic(Duration(seconds: _autoCaptureDelay), (timer) async {
+      if (_captureCount >= _requiredCaptures) {
+        timer.cancel();
+        await _saveEnhancedFaceProfile();
+        return;
+      }
+
+      if (!_isCameraReady || _isCapturing || _isSaving) return;
+      if (!_isFaceDetected || _currentFace == null) {
+        _updateStatus('ไม่พบใบหน้า', 'กรุณาวางใบหน้าในกรอบ', 'รอการตรวจจับ...');
+        return;
+      }
+
+      // ตรวจสอบ condition ปัจจุบัน
+      final currentCondition = _captureCount < _captureConditions.length
+          ? _captureConditions[_captureCount]
+          : 'frontal_normal';
+
+      final conditionInstruction =
+          _conditionInstructions[currentCondition] ?? 'มองตรง';
+
+      if (_currentQuality >= 0.7 &&
+          _faceStability >= 0.7 &&
+          _consecutiveGoodFrames >= _requiredConsecutiveFrames) {
+        _faceQualityLocked = true;
+        await _performEnhancedFaceEnrollment(
+            currentCondition, conditionInstruction);
+        _faceQualityLocked = false;
+      } else {
+        _updateStatus(
+            'ปรับตำแหน่ง...',
+            'คุณภาพ: ${(_currentQuality * 100).toInt()}% | เสถียร: ${(_faceStability * 100).toInt()}%',
+            conditionInstruction);
+      }
+    });
+  }
+
+  Future<void> _performEnhancedFaceEnrollment(
+      String condition, String instruction) async {
+    try {
+      if (mounted) setState(() => _isCapturing = true);
+
+      _updateStatus('กำลังบันทึก...',
+          'ภาพที่ ${_captureCount + 1}/$_requiredCaptures', instruction);
+
+      final image = await _cameraController!.takePicture();
+      final embeddingResult = await _extractEnhancedFaceEmbedding(
+          image.path, _currentFace!, condition);
+
+      if (embeddingResult['success'] == true) {
+        final embedding = List<double>.from(embeddingResult['embedding']);
+        final embeddingQuality = embeddingResult['quality'] as double;
+        final embeddingNorm = embeddingResult['norm'] as double;
+        final passedChecks = embeddingResult['passed_checks'] as bool;
+
+        if (passedChecks && embeddingQuality >= MIN_EMBEDDING_QUALITY) {
+          bool consistencyPassed = true;
+
+          if (_enrollmentEmbeddings.isNotEmpty) {
+            final consistency = _checkEmbeddingConsistency(embedding);
+            consistencyPassed = consistency >= ENROLLMENT_CONSISTENCY;
+
+            if (!consistencyPassed) {
+              _updateStatus(
+                  'ความสอดคล้องไม่เพียงพอ',
+                  '${(consistency * 100).toInt()}% (ต้องการ ${(ENROLLMENT_CONSISTENCY * 100).toInt()}%)',
+                  'กรุณาปรับตำแหน่ง');
+              await Future.delayed(const Duration(seconds: 1));
+            }
+          }
+
+          if (consistencyPassed) {
+            _enrollmentEmbeddings.add(embedding);
+            _embeddingQualities.add(embeddingQuality);
+
+            final metadata = {
+              'condition': condition,
+              'quality': _currentQuality,
+              'stability': _faceStability,
+              'norm': embeddingNorm,
+              'angles': {
+                'yaw': _currentFace!.headEulerAngleY ?? 0.0,
+                'pitch': _currentFace!.headEulerAngleX ?? 0.0,
+                'roll': _currentFace!.headEulerAngleZ ?? 0.0,
+              },
+              'lighting': _estimateLightingScore(
+                _currentFace!.leftEyeOpenProbability ?? 0.0,
+                _currentFace!.rightEyeOpenProbability ?? 0.0,
+              ),
+              'timestamp': DateTime.now().toIso8601String(),
+            };
+            _enrollmentMetadata.add(metadata);
+
+            _averageSimilarity = _calculateAverageSimilarity();
+            _enrollmentConfidence = _calculateEnrollmentConfidence();
+
+            final faceData = {
+              'capture_id': _uuid.v4(),
+              'timestamp': DateTime.now().toIso8601String(),
+              'condition': condition,
+              'quality_score': _currentQuality,
+              'stability_score': _faceStability,
+              'face_embedding': embedding,
+              'embedding_quality': embeddingQuality,
+              'embedding_norm': embeddingNorm,
+              'embedding_version': EMBEDDING_VERSION,
+              'embedding_model': MODEL_NAME,
+              'embedding_dimension': embedding.length,
+              'angles': metadata['angles'],
+              'lighting': metadata['lighting'],
+              'bounding_box': {
+                'left': _currentFace!.boundingBox.left,
+                'top': _currentFace!.boundingBox.top,
+                'width': _currentFace!.boundingBox.width,
+                'height': _currentFace!.boundingBox.height,
+              },
+              'capture_sequence': _captureCount + 1,
+              'metadata': metadata,
+            };
+
+            _capturedFaces.add(faceData);
+            _captureCount++;
+
+            _showEnhancedCaptureSuccess();
+
+            _updateStatus(
+                '✅ บันทึกสำเร็จ!',
+                'ภาพที่ $_captureCount/$_requiredCaptures',
+                'ความสอดคล้อง: ${(_averageSimilarity * 100).toInt()}%');
+          }
+        } else {
+          _updateStatus(
+              'คุณภาพไม่ผ่านเกณฑ์',
+              'ต้องการ: ${(MIN_EMBEDDING_QUALITY * 100).toInt()}% | ได้: ${(embeddingQuality * 100).toInt()}%',
+              'กรุณาปรับตำแหน่ง');
+        }
+      } else {
+        _updateStatus('สร้าง Embedding ไม่สำเร็จ',
+            embeddingResult['error'] as String, 'กรุณาลองใหม่อีกครั้ง');
+      }
+
+      try {
+        await File(image.path).delete();
+      } catch (_) {}
+
+      _faceHistory.clear();
+      _qualityHistory.clear();
+      _consecutiveGoodFrames = 0;
+
+      await Future.delayed(const Duration(milliseconds: 800));
+    } catch (e) {
+      print('❌ Enhanced face enrollment error: $e');
+      _updateStatus(
+          'บันทึกไม่สำเร็จ', 'เกิดข้อผิดพลาด', 'กรุณาลองใหม่อีกครั้ง');
+    } finally {
+      if (mounted) setState(() => _isCapturing = false);
+    }
+  }
+
+  // ================ ENHANCED FACE PROCESSING ================
+  Future<img.Image?> _cropAndPreprocessFace(String imagePath, Face face) async {
+    try {
+      final imageBytes = await File(imagePath).readAsBytes();
+      img.Image? originalImage;
+
+      try {
+        originalImage = img.decodeImage(imageBytes);
+      } catch (e) {
+        print('❌ decodeImage failed: $e');
+        try {
+          originalImage = img.decodeJpg(imageBytes);
+        } catch (e2) {
+          try {
+            originalImage = img.decodePng(imageBytes);
+          } catch (e3) {
+            print('❌ ทั้งหมดล้มเหลว: $e3');
+            return null;
+          }
+        }
+      }
+
+      if (originalImage == null) return null;
+
+      final bbox = face.boundingBox;
+
+      // ปรับ padding แบบ dynamic
+      final paddingX = (bbox.width * FACE_PADDING_RATIO).toInt();
+      final paddingY = (bbox.height * FACE_PADDING_RATIO).toInt();
+
+      int left = max(0, bbox.left.toInt() - paddingX);
+      int top = max(0, bbox.top.toInt() - paddingY);
+      int width =
+          min(originalImage.width - left, bbox.width.toInt() + paddingX * 2);
+      int height =
+          min(originalImage.height - top, bbox.height.toInt() + paddingY * 2);
+
+      final croppedImage = img.copyCrop(
+        originalImage,
+        x: left,
+        y: top,
+        width: width,
+        height: height,
+      );
+
+      // Resize ด้วย interpolation มาตรฐาน
+      final resizedImage = img.copyResize(
+        croppedImage,
+        width: FACE_CROP_SIZE,
+        height: FACE_CROP_SIZE,
+      );
+
+      return _convertToRgbImage(resizedImage);
+    } catch (e) {
+      print('❌ Error cropping face: $e');
+      return null;
+    }
+  }
+
+  img.Image _convertToRgbImage(img.Image image) {
+    if (image.numChannels == 3) return image;
+
+    final rgbImage = img.Image(
+      width: image.width,
+      height: image.height,
+      numChannels: 3,
+    );
+
+    final bytes = image.getBytes();
+    final rgbBytes = rgbImage.getBytes();
+
+    int srcIndex = 0;
+    int dstIndex = 0;
+    final totalPixels = image.width * image.height;
+
+    for (int i = 0; i < totalPixels; i++) {
+      if (image.numChannels == 1) {
+        // Grayscale -> RGB
+        final gray = srcIndex < bytes.length ? bytes[srcIndex] : 128;
+        rgbBytes[dstIndex] = gray;
+        rgbBytes[dstIndex + 1] = gray;
+        rgbBytes[dstIndex + 2] = gray;
+        srcIndex += 1;
+      } else if (image.numChannels == 4) {
+        // RGBA -> RGB (discard alpha)
+        final r = srcIndex < bytes.length ? bytes[srcIndex] : 128;
+        final g = srcIndex + 1 < bytes.length ? bytes[srcIndex + 1] : 128;
+        final b = srcIndex + 2 < bytes.length ? bytes[srcIndex + 2] : 128;
+        rgbBytes[dstIndex] = r;
+        rgbBytes[dstIndex + 1] = g;
+        rgbBytes[dstIndex + 2] = b;
+        srcIndex += 4;
+      } else if (image.numChannels == 3) {
+        // RGB -> RGB
+        final r = srcIndex < bytes.length ? bytes[srcIndex] : 128;
+        final g = srcIndex + 1 < bytes.length ? bytes[srcIndex + 1] : 128;
+        final b = srcIndex + 2 < bytes.length ? bytes[srcIndex + 2] : 128;
+        rgbBytes[dstIndex] = r;
+        rgbBytes[dstIndex + 1] = g;
+        rgbBytes[dstIndex + 2] = b;
+        srcIndex += 3;
+      }
+      dstIndex += 3;
+    }
+
+    return rgbImage;
+  }
+
+  Future<Map<String, dynamic>> _extractEnhancedFaceEmbedding(
+      String imagePath, Face face, String condition) async {
+    try {
+      final processedImage = await _cropAndPreprocessFace(imagePath, face);
+      if (processedImage == null) {
+        return {'success': false, 'error': 'ไม่สามารถ process ใบหน้าได้'};
+      }
+
+      List<double> embedding;
+      if (_modelLoaded && _faceModel != null) {
+        embedding = await _runFaceModel(processedImage);
+      } else {
+        embedding = _generateFallbackEmbedding(processedImage, face);
+      }
+
+      final normalizedEmbedding = _l2Normalize(embedding);
+      final embeddingNorm = _calculateEmbeddingNorm(normalizedEmbedding);
+      final embeddingQuality =
+          _evaluateEmbeddingQuality(normalizedEmbedding, face, condition);
+      final passedChecks = _checkEmbeddingValidity(
+          normalizedEmbedding, embeddingNorm, embeddingQuality);
+
+      return {
+        'success': true,
+        'embedding': normalizedEmbedding,
+        'quality': embeddingQuality,
+        'norm': embeddingNorm,
+        'passed_checks': passedChecks,
+        'dimension': normalizedEmbedding.length,
+        'condition': condition,
+      };
+    } catch (e) {
+      print('❌ Error extracting face embedding: $e');
+      return {'success': false, 'error': e.toString(), 'passed_checks': false};
+    }
+  }
+
+  Future<List<double>> _runFaceModel(img.Image image) async {
+    try {
+      final input = _prepareInputTensor(image);
+      final outputShape = _faceModel!.getOutputTensor(0).shape;
+      final outputSize = outputShape.reduce((a, b) => a * b);
+      final output = List<double>.filled(outputSize, 0.0).reshape(outputShape);
+
+      _faceModel!.run(input, output);
+
+      final result = List<double>.from(output[0]);
+      print('✅ รันโมเดลสำเร็จ ได้ embedding ขนาด: ${result.length}');
+      return result;
+    } catch (e) {
+      print('❌ Error running face model: $e');
+      throw e;
+    }
+  }
+
+  List<List<List<List<double>>>> _prepareInputTensor(img.Image image) {
+    final shape = MODEL_INPUT_SHAPE;
+
+    final input = List.generate(
+      shape[0],
+      (_) => List.generate(
+        shape[1],
+        (_) => List.generate(
+          shape[2],
+          (_) => List.filled(shape[3], 0.0),
+        ),
+      ),
+    );
+
+    final bytes = image.getBytes(order: img.ChannelOrder.rgb);
+    final expectedBytes = FACE_CROP_SIZE * FACE_CROP_SIZE * 3;
+
+    int byteIndex = 0;
+    for (int y = 0; y < FACE_CROP_SIZE; y++) {
+      for (int x = 0; x < FACE_CROP_SIZE; x++) {
+        if (byteIndex + 2 < bytes.length && byteIndex + 2 < expectedBytes) {
+          // MobileFaceNet ต้องการ normalization [-1, 1]
+          final r = bytes[byteIndex].toDouble();
+          final g = bytes[byteIndex + 1].toDouble();
+          final b = bytes[byteIndex + 2].toDouble();
+
+          input[0][y][x][0] = (r / 127.5) - 1.0;
+          input[0][y][x][1] = (g / 127.5) - 1.0;
+          input[0][y][x][2] = (b / 127.5) - 1.0;
+
+          byteIndex += 3;
+        } else {
+          input[0][y][x][0] = 0.0;
+          input[0][y][x][1] = 0.0;
+          input[0][y][x][2] = 0.0;
+          byteIndex += 3;
+        }
+      }
+    }
+
+    return input;
+  }
+
+  double _calculateEmbeddingNorm(List<double> embedding) {
+    double sum = 0.0;
+    for (final value in embedding) sum += value * value;
+    return sqrt(sum);
+  }
+
+  bool _checkEmbeddingValidity(
+      List<double> embedding, double norm, double quality) {
+    // ตรวจสอบ norm ควรอยู่ที่ประมาณ 1.0 (หลังจาก normalize)
+    if (norm < 0.9 || norm > 1.1) {
+      print('⚠️ Embedding norm ผิดปกติ: $norm');
+      return false;
+    }
+
+    // ตรวจสอบค่า NaN หรือ Infinity
+    for (final value in embedding) {
+      if (value.isNaN || value.isInfinite) {
+        print('⚠️ Embedding มีค่าไม่ปกติ: $value');
+        return false;
+      }
+    }
+
+    // ตรวจสอบคุณภาพ
+    if (quality < MIN_EMBEDDING_QUALITY) {
+      print('⚠️ Embedding quality ต่ำเกินไป: $quality');
+      return false;
+    }
+
+    return true;
+  }
+
+  double _evaluateEmbeddingQuality(
+      List<double> embedding, Face face, String condition) {
+    double quality = 0.0;
+
+    // 1. Norm score (25%)
+    final norm = _calculateEmbeddingNorm(embedding);
+    final normScore = 1.0 - (norm - 1.0).abs();
+    quality += normScore * 0.25;
+
+    // 2. Face quality (50%)
+    final faceQuality = _calculateFaceQuality(face);
+    quality += faceQuality * 0.5;
+
+    // 3. Stability (25%)
+    quality += _faceStability * 0.25;
+
+    return quality.clamp(0.0, 1.0);
+  }
+
+  List<double> _generateFallbackEmbedding(img.Image image, Face face) {
+    print('⚠️ ใช้ fallback embedding');
+    final embedding = List<double>.filled(EMBEDDING_DIMENSION, 0.0);
+    final random = Random(DateTime.now().millisecondsSinceEpoch);
+
+    for (int i = 0; i < EMBEDDING_DIMENSION; i++) {
+      embedding[i] = random.nextDouble() * 2 - 1;
+    }
+
+    return embedding;
+  }
+
+  List<double> _l2Normalize(List<double> vector) {
+    double norm = 0.0;
+    for (final value in vector) norm += value * value;
+    norm = sqrt(norm);
+    if (norm < 1e-12) return vector;
+
+    final normalized = List<double>.filled(vector.length, 0.0);
+    for (int i = 0; i < vector.length; i++) normalized[i] = vector[i] / norm;
+    return normalized;
+  }
+
+  // ================ SIMILARITY CALCULATION ================
+  double _checkEmbeddingConsistency(List<double> newEmbedding) {
+    if (_enrollmentEmbeddings.isEmpty) return 1.0;
+
+    double totalSimilarity = 0.0;
+    int count = 0;
+
+    for (final existingEmbedding in _enrollmentEmbeddings) {
+      final similarity = _cosineSimilarity(newEmbedding, existingEmbedding);
+      totalSimilarity += similarity;
+      count++;
+    }
+
+    return count > 0 ? totalSimilarity / count : 0.0;
+  }
+
+  double _cosineSimilarity(List<double> a, List<double> b) {
+    if (a.length != b.length) return 0.0;
+
+    double dot = 0.0, normA = 0.0, normB = 0.0;
+    for (int i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+
+    normA = sqrt(normA);
+    normB = sqrt(normB);
+
+    if (normA < 1e-12 || normB < 1e-12) return 0.0;
+
+    return dot / (normA * normB);
+  }
+
+  double _calculateAverageSimilarity() {
+    if (_enrollmentEmbeddings.length < 2) return 1.0;
+
+    double totalSimilarity = 0.0;
+    int comparisons = 0;
+
+    for (int i = 0; i < _enrollmentEmbeddings.length; i++) {
+      for (int j = i + 1; j < _enrollmentEmbeddings.length; j++) {
+        final similarity = _cosineSimilarity(
+            _enrollmentEmbeddings[i], _enrollmentEmbeddings[j]);
+        totalSimilarity += similarity;
+        comparisons++;
+      }
+    }
+
+    return comparisons > 0 ? totalSimilarity / comparisons : 1.0;
+  }
+
+  double _calculateEnrollmentConfidence() {
+    if (_enrollmentEmbeddings.length < 2) return 0.0;
+
+    double confidence = 0.0;
+
+    // 1. Average similarity (50%)
+    final avgSimilarity = _calculateAverageSimilarity();
+    confidence += avgSimilarity * 0.5;
+
+    // 2. Number of embeddings (30%)
+    final countScore =
+        min(1.0, _enrollmentEmbeddings.length / _requiredCaptures);
+    confidence += countScore * 0.3;
+
+    // 3. Quality average (20%)
+    if (_embeddingQualities.isNotEmpty) {
+      double avgQuality = 0.0;
+      for (final quality in _embeddingQualities) avgQuality += quality;
+      avgQuality /= _embeddingQualities.length;
+      confidence += avgQuality * 0.2;
+    }
+
+    return confidence.clamp(0.0, 1.0);
+  }
+
+  List<double> _calculateMeanEmbedding(List<List<double>> embeddings) {
+    if (embeddings.isEmpty)
+      return List<double>.filled(EMBEDDING_DIMENSION, 0.0);
+
+    final dimension = embeddings[0].length;
+    final mean = List<double>.filled(dimension, 0.0);
+
+    for (final embedding in embeddings) {
+      for (int i = 0; i < dimension; i++) {
+        mean[i] += embedding[i];
+      }
+    }
+
+    for (int i = 0; i < dimension; i++) {
+      mean[i] /= embeddings.length;
+    }
+
+    return _l2Normalize(mean);
+  }
+
+  // ================ ENHANCED FIREBASE SAVE ================
+  Future<void> _saveEnhancedFaceProfile() async {
+    try {
+      if (mounted) {
+        setState(() {
+          _isSaving = true;
+          _statusMessage = 'กำลังสร้าง Face Profile...';
+          _instructionMessage = 'กรุณารอสักครู่';
+          _detailMessage = 'กำลังคำนวณและบันทึกข้อมูล';
+        });
+      }
+
+      final user = _auth.currentUser;
+      if (user == null) throw Exception('ผู้ใช้ไม่ได้เข้าสู่ระบบ');
+
+      if (_enrollmentEmbeddings.length < 2) {
+        throw Exception('ต้องการอย่างน้อย 2 embeddings สำหรับ enrollment');
+      }
+
+      // คำนวณ statistics
+      double avgQuality = 0.0, avgEmbeddingQuality = 0.0, avgStability = 0.0;
+      if (_capturedFaces.isNotEmpty) {
+        double totalQuality = 0.0,
+            totalEmbeddingQuality = 0.0,
+            totalStability = 0.0;
+        for (var data in _capturedFaces) {
+          totalQuality += data['quality_score'] as double;
+          totalEmbeddingQuality += data['embedding_quality'] as double;
+          totalStability += data['stability_score'] as double;
+        }
+        avgQuality = totalQuality / _capturedFaces.length;
+        avgEmbeddingQuality = totalEmbeddingQuality / _capturedFaces.length;
+        avgStability = totalStability / _capturedFaces.length;
+      }
+
+      final finalEmbedding = _calculateMeanEmbedding(_enrollmentEmbeddings);
+      _enrollmentConfidence = _calculateEnrollmentConfidence();
+
+      print('🎯 Enhanced Face Enrollment Results:');
+      print('  Total embeddings: ${_enrollmentEmbeddings.length}');
+      print(
+          '  Average similarity: ${(_averageSimilarity * 100).toStringAsFixed(1)}%');
+      print(
+          '  Enrollment confidence: ${(_enrollmentConfidence * 100).toStringAsFixed(1)}%');
+      print('  Average quality: ${(avgQuality * 100).toStringAsFixed(1)}%');
+      print('  Average stability: ${(avgStability * 100).toStringAsFixed(1)}%');
+
+      final faceProfileId = _uuid.v4();
+      final faceProfile = {
+        'profile_id': faceProfileId,
+        'user_id': user.uid,
+        'mean_embedding': finalEmbedding,
+        'embedding_dimension': finalEmbedding.length,
+        'embedding_version': EMBEDDING_VERSION,
+        'embedding_model': MODEL_NAME,
+        'enrollment_stats': {
+          'total_embeddings': _enrollmentEmbeddings.length,
+          'average_similarity': _averageSimilarity,
+          'enrollment_confidence': _enrollmentConfidence,
+          'average_quality': avgQuality,
+          'average_embedding_quality': avgEmbeddingQuality,
+          'average_stability': avgStability,
+          'conditions_captured':
+              _enrollmentMetadata.map((m) => m['condition']).toList(),
+        },
+        'created_at': FieldValue.serverTimestamp(),
+        'updated_at': FieldValue.serverTimestamp(),
+        'status': 'active',
+        'device_info': {
+          'platform': '${Theme.of(context).platform}',
+          'screen_resolution':
+              '${_screenWidth.toInt()}x${_screenHeight.toInt()}',
+          'enrolled_at': DateTime.now().toIso8601String(),
+          'app_version': '2.0',
+        },
+        'thresholds': {
+          'verification': VERIFICATION_THRESHOLD,
+          'identification': IDENTIFICATION_THRESHOLD,
+          'min_embedding_quality': MIN_EMBEDDING_QUALITY,
+        },
+      };
+
+      await _saveEnhancedFaceProfileToFirebase(
+          user.uid, faceProfileId, faceProfile);
+      await _saveEnhancedFaceEmbeddings(
+          user.uid, faceProfileId, _capturedFaces);
+
+      if (mounted) {
+        setState(() {
+          _statusMessage = '✅ Face Profile สร้างสำเร็จ!';
+          _instructionMessage = 'กำลังไปหน้าหลัก...';
+          _detailMessage =
+              'ความมั่นใจ: ${(_enrollmentConfidence * 100).toInt()}%';
+          _showSuccess = true;
+        });
+      }
+
+      await Future.delayed(const Duration(seconds: 2));
+      _playSuccessAnimation();
+
+      await Future.delayed(const Duration(seconds: 1));
+
+      if (mounted) {
+        Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
+      }
+    } catch (e, stackTrace) {
+      print('❌ Save to Firebase error: $e');
+      print('Stack trace: $stackTrace');
+
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'บันทึกไม่สำเร็จ';
+          _instructionMessage = 'กรุณาลองใหม่อีกครั้ง';
+          _detailMessage = 'เกิดข้อผิดพลาด: ${e.toString()}';
+          _isSaving = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _saveEnhancedFaceProfileToFirebase(
+      String userId, String profileId, Map<String, dynamic> faceProfile) async {
+    try {
+      final userDocRef = _firestore.collection('users').doc(userId);
+
+      await userDocRef.collection('face_profiles').doc(profileId).set({
+        ...faceProfile,
+        'last_updated': FieldValue.serverTimestamp(),
+      });
+
+      await userDocRef.set({
+        'last_face_profile_id': profileId,
+        'has_face_profile': true,
+        'face_profile_created_at': FieldValue.serverTimestamp(),
+        'updated_at': FieldValue.serverTimestamp(),
+        'face_id_enrolled': true,
+        'enrollment_date': FieldValue.serverTimestamp(),
+        'enrollment_confidence': _enrollmentConfidence,
+        'embedding_version': EMBEDDING_VERSION,
+        'embedding_model': MODEL_NAME,
+      }, SetOptions(merge: true));
+
+      print('✅ Enhanced face profile saved successfully!');
+    } catch (e) {
+      print('❌ Error saving enhanced face profile: $e');
+      throw e;
+    }
+  }
+
+  Future<void> _saveEnhancedFaceEmbeddings(String userId, String profileId,
+      List<Map<String, dynamic>> capturedFaces) async {
+    try {
+      final userDocRef = _firestore.collection('users').doc(userId);
+      final embeddingsCollection = userDocRef.collection('face_embeddings');
+
+      final batch = _firestore.batch();
+
+      for (var faceData in capturedFaces) {
+        final embeddingId = _uuid.v4();
+        final embeddingDoc = embeddingsCollection.doc(embeddingId);
+
+        final embedding = {
+          'embedding_id': embeddingId,
+          'profile_id': profileId,
+          'user_id': userId,
+          'embedding_vector': faceData['face_embedding'],
+          'quality_score': faceData['quality_score'],
+          'stability_score': faceData['stability_score'],
+          'embedding_quality': faceData['embedding_quality'],
+          'embedding_norm': faceData['embedding_norm'],
+          'condition': faceData['condition'],
+          'angles': faceData['angles'],
+          'lighting': faceData['lighting'],
+          'created_at': FieldValue.serverTimestamp(),
+          'capture_sequence': faceData['capture_sequence'],
+          'metadata': faceData['metadata'],
+          'embedding_dimension': faceData['face_embedding'].length,
+          'embedding_version': EMBEDDING_VERSION,
+        };
+
+        batch.set(embeddingDoc, embedding);
+      }
+
+      await batch.commit();
+      print(
+          '✅ All enhanced face embeddings saved! (${capturedFaces.length} embeddings)');
+    } catch (e) {
+      print('❌ Error saving enhanced face embeddings: $e');
+      throw e;
+    }
+  }
+
+  // ================ UI ENHANCEMENTS ================
+  void _showEnhancedCaptureSuccess() {
+    if (mounted) {
+      setState(() {
+        _showGuide = true;
+      });
+
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (mounted) {
+          setState(() {
+            _showGuide = false;
+          });
+        }
+      });
+    }
+  }
+
+  void _playSuccessAnimation() async {
+    await _successController.forward();
+    await Future.delayed(const Duration(milliseconds: 500));
+    await _successController.reverse();
+  }
+
+  void _updateStatus(String status, String instruction, String detail) {
+    if (mounted) {
+      setState(() {
+        _statusMessage = status;
+        _instructionMessage = instruction;
+        _detailMessage = detail;
+      });
+    }
+  }
+
+  void _stopAllTimers() {
+    _faceDetectionTimer?.cancel();
+    _autoCaptureTimer?.cancel();
+    _faceDetectionTimer = null;
+    _autoCaptureTimer = null;
+  }
+
+  Color _getQualityColor(double quality) {
+    if (quality >= 0.8) return Colors.green;
+    if (quality >= 0.7) return Colors.lightGreen;
+    if (quality >= 0.6) return Colors.yellow;
+    if (quality >= 0.5) return Colors.orange;
+    return Colors.red;
+  }
+
+  // ================ BUILD METHOD ================
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            // Camera Preview
+            if (_isCameraReady && _cameraController != null)
+              Positioned.fill(child: CameraPreview(_cameraController!))
+            else
+              Container(
+                color: Colors.black,
+                child: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const CircularProgressIndicator(color: Colors.white),
+                      const SizedBox(height: 20),
+                      Text(_statusMessage,
+                          style: const TextStyle(color: Colors.white)),
+                      if (!_modelLoaded)
+                        const Text('กำลังโหลดโมเดล Face ID...',
+                            style: TextStyle(color: Colors.yellow)),
+                    ],
+                  ),
+                ),
+              ),
+
+            // Overlay
+            Positioned.fill(
+              child: Container(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.black.withOpacity(0.5),
+                      Colors.transparent,
+                      Colors.transparent,
+                      Colors.black.withOpacity(0.7),
+                    ],
+                  ),
+                ),
+                child: Column(
+                  children: [
+                    // Header
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.arrow_back,
+                                color: Colors.white, size: 28),
+                            onPressed: () {
+                              _stopAllTimers();
+                              Navigator.pop(context);
+                            },
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('บันทึก Face Profile',
+                                    style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 18,
+                                        fontWeight: FontWeight.bold)),
+                                Text(
+                                    _modelLoaded
+                                        ? 'MobileFaceNet'
+                                        : 'กำลังเตรียมระบบ...',
+                                    style: const TextStyle(
+                                        color: Colors.white70, fontSize: 11)),
+                              ],
+                            ),
+                          ),
+                          if (_modelLoaded)
+                            Container(
+                              padding: const EdgeInsets.all(4),
+                              decoration: BoxDecoration(
+                                color: Colors.green.withOpacity(0.2),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: Colors.green),
+                              ),
+                              child: const Row(
+                                children: [
+                                  Icon(Icons.fingerprint,
+                                      color: Colors.green, size: 12),
+                                  SizedBox(width: 4),
+                                  Text('Enhanced',
+                                      style: TextStyle(
+                                          color: Colors.green, fontSize: 10)),
+                                ],
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+
+                    const Spacer(),
+
+                    // Face Frame with Animation
+                    Center(
+                      child: ScaleTransition(
+                        scale: _pulseAnimation,
+                        child: AnimatedContainer(
+                          width: 240,
+                          height: 320,
+                          duration: const Duration(milliseconds: 300),
+                          decoration: BoxDecoration(
+                            border: Border.all(
+                              color: _isFaceDetected
+                                  ? _getQualityColor(_currentQuality)
+                                  : Colors.blue.withOpacity(0.5),
+                              width: 3,
+                            ),
+                            borderRadius: BorderRadius.circular(15),
+                            boxShadow: _isFaceDetected
+                                ? [
+                                    BoxShadow(
+                                      color: _getQualityColor(_currentQuality)
+                                          .withOpacity(0.3),
+                                      blurRadius: 20,
+                                      spreadRadius: 2,
+                                    )
+                                  ]
+                                : [],
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    const Spacer(),
+
+                    // Progress Bar
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      child: Column(
+                        children: [
+                          Container(
+                            height: 10,
+                            decoration: BoxDecoration(
+                                color: Colors.grey.withOpacity(0.3),
+                                borderRadius: BorderRadius.circular(5)),
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 300),
+                              width: MediaQuery.of(context).size.width *
+                                  (_captureCount / _requiredCaptures),
+                              decoration: BoxDecoration(
+                                  color: _getQualityColor(_averageQuality),
+                                  borderRadius: BorderRadius.circular(5)),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text('${_captureCount}/$_requiredCaptures',
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14)),
+                          if (_captureCount > 0)
+                            Text(
+                                'ความสอดคล้อง: ${(_averageSimilarity * 100).toInt()}%',
+                                style: TextStyle(
+                                    color: _averageSimilarity >=
+                                            ENROLLMENT_CONSISTENCY
+                                        ? Colors.green
+                                        : Colors.orange,
+                                    fontSize: 12)),
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 20),
+
+                    // Status Card
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      margin: const EdgeInsets.symmetric(horizontal: 20),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.7),
+                        borderRadius: BorderRadius.circular(15),
+                        border: Border.all(
+                            color: _getQualityColor(_currentQuality), width: 1),
+                      ),
+                      child: Column(
+                        children: [
+                          Text(_statusMessage,
+                              style: TextStyle(
+                                  color: _getQualityColor(_currentQuality),
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold),
+                              textAlign: TextAlign.center),
+                          const SizedBox(height: 8),
+                          Text(_instructionMessage,
+                              style: const TextStyle(
+                                  color: Colors.white, fontSize: 14),
+                              textAlign: TextAlign.center),
+                          if (_detailMessage.isNotEmpty)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 8),
+                              child: Text(_detailMessage,
+                                  style: const TextStyle(
+                                      color: Colors.white70, fontSize: 12),
+                                  textAlign: TextAlign.center),
+                            ),
+                          if (_captureCount > 0)
+                            Text('Embeddings: ${_enrollmentEmbeddings.length}',
+                                style: const TextStyle(
+                                    color: Colors.white70, fontSize: 12)),
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 20),
+
+                    // Stats
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          _buildEnhancedStatItem(
+                              'คุณภาพ',
+                              '${(_currentQuality * 100).toInt()}%',
+                              _getQualityColor(_currentQuality),
+                              Icons.photo_camera),
+                          _buildEnhancedStatItem(
+                              'เสถียร',
+                              '${(_faceStability * 100).toInt()}%',
+                              Colors.blue,
+                              Icons.timeline),
+                          _buildEnhancedStatItem(
+                              'โมเดล',
+                              _modelLoaded ? 'พร้อม' : 'รอ',
+                              _modelLoaded ? Colors.green : Colors.yellow,
+                              Icons.model_training),
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 30),
+                  ],
+                ),
+              ),
+            ),
+
+            // Processing Overlay
+            if (_isSaving || _isCapturing)
+              Container(
+                color: Colors.black.withOpacity(0.8),
+                child: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const CircularProgressIndicator(
+                          color: Colors.white, strokeWidth: 3),
+                      const SizedBox(height: 20),
+                      Text(
+                          _isSaving
+                              ? 'กำลังสร้าง Face Profile...'
+                              : 'กำลังสร้าง Embedding...',
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 16)),
+                      if (_captureCount > 0) const SizedBox(height: 8),
+                      if (_captureCount > 0)
+                        Text(
+                            'ความสอดคล้อง: ${(_averageSimilarity * 100).toInt()}%',
+                            style: const TextStyle(
+                                color: Colors.white70, fontSize: 14)),
+                    ],
+                  ),
+                ),
+              ),
+
+            // Success Animation
+            if (_showSuccess)
+              Positioned.fill(
+                child: Container(
+                  color: Colors.transparent,
+                  child: Center(
+                    child: ScaleTransition(
+                      scale: _successController,
+                      child: Container(
+                        width: 100,
+                        height: 100,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.green.withOpacity(0.3),
+                          border: Border.all(color: Colors.green, width: 3),
+                        ),
+                        child: const Icon(Icons.check,
+                            color: Colors.white, size: 50),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+            // Guide Overlay
+            if (_showGuide)
+              Positioned.fill(
+                child: Container(
+                  color: Colors.transparent,
+                  child: Center(
+                    child: Container(
+                      width: 70,
+                      height: 70,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.green.withOpacity(0.3),
+                        border: Border.all(color: Colors.green, width: 2),
+                      ),
+                      child: const Icon(Icons.check,
+                          color: Colors.white, size: 35),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEnhancedStatItem(
+      String title, String value, Color color, IconData icon) {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.1),
+            shape: BoxShape.circle,
+            border: Border.all(color: color, width: 1),
+          ),
+          child: Icon(icon, color: color, size: 16),
+        ),
+        const SizedBox(height: 4),
+        Text(value,
+            style: TextStyle(
+                color: color, fontSize: 14, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 2),
+        Text(title,
+            style:
+                TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 10)),
+      ],
+    );
+  }
+}

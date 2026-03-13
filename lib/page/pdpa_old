@@ -1,0 +1,674 @@
+import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+class PDPAPage extends StatefulWidget {
+  const PDPAPage({super.key});
+
+  @override
+  State<PDPAPage> createState() => _PDPAPageState();
+}
+
+class _PDPAPageState extends State<PDPAPage> {
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  bool _hasReadAll = false;
+  bool _isSaving = false;
+  bool _isCreatingAccount = false;
+  
+  // ตัวแปรเก็บข้อมูลจากหน้า Register
+  Map<String, dynamic>? _userData;
+  
+  @override
+  void initState() {
+    super.initState();
+    _loadUserData();
+  }
+  
+  void _loadUserData() {
+    final args = ModalRoute.of(context)?.settings.arguments;
+    if (args != null && args is Map<String, dynamic>) {
+      setState(() {
+        _userData = args;
+      });
+      print("📥 รับข้อมูลจาก Register: $_userData");
+    }
+  }
+
+  Future<void> _saveConsentAndNavigate() async {
+    if (!_hasReadAll || _userData == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(_userData == null 
+            ? "ไม่พบข้อมูลการสมัคร กรุณาลองใหม่อีกครั้ง" 
+            : "กรุณาอ่านและยอมรับข้อตกลงทั้งหมด"),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _isSaving = true;
+      _isCreatingAccount = true;
+    });
+
+    try {
+      // 1. สร้างบัญชีใน Firebase Auth
+      final email = _userData!['email'] as String;
+      final password = _userData!['password'] as String;
+      
+      print("📝 กำลังสร้างบัญชีสำหรับ: $email");
+      
+      final userCredential = await _auth.createUserWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+      
+      final user = userCredential.user!;
+      print("✅ สร้างบัญชีสำเร็จ: ${user.uid}");
+      
+      // 2. ส่งอีเมลยืนยัน
+      await user.sendEmailVerification();
+      print("📧 ส่งอีเมลยืนยันแล้ว");
+      
+      // 3. บันทึกข้อมูลใน Firestore
+      final userDocument = {
+        'studentId': _userData!['studentId'],
+        'firstName': _userData!['firstName'],
+        'lastName': _userData!['lastName'],
+        'level': _userData!['level'],
+        'year': _userData!['year'],
+        'email': email,
+        'emailVerified': false, // ยังไม่ได้ยืนยันอีเมล
+        'pdpaConsent': true,
+        'pdpaConsentDate': FieldValue.serverTimestamp(),
+        'pdpaVersion': '1.0',
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+        'faceRegistered': false,
+        'role': 'student',
+        'status': 'pending', // รอการยืนยันอีเมล
+        'lastLogin': FieldValue.serverTimestamp(),
+        'registrationComplete': true,
+      };
+      
+      await _firestore.collection('users').doc(user.uid).set(userDocument);
+      print("💾 บันทึกข้อมูลใน Firestore สำเร็จ");
+      
+      // 4. แสดงผลสำเร็จ
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("✅ สมัครสมาชิกสำเร็จ! กรุณาตรวจสอบอีเมลเพื่อยืนยันบัญชี"),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 5),
+        ),
+      );
+      
+      // 5. ออกจากระบบและนำทางไปหน้า Login หรือหน้าแรก
+      await Future.delayed(Duration(seconds: 2));
+      
+      await _auth.signOut(); // ออกจากระบบเพื่อให้ผู้ใช้ล็อกอินใหม่หลังยืนยันอีเมล
+      
+      if (mounted) {
+        // นำทางไปหน้า Login หรือหน้าแรก
+        Navigator.pushNamedAndRemoveUntil(
+          context, 
+          '/login', // เปลี่ยนไปหน้า Login
+          (route) => false
+        );
+      }
+      
+    } on FirebaseAuthException catch (e) {
+      String errorMessage = "เกิดข้อผิดพลาดในการสร้างบัญชี";
+      if (e.code == 'email-already-in-use') {
+        errorMessage = "อีเมลนี้ถูกใช้งานแล้ว";
+      } else if (e.code == 'weak-password') {
+        errorMessage = "รหัสผ่านไม่แข็งแรงพอ";
+      } else if (e.code == 'invalid-email') {
+        errorMessage = "รูปแบบอีเมลไม่ถูกต้อง";
+      } else if (e.code == 'network-request-failed') {
+        errorMessage = "เชื่อมต่ออินเทอร์เน็ตล้มเหลว";
+      } else if (e.code == 'too-many-requests') {
+        errorMessage = "ร้องขอมากเกินไป กรุณารอสักครู่";
+      }
+      
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(errorMessage),
+          backgroundColor: Colors.red,
+        ),
+      );
+      
+    } catch (e) {
+      print("❌ เกิดข้อผิดพลาด: $e");
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("เกิดข้อผิดพลาด: ${e.toString()}"),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      setState(() {
+        _isSaving = false;
+        _isCreatingAccount = false;
+      });
+    }
+  }
+
+  Widget _buildUserInfoCard() {
+    if (_userData == null) return SizedBox();
+    
+    return Container(
+      margin: EdgeInsets.only(bottom: 20),
+      padding: EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Color(0xFF6A1B9A).withOpacity(0.05),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Color(0xFF6A1B9A).withOpacity(0.2)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.person, color: Color(0xFF6A1B9A)),
+              SizedBox(width: 10),
+              Text(
+                "ข้อมูลที่จะสมัคร",
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF6A1B9A),
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 12),
+          _buildInfoRow("รหัสนักศึกษา", _userData!['studentId']),
+          _buildInfoRow("ชื่อ-นามสกุล", "${_userData!['firstName']} ${_userData!['lastName']}"),
+          _buildInfoRow("ระดับการศึกษา", _userData!['level']),
+          _buildInfoRow("ชั้นปี", "ปี ${_userData!['year']}"),
+          _buildInfoRow("อีเมล", _userData!['email']),
+          Divider(height: 20),
+          Text(
+            "⚠️ ข้อมูลนี้จะถูกบันทึกหลังจากที่คุณยอมรับข้อตกลง",
+            style: TextStyle(
+              fontSize: 12,
+              color: Colors.orange[700],
+              fontStyle: FontStyle.italic,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInfoRow(String label, String value) {
+    return Padding(
+      padding: EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: TextStyle(
+                color: Colors.grey[700],
+                fontSize: 14,
+              ),
+            ),
+          ),
+          Text(
+            value,
+            style: TextStyle(
+              color: Colors.black,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildProcessingOverlay() {
+    if (!_isCreatingAccount) return SizedBox();
+    
+    return Container(
+      color: Colors.black.withOpacity(0.5),
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 100,
+              height: 100,
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black26,
+                    blurRadius: 10,
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(
+                    color: Color(0xFF6A1B9A),
+                  ),
+                  SizedBox(height: 10),
+                  Text(
+                    "กำลังสร้างบัญชี...",
+                    style: TextStyle(
+                      color: Color(0xFF6A1B9A),
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF5F5F5),
+      appBar: AppBar(
+        title: const Text('นโยบายความเป็นส่วนตัว'),
+        backgroundColor: const Color(0xFF6A1B9A),
+        foregroundColor: Colors.white,
+        elevation: 0,
+        leading: IconButton(
+          icon: Icon(Icons.arrow_back),
+          onPressed: _isSaving ? null : () {
+            Navigator.pop(context);
+          },
+        ),
+      ),
+      body: Stack(
+        children: [
+          Column(
+            children: [
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(20.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _buildHeader(),
+                      const SizedBox(height: 20),
+                      
+                      // แสดงข้อมูลผู้ใช้
+                      _buildUserInfoCard(),
+                      
+                      _buildSectionTitle('1. การเก็บรวบรวมข้อมูลส่วนบุคคล'),
+                      _buildParagraph(
+                          'เราเก็บรวบรวมข้อมูลส่วนบุคคลของคุณเพื่อวัตถุประสงค์ในการให้บริการและพัฒนาประสบการณ์การใช้งานของคุณ ข้อมูลที่เรารวบรวมอาจรวมถึงแต่ไม่จำกัดเพียง:'),
+                      _buildBulletPoint('• ชื่อ นามสกุล'),
+                      _buildBulletPoint('• ที่อยู่ อีเมล '),
+                      _buildBulletPoint('• ข้อมูลทางการศึกษา (รหัสนักศึกษา ระดับการศึกษา ชั้นปี)'),
+                      _buildBulletPoint('• ข้อมูลการใช้งานแอปพลิเคชัน'),
+                      _buildBulletPoint('• ข้อมูลใบหน้า  สำหรับการยืนยันตัวตนในการเช็คชื่อ'),
+                      _buildBulletPoint('• ข้อมูลเวลาและสถานที่ในการเช็คชื่อ'),
+                      
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('2. วัตถุประสงค์ในการใช้ข้อมูล'),
+                      _buildParagraph(
+                          'เราใช้ข้อมูลส่วนบุคคลของคุณสำหรับวัตถุประสงค์ต่อไปนี้:'),
+                      _buildBulletPoint('• ให้บริการและบริหารจัดการแอปพลิเคชัน'),
+                      _buildBulletPoint('• พัฒนาและปรับปรุงบริการ'),
+                      _buildBulletPoint('• ตอบคำถามและแก้ไขปัญหาต่างๆ'),
+                      _buildBulletPoint('• ส่งข้อมูลสำคัญเกี่ยวกับบริการ'),
+                      _buildBulletPoint('• เพิ่มความสะดวกรวดเร็วในการใช้งาน'),
+                      _buildBulletPoint('• ยืนยันตัวตนผ่านระบบจดจำใบหน้าในการเช็คชื่อ'),
+                      _buildBulletPoint('• บันทึกและตรวจสอบประวัติการเข้าเรียน'),
+                      _buildBulletPoint('• ป้องกันการเช็คชื่อแทนผู้อื่น'),
+                      _buildBulletPoint('• วิเคราะห์และพัฒนาระบบการเช็คชื่อ'),
+                      
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('3. การประมวลผลข้อมูลใบหน้า'),
+                      _buildParagraph(
+                          'เพื่อการยืนยันตัวตนที่ปลอดภัยและมีประสิทธิภาพ เราได้นำระบบจดจำใบหน้ามาใช้ในการเช็คชื่อ:'),
+                      _buildBulletPoint('• เก็บรวบรวมข้อมูลลักษณะใบหน้าจากภาพที่ถ่ายในขณะเช็คชื่อ'),
+                      _buildBulletPoint('• ประมวลผลข้อมูลใบหน้าเพื่อการยืนยันตัวตนเท่านั้น'),
+                      _buildBulletPoint('• ใช้เทคโนโลยีการจดจำใบหน้า (ML kit Face Detection) สำหรับการตรวจสอบ'),
+                      _buildBulletPoint('• แปลงภาพใบหน้าเป็นข้อมูลดิจิทัล'),
+                      _buildBulletPoint('• เก็บข้อมูลในรูปแบบที่เข้ารหัสเพื่อความปลอดภัย'),
+                      
+                      const SizedBox(height: 10),
+                      _buildParagraph('มาตรการรักษาความปลอดภัยข้อมูลใบหน้า:'),
+                      _buildBulletPoint('• เก็บข้อมูลในรูปแบบที่เข้ารหัส (Encrypted)'),
+                      _buildBulletPoint('• ไม่เก็บภาพใบหน้าแต่เก็บเป็นข้อมูลดิจิทัลแทน'),
+                      _buildBulletPoint('• จำกัดการเข้าถึงข้อมูลเฉพาะผู้ที่มีสิทธิ์เท่านั้น'),
+                      _buildBulletPoint('• มีระบบป้องกันการเข้าถึงข้อมูลโดยไม่ได้รับอนุญาต'),
+                      
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('4. การเปิดเผยข้อมูล'),
+                      _buildParagraph(
+                          'เราจะไม่เปิดเผยข้อมูลส่วนบุคคลของคุณแก่บุคคลอื่นโดยไม่ได้รับความยินยอมจากคุณ เว้นแต่ในกรณีต่อไปนี้:'),
+                      _buildBulletPoint('• ตามที่กฎหมายกำหนดหรือตามคำสั่งศาล'),
+                      _buildBulletPoint('• เพื่อปกป้องสิทธิ์หรือความปลอดภัยของเรา'),
+                      _buildBulletPoint('• ในกรณีที่มีการเปลี่ยนแปลงธุรกิจ เช่น การควบรวมกิจการ'),
+                      _buildBulletPoint('• ต่อเจ้าหน้าที่ของสถาบันเพื่อวัตถุประสงค์ทางการศึกษาเท่านั้น'),
+                      
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('5. ความปลอดภัยของข้อมูล'),
+                      _buildParagraph(
+                          'เราใช้มาตรการรักษาความปลอดภัยที่เหมาะสมเพื่อปกป้องข้อมูลส่วนบุคคลของคุณจากการเข้าถึง การใช้ หรือเปิดเผยโดยไม่ได้รับอนุญาต:'),
+                      _buildBulletPoint('• การเข้ารหัสข้อมูล (Data Encryption)'),
+                      _buildBulletPoint('• การควบคุมการเข้าถึงข้อมูล (Access Control)'),
+                      _buildBulletPoint('• ระบบไฟร์วอลล์และป้องกันการโจมตี'),
+                      _buildBulletPoint('• การสำรองข้อมูลอย่างปลอดภัย'),
+                      _buildBulletPoint('• การลบข้อมูลเมื่อหมดความจำเป็น'),
+                      
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('6. สิทธิ์ของคุณ'),
+                      _buildParagraph('คุณมีสิทธิ์ดังต่อไปนี้:'),
+                      _buildBulletPoint('• เข้าถึงข้อมูลส่วนบุคคลของคุณ'),
+                      _buildBulletPoint('• แก้ไขข้อมูลส่วนบุคคลของคุณ'),
+                      _buildBulletPoint('• ลบข้อมูลส่วนบุคคลของคุณ'),
+                      _buildBulletPoint('• คัดค้านการประมวลผลข้อมูลส่วนบุคคล'),
+                      
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('7. ระยะเวลาการเก็บข้อมูล'),
+                      _buildParagraph(
+                          'เราจะเก็บข้อมูลส่วนบุคคลของคุณไว้ตราบเท่าที่จำเป็นเพื่อให้บรรลุวัตถุประสงค์ที่ระบุในนโยบายนี้:'),
+                      _buildBulletPoint('• ข้อมูลส่วนบุคคลทั่วไป: เก็บตลอดระยะเวลาที่เป็นผู้ใช้งานระบบ'),
+                      _buildBulletPoint('• ข้อมูลใบหน้า: เก็บจนกว่าผู้ใช้งานจะขอลบหรือสิ้นสุดสถานะการเป็นนักศึกษา'),
+                      _buildBulletPoint('• ข้อมูลการเช็คชื่อ: เก็บเป็นระยะเวลา 1 ปีการศึกษา'),
+                      _buildBulletPoint('• ข้อมูลจะถูกลบภายใน 30 วัน หลังจากสิ้นสุดสถานะการเป็นนักศึกษา'),
+                      
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('8. การติดต่อ'),
+                      _buildParagraph(
+                          'หากคุณมีคำถามหรือข้อกังวลเกี่ยวกับนโยบายความเป็นส่วนตัวนี้ กรุณาติดต่อเราที่:'),
+                      _buildBulletPoint('• อีเมล: taradon5619@gmail.com'),
+                      _buildBulletPoint('• โทรศัพท์: 082-7108768'),
+
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('9. การเปลี่ยนแปลงนโยบาย'),
+                      _buildParagraph(
+                          'เราอาจแก้ไขนโยบายนี้เป็นครั้งคราว โดยจะแจ้งให้คุณทราบผ่านทางแอปพลิเคชันหรือช่องทางอื่นๆ ที่เหมาะสม การใช้บริการต่อหลังจากมีการเปลี่ยนแปลงถือว่าคุณยอมรับการเปลี่ยนแปลงนั้น'),
+                      
+                      const SizedBox(height: 25),
+                      _buildSectionTitle('10. ความยินยอม'),
+                      _buildParagraph(
+                          'โดยการกดปุ่ม "ยินยอม" ด้านล่าง แสดงว่าคุณได้อ่านและเข้าใจนโยบายความเป็นส่วนตัวนี้อย่างครบถ้วนแล้ว และยินยอมให้เรารวบรวม ใช้ และเปิดเผยข้อมูลส่วนบุคคลของคุณ รวมถึงข้อมูลใบหน้าสำหรับการยืนยันตัวตน ตามที่ระบุในนโยบายนี้'),
+                      
+                      const SizedBox(height: 20),
+                      _buildReadAllCheckbox(),
+                      const SizedBox(height: 20),
+                      _buildConsentDeclaration(),
+                      const SizedBox(height: 40),
+                    ],
+                  ),
+                ),
+              ),
+              _buildBottomButtons(),
+            ],
+          ),
+          
+          // Overlay สำหรับแสดงการประมวลผล
+          _buildProcessingOverlay(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeader() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF6A1B9A).withOpacity(0.1),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        children: [
+          Icon(Icons.privacy_tip, size: 50, color: Color(0xFF6A1B9A)),
+          SizedBox(height: 10),
+          Text(
+            'ขั้นตอนสุดท้าย: ยอมรับข้อตกลง',
+            style: TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+              color: Color(0xFF6A1B9A),
+            ),
+            textAlign: TextAlign.center,
+          ),
+          SizedBox(height: 8),
+          if (_userData != null)
+            Text(
+              'อีเมล: ${_userData!['email']}',
+              style: TextStyle(
+                fontSize: 14,
+                color: Color(0xFF6A1B9A),
+                fontWeight: FontWeight.w500,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          SizedBox(height: 4),
+          Text(
+            'โปรดอ่านนโยบายความเป็นส่วนตัวอย่างละเอียดก่อนให้ความยินยอม',
+            style: TextStyle(
+              fontSize: 12,
+              color: Colors.grey[600],
+            ),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSectionTitle(String title) {
+    return Text(
+      title,
+      style: const TextStyle(
+        fontSize: 18,
+        fontWeight: FontWeight.bold,
+        color: Color(0xFF6A1B9A),
+      ),
+    );
+  }
+
+  Widget _buildParagraph(String text) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 16,
+          height: 1.5,
+          color: Colors.black87,
+        ),
+        textAlign: TextAlign.justify,
+      ),
+    );
+  }
+
+  Widget _buildBulletPoint(String text) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('   • ', style: TextStyle(fontSize: 16)),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontSize: 16,
+                height: 1.5,
+                color: Colors.black87,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReadAllCheckbox() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.blue[50],
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.blue[200]!),
+      ),
+      child: Row(
+        children: [
+          Checkbox(
+            value: _hasReadAll,
+            onChanged: _isSaving ? null : (value) {
+              setState(() {
+                _hasReadAll = value ?? false;
+              });
+            },
+            activeColor: const Color(0xFF6A1B9A),
+          ),
+          Expanded(
+            child: Text(
+              'ข้าพเจ้าได้อ่านและเข้าใจนโยบายความเป็นส่วนตัวทั้งหมดอย่างครบถ้วนแล้ว',
+              style: TextStyle(
+                fontSize: 14,
+                color: Colors.blue[800],
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConsentDeclaration() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.yellow[50],
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.yellow[700]!),
+      ),
+      child: Column(
+        children: [
+          Icon(Icons.warning_amber, color: Colors.amber, size: 30),
+          SizedBox(height: 10),
+          Text(
+            'ข้อความสำคัญ:',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              color: Colors.red,
+            ),
+          ),
+          SizedBox(height: 8),
+          RichText(
+            textAlign: TextAlign.center,
+            text: TextSpan(
+              style: TextStyle(
+                fontSize: 14,
+                height: 1.5,
+                color: Colors.black87,
+              ),
+              children: [
+                TextSpan(
+                  text: 'ข้าพเจ้าได้รับทราบและเข้าใจนโยบายความเป็นส่วนตัวข้างต้นอย่างครบถ้วนแล้ว ',
+                ),
+                TextSpan(
+                  text: 'และยินยอมให้เก็บรวบรวม ใช้ และเปิดเผยข้อมูลส่วนบุคคล ',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                TextSpan(
+                  text: 'รวมถึงข้อมูลใบหน้าสำหรับการยืนยันตัวตนในการเช็คชื่อ ตามที่ระบุในนโยบายนี้',
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBottomButtons() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.3),
+            blurRadius: 10,
+            offset: const Offset(0, -2),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: OutlinedButton(
+              onPressed: _isSaving ? null : () {
+                Navigator.pop(context); // กลับไปหน้า register
+              },
+              style: OutlinedButton.styleFrom(
+                foregroundColor: const Color(0xFF6A1B9A),
+                side: const BorderSide(color: Color(0xFF6A1B9A)),
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text(
+                'ไม่ยินยอม',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: ElevatedButton(
+              onPressed: (_hasReadAll && !_isSaving) ? _saveConsentAndNavigate : null,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF6A1B9A),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                elevation: 4,
+              ),
+              child: _isSaving
+                  ? SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      ),
+                    )
+                  : Text(
+                      _userData == null ? 'รอข้อมูล...' : 'ยินยอมและสมัครสมาชิก',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

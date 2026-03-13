@@ -1,0 +1,12 @@
+//{
+  "faceData": {
+    "faceId": "timestamp",
+    "boundingBox": {...},
+    "landmarks": {...},
+    "contours": {...},
+    "faceVector": [1.2, 3.4, 5.6, ...], // สำหรับเปรียบเทียบ
+    "capturedAt": "timestamp"
+  },
+  "faceRegistered": true,
+  "registrationCompletedAt": "timestamp"
+}    // face data  **************************************

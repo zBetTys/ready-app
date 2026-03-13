@@ -1,0 +1,697 @@
+import 'dart:async';
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+class CheckinMatchPage extends StatefulWidget {
+  const CheckinMatchPage({super.key});
+
+  @override
+  State<CheckinMatchPage> createState() => _CheckinMatchPageState();
+}
+
+class _CheckinMatchPageState extends State<CheckinMatchPage> with WidgetsBindingObserver {
+  CameraController? _cameraController;
+  List<CameraDescription>? _cameras;
+  bool _isCameraInitialized = false;
+  bool _isProcessing = false;
+  bool _isMatching = false;
+  bool _matchSuccess = false;
+  bool _alreadyCheckedInToday = false; // ✅ ตรวจสอบการเช็คชื่อแล้ว
+  String _statusMessage = 'กำลังเตรียมกล้อง...';
+  double _matchConfidence = 0.0;
+  
+  FaceDetector? _faceDetector;
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  
+  Map<String, dynamic>? _storedFaceData;
+  Map<String, dynamic>? _currentUserData;
+  double _similarityThreshold = 0.6;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initializeSystem();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _cameraController?.dispose();
+    _faceDetector?.close();
+    super.dispose();
+  }
+
+  Future<void> _initializeSystem() async {
+    await _loadStoredFaceData();
+    await _loadCurrentUserData();
+    await _checkTodayCheckin(); // ✅ ตรวจสอบการเช็คชื่อวันนี้
+    if (!_alreadyCheckedInToday) {
+      await _initializeCamera();
+      _initializeFaceDetector();
+    }
+  }
+
+  // ✅ ตรวจสอบว่าผู้ใช้เช็คชื่อวันนี้แล้วหรือไม่
+  Future<void> _checkTodayCheckin() async {
+    try {
+      final user = _auth.currentUser;
+      if (user != null) {
+        final now = DateTime.now();
+        final startOfDay = DateTime(now.year, now.month, now.day);
+        
+        final query = await _firestore
+            .collection('checkins')
+            .where('userId', isEqualTo: user.uid)
+            .where('checkinTime', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfDay))
+            .limit(1)
+            .get();
+
+        if (query.docs.isNotEmpty) {
+          setState(() {
+            _alreadyCheckedInToday = true;
+            _statusMessage = 'คุณได้เช็คชื่อวันนี้เรียบร้อยแล้ว\nสามารถเช็คชื่อได้อีกครั้งในวันถัดไป';
+          });
+          print('❌ User already checked in today');
+        } else {
+          print('✅ User can check in today');
+        }
+      }
+    } catch (e) {
+      print('❌ Error checking today checkin: $e');
+    }
+  }
+
+  Future<void> _loadStoredFaceData() async {
+    try {
+      final user = _auth.currentUser;
+      if (user != null) {
+        final doc = await _firestore.collection('users').doc(user.uid).get();
+        if (doc.exists && doc.data()!['faceData'] != null) {
+          setState(() {
+            _storedFaceData = doc.data()!['faceData'];
+          });
+          print('✅ โหลดข้อมูลใบหน้าเรียบร้อย');
+          print('📊 จำนวนใบหน้าที่บันทึก: ${_storedFaceData?['capturedFaces']?.length ?? 0}');
+        } else {
+          setState(() {
+            _statusMessage = 'ไม่พบข้อมูลใบหน้า\nกรุณาลงทะเบียนใหม่';
+          });
+        }
+      }
+    } catch (e) {
+      print('❌ Error loading face data: $e');
+      setState(() {
+        _statusMessage = 'เกิดข้อผิดพลาดในการโหลดข้อมูล';
+      });
+    }
+  }
+
+  Future<void> _loadCurrentUserData() async {
+    try {
+      final user = _auth.currentUser;
+      if (user != null) {
+        final doc = await _firestore.collection('users').doc(user.uid).get();
+        if (doc.exists) {
+          setState(() {
+            _currentUserData = doc.data();
+          });
+          print('✅ โหลดข้อมูลผู้ใช้เรียบร้อย: ${_currentUserData?['firstName']} ${_currentUserData?['lastName']}');
+        }
+      }
+    } catch (e) {
+      print('❌ Error loading user data: $e');
+    }
+  }
+
+  Future<void> _initializeCamera() async {
+    try {
+      _cameras = await availableCameras();
+      final frontCamera = _cameras!.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.front,
+      );
+
+      _cameraController = CameraController(
+        frontCamera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
+
+      await _cameraController!.initialize();
+
+      if (mounted) {
+        setState(() {
+          _isCameraInitialized = true;
+          _statusMessage = 'มองตรงไปที่กล้อง\nระบบกำลังตรวจสอบใบหน้า';
+        });
+      }
+
+      _startFaceMatching();
+    } catch (e) {
+      print('❌ Camera initialization error: $e');
+      setState(() {
+        _statusMessage = 'ไม่สามารถเริ่มกล้องได้';
+      });
+    }
+  }
+
+  void _initializeFaceDetector() {
+    final options = FaceDetectorOptions(
+      enableContours: true,
+      enableLandmarks: true,
+      enableClassification: true,
+      enableTracking: true,
+      performanceMode: FaceDetectorMode.fast,
+    );
+    _faceDetector = FaceDetector(options: options);
+  }
+
+  void _startFaceMatching() {
+    // ✅ ไม่เริ่มตรวจจับถ้าเช็คชื่อแล้ว
+    if (_alreadyCheckedInToday) return;
+
+    Timer.periodic(const Duration(milliseconds: 1000), (timer) async {
+      if (_isProcessing || _isMatching || !_isCameraInitialized || _storedFaceData == null) return;
+
+      try {
+        setState(() => _isProcessing = true);
+        
+        final image = await _cameraController!.takePicture();
+        final inputImage = InputImage.fromFilePath(image.path);
+        final faces = await _faceDetector!.processImage(inputImage);
+
+        if (faces.isNotEmpty) {
+          final face = faces.first;
+          
+          if (_isFaceInGoodPosition(face)) {
+            setState(() {
+              _statusMessage = 'ตรวจพบใบหน้า\nกำลังเปรียบเทียบ...';
+            });
+            
+            await _matchAndCheckin(face, image.path);
+            
+            if (_matchSuccess) {
+              timer.cancel();
+            }
+          } else {
+            setState(() {
+              _statusMessage = 'กรุณาให้ใบหน้าอยู่ในกรอบ\nและมองตรงไปที่กล้อง';
+            });
+          }
+        } else {
+          setState(() {
+            _statusMessage = 'ไม่พบใบหน้า\nกรุณาให้ใบหน้าอยู่ในกรอบ';
+          });
+        }
+        
+        await File(image.path).delete();
+      } catch (e) {
+        print('❌ Face matching error: $e');
+      } finally {
+        setState(() => _isProcessing = false);
+      }
+    });
+  }
+
+  bool _isFaceInGoodPosition(Face face) {
+    final boundingBox = face.boundingBox;
+    
+    return boundingBox.width > 150 && 
+           boundingBox.height > 150 &&
+           (face.headEulerAngleY?.abs() ?? 0) < 20 &&
+           (face.headEulerAngleZ?.abs() ?? 0) < 20;
+  }
+
+  Future<void> _matchAndCheckin(Face face, String imagePath) async {
+    setState(() => _isMatching = true);
+    
+    try {
+      // ✅ ตรวจสอบอีกครั้งก่อนบันทึก
+      await _checkTodayCheckin();
+      if (_alreadyCheckedInToday) {
+        setState(() {
+          _matchSuccess = false;
+          _statusMessage = 'คุณได้เช็คชื่อวันนี้เรียบร้อยแล้ว';
+          _isMatching = false;
+        });
+        return;
+      }
+
+      final currentFaceFeatures = _extractFastFaceFeatures(face);
+      final similarity = _calculateAdvancedSimilarity(currentFaceFeatures);
+      _matchConfidence = similarity;
+      
+      if (similarity >= _similarityThreshold) {
+        await _saveCheckinRecord();
+        
+        setState(() {
+          _matchSuccess = true;
+          _statusMessage = 'เช็คชื่อสำเร็จ! ✅\nความคล้าย: ${(similarity * 100).toStringAsFixed(1)}%';
+        });
+        
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted) {
+            Navigator.pushNamedAndRemoveUntil(
+              context, 
+              '/home', 
+              (route) => false
+            );
+          }
+        });
+        
+      } else {
+        setState(() {
+          _matchSuccess = false;
+          _statusMessage = 'ใบหน้าไม่ตรงกับข้อมูล\nความคล้าย: ${(similarity * 100).toStringAsFixed(1)}%\nกรุณาลองอีกครั้ง';
+        });
+        
+        Future.delayed(const Duration(seconds: 1), () {
+          if (mounted && !_matchSuccess) {
+            setState(() {
+              _isMatching = false;
+              _statusMessage = 'มองตรงไปที่กล้อง\nระบบกำลังตรวจสอบใบหน้า';
+            });
+          }
+        });
+      }
+      
+    } catch (e) {
+      print('❌ Matching error: $e');
+      setState(() {
+        _matchSuccess = false;
+        _statusMessage = 'เกิดข้อผิดพลาด\nกรุณาลองใหม่อีกครั้ง';
+        _isMatching = false;
+      });
+    }
+  }
+
+  Map<String, dynamic> _extractFastFaceFeatures(Face face) {
+    return {
+      'angle': {
+        'yaw': face.headEulerAngleY ?? 0,
+        'roll': face.headEulerAngleZ ?? 0,
+      },
+      'boundingBox': {
+        'width': face.boundingBox.width,
+        'height': face.boundingBox.height,
+        'area': face.boundingBox.width * face.boundingBox.height,
+      },
+      'keyLandmarks': _extractKeyLandmarks(face),
+      'classification': {
+        'smilingProbability': face.smilingProbability ?? 0,
+        'leftEyeOpenProbability': face.leftEyeOpenProbability ?? 0,
+        'rightEyeOpenProbability': face.rightEyeOpenProbability ?? 0,
+      },
+      'faceVector': _generateFastFaceVector(face),
+    };
+  }
+
+  Map<String, dynamic> _extractKeyLandmarks(Face face) {
+    final landmarks = <String, dynamic>{};
+    
+    final keyLandmarkTypes = [
+      FaceLandmarkType.leftEye,
+      FaceLandmarkType.rightEye,
+      FaceLandmarkType.noseBase,
+    ];
+    
+    for (var type in keyLandmarkTypes) {
+      if (face.landmarks[type] != null) {
+        final point = face.landmarks[type]!.position;
+        landmarks[type.toString().split('.').last] = {
+          'x': point.x,
+          'y': point.y,
+        };
+      }
+    }
+    
+    return landmarks;
+  }
+
+  List<double> _generateFastFaceVector(Face face) {
+    return [
+      face.boundingBox.width,
+      face.boundingBox.height,
+      face.boundingBox.width / face.boundingBox.height,
+      face.headEulerAngleY ?? 0,
+      face.headEulerAngleZ ?? 0,
+      face.smilingProbability ?? 0,
+      face.leftEyeOpenProbability ?? 0,
+      face.rightEyeOpenProbability ?? 0,
+    ];
+  }
+
+  double _calculateAdvancedSimilarity(Map<String, dynamic> currentFeatures) {
+    try {
+      if (_storedFaceData?['capturedFaces'] == null) return 0.0;
+      
+      double bestSimilarity = 0.0;
+      final List<dynamic> capturedFaces = _storedFaceData!['capturedFaces'];
+      
+      for (var storedFace in capturedFaces) {
+        final similarity = _compareSingleFace(currentFeatures, storedFace);
+        if (similarity > bestSimilarity) {
+          bestSimilarity = similarity;
+        }
+      }
+      
+      return bestSimilarity;
+      
+    } catch (e) {
+      print('❌ Advanced similarity calculation error: $e');
+      return 0.0;
+    }
+  }
+
+  double _compareSingleFace(Map<String, dynamic> current, Map<String, dynamic> stored) {
+    double totalScore = 0.0;
+    int featureCount = 0;
+
+    final currentBox = current['boundingBox'];
+    final storedBox = stored['boundingBox'];
+    
+    if (currentBox != null && storedBox != null) {
+      final widthRatio = currentBox['width'] / storedBox['width'];
+      final heightRatio = currentBox['height'] / storedBox['height'];
+      final sizeScore = 1.0 - ((widthRatio - 1.0).abs() + (heightRatio - 1.0).abs()) / 2;
+      totalScore += sizeScore.clamp(0.0, 1.0) * 0.25;
+      featureCount++;
+    }
+
+    final currentAngle = current['angle'];
+    final storedAngle = stored['angle'];
+    
+    if (currentAngle != null && storedAngle != null) {
+      final yawDiff = (currentAngle['yaw'] - storedAngle['yaw']).abs();
+      final rollDiff = (currentAngle['roll'] - storedAngle['roll']).abs();
+      final angleScore = 1.0 - ((yawDiff + rollDiff) / 40);
+      totalScore += angleScore.clamp(0.0, 1.0) * 0.25;
+      featureCount++;
+    }
+
+    final currentVector = current['faceVector'];
+    final storedVector = stored['faceVector'];
+    
+    if (currentVector != null && storedVector is List && storedVector != null && storedVector is List) {
+      if (currentVector.length == storedVector.length) {
+        double vectorScore = 0.0;
+        for (int i = 0; i < currentVector.length; i++) {
+          final diff = (currentVector[i] - storedVector[i]).abs();
+          vectorScore += 1.0 - (diff / _getVectorRange(i));
+        }
+        vectorScore = vectorScore / currentVector.length;
+        totalScore += vectorScore.clamp(0.0, 1.0) * 0.4;
+        featureCount++;
+      }
+    }
+
+    final currentLandmarks = current['keyLandmarks'];
+    final storedLandmarks = stored['keyLandmarks'];
+    
+    if (currentLandmarks != null && storedLandmarks != null) {
+      double landmarkScore = 0.0;
+      int landmarkCount = 0;
+      
+      ['leftEye', 'rightEye', 'noseBase'].forEach((key) {
+        if (currentLandmarks[key] != null && storedLandmarks[key] != null) {
+          final currentPoint = currentLandmarks[key];
+          final storedPoint = storedLandmarks[key];
+          final xDiff = (currentPoint['x'] - storedPoint['x']).abs();
+          final yDiff = (currentPoint['y'] - storedPoint['y']).abs();
+          final pointScore = 1.0 - ((xDiff + yDiff) / 150);
+          landmarkScore += pointScore.clamp(0.0, 1.0);
+          landmarkCount++;
+        }
+      });
+      
+      if (landmarkCount > 0) {
+        totalScore += (landmarkScore / landmarkCount) * 0.1;
+      }
+      featureCount++;
+    }
+
+    return featureCount > 0 ? totalScore : 0.0;
+  }
+
+  double _getVectorRange(int index) {
+    final ranges = [100.0, 100.0, 0.5, 30.0, 30.0, 1.0, 1.0, 1.0];
+    return index < ranges.length ? ranges[index] : 1.0;
+  }
+
+  Future<void> _saveCheckinRecord() async {
+    try {
+      final user = _auth.currentUser;
+      if (user != null && _currentUserData != null) {
+        // ✅ ตรวจสอบอีกครั้งก่อนบันทึก
+        await _checkTodayCheckin();
+        if (_alreadyCheckedInToday) {
+          throw Exception('User already checked in today');
+        }
+
+        await _firestore.collection('checkins').add({
+          'userId': user.uid,
+          'studentId': _currentUserData?['studentId'] ?? '',
+          'firstName': _currentUserData?['firstName'] ?? '',
+          'lastName': _currentUserData?['lastName'] ?? '',
+          'checkinTime': FieldValue.serverTimestamp(),
+          'location': 'หน้าเสาธง',
+          'status': 'success',
+          'matchConfidence': _matchConfidence,
+          'similarityPercentage': (_matchConfidence * 100).toStringAsFixed(1),
+          'checkedInAt': DateTime.now().toIso8601String(),
+          'date': DateTime.now().toIso8601String().split('T')[0], // ✅ เก็บวันที่สำหรับ query
+        });
+        
+        print('✅ Checkin recorded successfully for: ${_currentUserData?['firstName']} ${_currentUserData?['lastName']}');
+        
+        // ✅ อัพเดตสถานะ
+        setState(() {
+          _alreadyCheckedInToday = true;
+        });
+      }
+    } catch (e) {
+      print('❌ Error saving checkin: $e');
+      rethrow;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        title: const Text('เช็คชื่อด้วยใบหน้า'),
+        backgroundColor: const Color(0xFF6A1B9A),
+        foregroundColor: Colors.white,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () {
+            Navigator.pop(context);
+          },
+        ),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                if (_isCameraInitialized && !_alreadyCheckedInToday)
+                  CameraPreview(_cameraController!)
+                else if (_alreadyCheckedInToday)
+                  Container(
+                    color: Colors.black,
+                    child: const Center(
+                      child: Icon(
+                        Icons.check_circle,
+                        size: 100,
+                        color: Colors.green,
+                      ),
+                    ),
+                  )
+                else
+                  Container(
+                    color: Colors.black,
+                    child: const Center(
+                      child: CircularProgressIndicator(color: Colors.white),
+                    ),
+                  ),
+
+                if (!_alreadyCheckedInToday) ...[
+                  Container(
+                    width: 280,
+                    height: 280,
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: _isMatching 
+                            ? (_matchSuccess ? Colors.green : Colors.orange)
+                            : Colors.white,
+                        width: 4,
+                      ),
+                      borderRadius: BorderRadius.circular(140),
+                    ),
+                  ),
+                ],
+
+                Positioned(
+                  bottom: 120,
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.8),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Column(
+                      children: [
+                        if (_alreadyCheckedInToday)
+                          const Icon(
+                            Icons.check_circle,
+                            color: Colors.green,
+                            size: 60,
+                          )
+                        else if (_isMatching)
+                          Icon(
+                            _matchSuccess ? Icons.check_circle : Icons.warning,
+                            color: _matchSuccess ? Colors.green : Colors.orange,
+                            size: 50,
+                          ),
+                        const SizedBox(height: 12),
+                        Text(
+                          _statusMessage,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            color: Colors.white,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                        if (_isMatching && !_matchSuccess && !_alreadyCheckedInToday)
+                          const SizedBox(height: 8),
+                        if (_isMatching && !_matchSuccess && !_alreadyCheckedInToday)
+                          const Text(
+                            'ระบบจะสแกนต่ออัตโนมัติ',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.white70,
+                            ),
+                          ),
+                        if (_alreadyCheckedInToday)
+                          const SizedBox(height: 8),
+                        if (_alreadyCheckedInToday)
+                          const Text(
+                            'สามารถเช็คชื่อได้อีกครั้งในวันถัดไป',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.white70,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                if ((_isProcessing || _isMatching) && !_alreadyCheckedInToday)
+                  Container(
+                    color: Colors.black.withOpacity(0.7),
+                    child: Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          if (_isMatching)
+                            Icon(
+                              _matchSuccess ? Icons.check_circle : Icons.autorenew,
+                              size: 60,
+                              color: _matchSuccess ? Colors.green : Colors.orange,
+                            )
+                          else
+                            const CircularProgressIndicator(color: Colors.white),
+                          const SizedBox(height: 20),
+                          Text(
+                            _isMatching 
+                                ? (_matchSuccess ? 'กำลังบันทึกข้อมูล...' : 'กำลังเปรียบเทียบใบหน้า...')
+                                : 'กำลังตรวจจับใบหน้า...',
+                            style: const TextStyle(
+                              fontSize: 16,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+
+          Container(
+            padding: const EdgeInsets.all(16),
+            color: Colors.black,
+            child: Row(
+              children: [
+                Icon(
+                  _alreadyCheckedInToday ? Icons.info_outline : Icons.info,
+                  color: _alreadyCheckedInToday ? Colors.green : Colors.grey[400],
+                  size: 20,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    _alreadyCheckedInToday 
+                        ? 'คุณได้เช็คชื่อวันนี้เรียบร้อยแล้ว'
+                        : _storedFaceData != null 
+                            ? 'กำลังเปรียบเทียบกับข้อมูลใบหน้าที่บันทึกไว้'
+                            : 'กำลังโหลดข้อมูลใบหน้า...',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: _alreadyCheckedInToday ? Colors.green : Colors.grey[400],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // ✅ ปุ่มกลับหน้าหลักเมื่อเช็คชื่อแล้ว
+          if (_alreadyCheckedInToday)
+            Container(
+              padding: const EdgeInsets.all(16),
+              color: Colors.black,
+              child: SizedBox(
+                width: double.infinity,
+                height: 50,
+                child: ElevatedButton(
+                  onPressed: () {
+                    Navigator.pushNamedAndRemoveUntil(
+                      context,
+                      '/home',
+                      (route) => false,
+                    );
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF6A1B9A),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(15),
+                    ),
+                  ),
+                  child: const Text(
+                    'กลับหน้าหลัก',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}

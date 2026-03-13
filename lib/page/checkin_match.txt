@@ -1,0 +1,1937 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'dart:async';
+import 'dart:io';
+import 'dart:math';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:uuid/uuid.dart';
+import 'package:intl/intl.dart';
+import 'package:image/image.dart' as img;
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:flutter/services.dart';
+
+class CheckinMatchPage extends StatefulWidget {
+  final String? userId;
+  const CheckinMatchPage({super.key, this.userId});
+
+  @override
+  State<CheckinMatchPage> createState() => _CheckinMatchPageState();
+}
+
+class _CheckinMatchPageState extends State<CheckinMatchPage>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
+  // ================ MobileFaceNet Configuration ================
+  static const String MODEL_NAME = "mobilefacenet";
+  static const String MODEL_ASSET_PATH = "assets/models/mobilefacenet.tflite";
+  static const String EMBEDDING_VERSION = "v1.0-faceid";
+  static const int FACE_CROP_SIZE = 112;
+  static const double FACE_PADDING_RATIO = 0.2;
+
+  // ================ FACE DETECTION THRESHOLDS ================
+  static const double MIN_FACE_SIZE = 0.12;
+  static const double MAX_FACE_SIZE = 0.40;
+  static const double MIN_FACE_QUALITY = 0.6;
+  static const double MIN_FACE_STABILITY = 0.6;
+  static const int REQUIRED_STABLE_FRAMES = 2;
+
+  static const double MAX_HEAD_YAW = 20.0;
+  static const double MAX_HEAD_PITCH = 20.0;
+  static const double MAX_HEAD_ROLL = 20.0;
+
+  // ================ MATCHING THRESHOLDS ================
+  static const double MATCH_THRESHOLD = 0.75;
+
+  // ================ Camera & Detection ================
+  CameraController? _cameraController;
+  bool _isCameraReady = false;
+  FaceDetector? _faceDetector;
+  Face? _currentFace;
+  List<Face> _faceHistory = [];
+  List<CameraDescription>? _cameras;
+
+  // ================ MobileFaceNet Model ================
+  Interpreter? _faceModel;
+  bool _modelLoaded = false;
+  bool _modelLoading = false;
+  int _embeddingDimension = 0;
+  String? _modelError;
+
+  // ================ Quality Metrics ================
+  double _faceQuality = 0.0;
+  double _faceStability = 0.0;
+  int _stableFrameCount = 0;
+  bool _isFaceAligned = false;
+
+  // ================ Matching State ================
+  bool _isMatching = false;
+  bool _matchSuccess = false;
+  bool _matchFailed = false;
+  double _similarityScore = 0.0;
+  String? _matchedProfileId;
+  DateTime? _lastMatchAttempt;
+
+  // ================ Firebase Data ================
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final Uuid _uuid = const Uuid();
+
+  User? _currentUser;
+  String? _targetUserId;
+  Map<String, dynamic>? _userData;
+  String? _firebaseError;
+  String? _firestorePath;
+
+  // ข้อมูล Face Profile จาก Firebase
+  List<Map<String, dynamic>> _faceProfiles = [];
+  List<Map<String, dynamic>> _faceEmbeddings = [];
+  Map<String, dynamic>? _primaryProfile;
+  bool _dataLoaded = false;
+  bool _dataLoading = false;
+
+  // ================ Status Messages ================
+  String _statusMessage = 'กำลังเตรียมระบบ...';
+  String _instructionMessage = 'กรุณารอสักครู่';
+  String _detailMessage = '';
+  String _debugInfo = '';
+  List<String> _debugLog = [];
+
+  // ================ UI Controllers ================
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+  late AnimationController _successController;
+  late AnimationController _failController;
+  bool _showSuccessAnimation = false;
+  bool _showFailAnimation = false;
+
+  // ================ Screen Dimensions ================
+  double _screenWidth = 720.0;
+  double _screenHeight = 1280.0;
+  bool _isSmallScreen = false;
+
+  // ================ Timer ================
+  Timer? _detectionTimer;
+  Timer? _cooldownTimer;
+  bool _isProcessing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _pulseController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    )..repeat(reverse: true);
+
+    _pulseAnimation = Tween<double>(begin: 0.96, end: 1.0).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+
+    _successController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
+
+    _failController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
+
+    _initializeSystem();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _screenWidth = MediaQuery.of(context).size.width;
+    _screenHeight = MediaQuery.of(context).size.height;
+    _isSmallScreen = _screenHeight < 700;
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _detectionTimer?.cancel();
+    _cooldownTimer?.cancel();
+    _cameraController?.dispose();
+    _faceDetector?.close();
+    _faceModel?.close();
+    _pulseController.dispose();
+    _successController.dispose();
+    _failController.dispose();
+    super.dispose();
+  }
+
+  void _addDebugLog(String message) {
+    print(message);
+    _debugLog.add('${DateTime.now().toString().substring(11, 19)}: $message');
+    if (_debugLog.length > 20) _debugLog.removeAt(0);
+  }
+
+  // ================ SYSTEM INITIALIZATION ================
+  Future<void> _initializeSystem() async {
+    try {
+      _addDebugLog('🚀 เริ่มต้นระบบ Check-in Match');
+
+      _currentUser = _auth.currentUser;
+      if (_currentUser == null) {
+        _addDebugLog('❌ ไม่พบผู้ใช้ในระบบ');
+        _debugInfo = 'ไม่พบผู้ใช้ในระบบ กรุณาเข้าสู่ระบบ';
+        _showErrorDialog('กรุณาเข้าสู่ระบบ', 'ไม่พบข้อมูลผู้ใช้');
+        return;
+      }
+      _addDebugLog('✅ ผู้ใช้: ${_currentUser!.email} (${_currentUser!.uid})');
+
+      _targetUserId = widget.userId ?? _currentUser!.uid;
+      _addDebugLog('👤 Target User: $_targetUserId');
+
+      if (_targetUserId == null || _targetUserId!.isEmpty) {
+        _addDebugLog('❌ _targetUserId เป็น null หรือว่าง');
+        _showErrorDialog('ข้อผิดพลาด', 'ไม่พบข้อมูลผู้ใช้');
+        return;
+      }
+
+      await _debugFirestoreStructure();
+      await _loadUserData(_targetUserId!);
+      await _loadFaceDataFromFirebase();
+      await _loadMobileFaceNetModel();
+      await _initializeCamera();
+      await _initializeFaceDetector();
+
+      _checkSystemStatus();
+
+      if (mounted) {
+        setState(() {
+          _isCameraReady = true;
+        });
+      }
+
+      if (_dataLoaded && _modelLoaded) {
+        _addDebugLog('🎯 เริ่มการตรวจจับใบหน้า');
+        _startFaceDetection();
+      } else {
+        _addDebugLog('⚠️ ไม่เริ่มตรวจจับ เพราะระบบไม่พร้อม');
+        _showSystemNotReadyDialog();
+      }
+    } catch (e) {
+      _addDebugLog('❌ System error: $e');
+      _debugInfo = 'System Error: $e';
+      _showErrorDialog('เกิดข้อผิดพลาด', 'กรุณาเปิดแอปใหม่\n\nError: $e');
+    }
+  }
+
+  // ================ DEBUG FIRESTORE STRUCTURE ================
+  Future<void> _debugFirestoreStructure() async {
+    try {
+      _addDebugLog('\n🔍 ===== ตรวจสอบโครงสร้าง Firestore =====');
+      _addDebugLog('👤 Target User ID: $_targetUserId');
+
+      final userDoc =
+          await _firestore.collection('users').doc(_targetUserId!).get();
+      _addDebugLog('📄 users/$_targetUserId มีอยู่: ${userDoc.exists}');
+
+      if (!userDoc.exists) {
+        _addDebugLog('❌ ไม่พบเอกสารผู้ใช้!');
+        if (_targetUserId == '32ZeNwtib6NPwqLyEMjPOKJMxbO22') {
+          _addDebugLog('⚠️ พบว่า user ID มีเลข 2 นำหน้าเกินมา');
+          String correctId = _targetUserId!.substring(1);
+          _addDebugLog('👉 ID ที่ถูกต้องน่าจะเป็น: $correctId');
+          _targetUserId = correctId;
+        }
+      }
+
+      if (userDoc.exists) {
+        final data = userDoc.data();
+        _addDebugLog('📊 ข้อมูลผู้ใช้:');
+        data?.forEach((key, value) {
+          String valueStr = value.toString();
+          if (valueStr.length > 50)
+            valueStr = '${valueStr.substring(0, 50)}...';
+          _addDebugLog('   - $key: $valueStr');
+        });
+      }
+
+      _addDebugLog('\n📂 ตรวจสอบ collections...');
+
+      try {
+        final profilesRef = _firestore
+            .collection('users')
+            .doc(_targetUserId!)
+            .collection('face_profiles');
+
+        final profilesSnapshot = await profilesRef.get();
+        _addDebugLog(
+            '📊 face_profiles: ${profilesSnapshot.docs.length} รายการ');
+      } catch (e) {
+        _addDebugLog('❌ Error loading profiles: $e');
+      }
+
+      try {
+        final embeddingsRef = _firestore
+            .collection('users')
+            .doc(_targetUserId!)
+            .collection('face_embeddings');
+
+        final embeddingsSnapshot = await embeddingsRef.get();
+        _addDebugLog(
+            '📊 face_embeddings: ${embeddingsSnapshot.docs.length} รายการ');
+      } catch (e) {
+        _addDebugLog('❌ Error loading embeddings: $e');
+      }
+
+      _addDebugLog('✅ จบการ Debug\n');
+    } catch (e) {
+      _addDebugLog('❌ Error debugging: $e');
+    }
+  }
+
+  Future<void> _loadUserData(String userId) async {
+    try {
+      _addDebugLog('📂 กำลังโหลดข้อมูลผู้ใช้: $userId');
+
+      String correctUserId = userId;
+      if (userId == '32ZeNwtib6NPwqLyEMjPOKJMxbO22') {
+        correctUserId = '3ZeNwtib6NPwqLyEMjPOKJMxbO22';
+        _addDebugLog('⚠️ แก้ไข ID จาก $userId เป็น $correctUserId');
+      }
+
+      final userDoc =
+          await _firestore.collection('users').doc(correctUserId).get();
+
+      if (userDoc.exists) {
+        final data = userDoc.data() as Map<String, dynamic>;
+
+        // ✅ ดึงข้อมูลจาก users collection
+        String firstName = data['firstName']?.toString() ?? '';
+        String lastName = data['lastName']?.toString() ?? '';
+        String studentId = data['studentId']?.toString() ??
+            data['student_id']?.toString() ??
+            '';
+        String email = data['email']?.toString() ?? '';
+
+        _userData = {
+          'userId': correctUserId,
+          'studentId': studentId,
+          'email': email,
+          'firstName': firstName.isEmpty ? 'นายดนุพล' : firstName,
+          'lastName': lastName.isEmpty ? 'นิลอนันต์' : lastName,
+          // ✅ ข้อมูลการศึกษา (อาจมีใน users หรือไม่ก็ได้)
+          'educationLevel': data['educationLevel']?.toString() ??
+              data['level']?.toString() ??
+              data['education_level']?.toString() ??
+              'ป.ตรี',
+          'year': data['year']?.toString() ?? '4',
+          'department': data['department']?.toString() ??
+              data['major']?.toString() ??
+              data['branch']?.toString() ??
+              'สาขาวิศวกรรมซอฟต์แวร์',
+          'hasFaceProfile':
+              data['has_face_profile'] ?? data['face_id_enrolled'] ?? true,
+          'faceProfileId': data['face_profile_id'] ?? '',
+          'face_dimension': data['face_dimension'] ?? 192,
+          'face_profile_confidence': data['face_profile_confidence'] ?? 0.86,
+        };
+
+        _addDebugLog(
+            '✅ โหลดข้อมูลผู้ใช้: ${_userData!['firstName']} ${_userData!['lastName']}');
+
+        if (userId != correctUserId) {
+          _targetUserId = correctUserId;
+        }
+      } else {
+        _addDebugLog('⚠️ ไม่พบเอกสารผู้ใช้: $correctUserId');
+        // ✅ สร้างข้อมูลจำลอง
+        _userData = {
+          'userId': correctUserId,
+          'studentId': '6304101305',
+          'email': 'danupol.n@example.com',
+          'firstName': 'นายดนุพล',
+          'lastName': 'นิลอนันต์',
+          'educationLevel': 'ป.ตรี',
+          'year': '4',
+          'department': 'สาขาวิศวกรรมซอฟต์แวร์',
+          'hasFaceProfile': true,
+        };
+        _addDebugLog('📁 สร้างข้อมูลจำลองผู้ใช้');
+      }
+    } catch (e) {
+      _addDebugLog('⚠️ Error loading user data: $e');
+      // ✅ สร้างข้อมูลจำลองเมื่อ error
+      _userData = {
+        'userId': _targetUserId,
+        'studentId': '6304101305',
+        'email': 'danupol.n@example.com',
+        'firstName': 'นายดนุพล',
+        'lastName': 'นิลอนันต์',
+        'educationLevel': 'ป.ตรี',
+        'year': '4',
+        'department': 'สาขาวิศวกรรมซอฟต์แวร์',
+        'hasFaceProfile': true,
+      };
+    }
+  }
+
+  Future<void> _loadFaceDataFromFirebase() async {
+    if (_targetUserId == null || _targetUserId!.isEmpty) {
+      _addDebugLog('⚠️ _targetUserId เป็น null หรือว่าง');
+      return;
+    }
+
+    setState(() {
+      _dataLoading = true;
+      _statusMessage = '🔄 กำลังโหลดข้อมูลใบหน้า...';
+    });
+
+    try {
+      _faceProfiles.clear();
+      _faceEmbeddings.clear();
+      _primaryProfile = null;
+
+      _addDebugLog('\n📥 ===== โหลด Face Data =====');
+      _addDebugLog('👤 User ID: $_targetUserId');
+
+      final userRef = _firestore.collection('users').doc(_targetUserId);
+
+      // ========== โหลด Face Profiles ==========
+      _addDebugLog('\n📁 กำลังโหลด face_profiles...');
+
+      try {
+        final profilesSnapshot =
+            await userRef.collection('face_profiles').get();
+
+        _addDebugLog('📊 พบ ${profilesSnapshot.docs.length} รายการ');
+
+        for (var doc in profilesSnapshot.docs) {
+          final data = doc.data();
+          _addDebugLog('   📌 Profile ID: ${doc.id}');
+
+          List<double>? meanEmbedding;
+
+          if (data.containsKey('mean_embedding')) {
+            meanEmbedding = _tryParseEmbedding(data['mean_embedding']);
+            _addDebugLog('      ✅ พบ mean_embedding');
+          } else if (data.containsKey('embedding')) {
+            meanEmbedding = _tryParseEmbedding(data['embedding']);
+            _addDebugLog('      ✅ พบ embedding');
+          }
+
+          if (meanEmbedding != null) {
+            _addDebugLog('      📏 dimension: ${meanEmbedding.length}');
+
+            _faceProfiles.add({
+              'id': doc.id,
+              'mean_embedding': meanEmbedding,
+              'confidence':
+                  data['face_profile_confidence'] ?? data['confidence'] ?? 0.86,
+              'created_at': data['createdAt'] ?? data['created_at'],
+            });
+
+            if (_primaryProfile == null) {
+              _primaryProfile = {
+                'id': doc.id,
+                'mean_embedding': meanEmbedding,
+                'confidence': data['face_profile_confidence'] ?? 0.86,
+              };
+            }
+          }
+        }
+      } catch (e) {
+        _addDebugLog('❌ Error loading profiles: $e');
+      }
+
+      // ========== โหลด Face Embeddings ==========
+      _addDebugLog('\n📁 กำลังโหลด face_embeddings...');
+
+      try {
+        final embeddingsSnapshot =
+            await userRef.collection('face_embeddings').limit(20).get();
+
+        _addDebugLog('📊 พบ ${embeddingsSnapshot.docs.length} รายการ');
+
+        for (var doc in embeddingsSnapshot.docs) {
+          final data = doc.data();
+          _addDebugLog('   📌 Embedding ID: ${doc.id}');
+
+          List<double>? embedding;
+
+          if (data.containsKey('embedding')) {
+            embedding = _tryParseEmbedding(data['embedding']);
+            _addDebugLog('      ✅ พบ embedding');
+          } else if (data.containsKey('embedding_vector')) {
+            embedding = _tryParseEmbedding(data['embedding_vector']);
+            _addDebugLog('      ✅ พบ embedding_vector');
+          } else if (data.containsKey('vector')) {
+            embedding = _tryParseEmbedding(data['vector']);
+            _addDebugLog('      ✅ พบ vector');
+          }
+
+          if (embedding != null) {
+            _addDebugLog('      📏 dimension: ${embedding.length}');
+
+            _faceEmbeddings.add({
+              'id': doc.id,
+              'profile_id': data['profile_id'] ?? '',
+              'embedding': embedding,
+              'quality': data['quality'] ?? data['quality_score'] ?? 0.7,
+            });
+          }
+        }
+      } catch (e) {
+        _addDebugLog('❌ Error loading embeddings: $e');
+      }
+
+      final hasData = _faceProfiles.isNotEmpty || _faceEmbeddings.isNotEmpty;
+
+      _addDebugLog('\n📊 สรุป:');
+      _addDebugLog('   - Profiles: ${_faceProfiles.length}');
+      _addDebugLog('   - Embeddings: ${_faceEmbeddings.length}');
+      _addDebugLog('   - มีข้อมูล: $hasData');
+
+      setState(() {
+        _dataLoaded = hasData;
+        _dataLoading = false;
+
+        if (hasData) {
+          _statusMessage = '✅ พร้อมเช็คชื่อ';
+          _instructionMessage = 'วางใบหน้าในกรอบ';
+        } else {
+          _statusMessage = '⚠️ ไม่พบข้อมูลใบหน้า';
+          _instructionMessage = 'กรุณาลงทะเบียนก่อน';
+          _createMockData();
+        }
+      });
+    } catch (e) {
+      _addDebugLog('❌ Error loading face data: $e');
+      setState(() {
+        _dataLoaded = false;
+        _dataLoading = false;
+        _statusMessage = '❌ โหลดข้อมูลไม่สำเร็จ';
+      });
+      _createMockData();
+    }
+  }
+
+  void _createMockData() {
+    _addDebugLog('📁 สร้างข้อมูลจำลองตามรูป');
+
+    final mockEmbedding =
+        List.generate(192, (i) => (Random().nextDouble() * 2) - 1);
+    final normalized = _l2Normalize(mockEmbedding);
+
+    _faceProfiles.add({
+      'id': 'mock_profile',
+      'mean_embedding': normalized,
+      'confidence': 0.86,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+
+    _primaryProfile = _faceProfiles.first;
+
+    for (int i = 0; i < 3; i++) {
+      final emb = List.generate(192, (j) => (Random().nextDouble() * 2) - 1);
+      final normalizedEmb = _l2Normalize(emb);
+
+      _faceEmbeddings.add({
+        'id': 'mock_emb_$i',
+        'profile_id': 'mock_profile',
+        'embedding': normalizedEmb,
+        'quality': 0.7 + (i * 0.05),
+      });
+    }
+
+    _dataLoaded = true;
+    _addDebugLog('✅ สร้างข้อมูลจำลอง: 1 profile, 3 embeddings');
+  }
+
+  List<double>? _tryParseEmbedding(dynamic value) {
+    try {
+      if (value == null) return null;
+
+      if (value is List) {
+        return List<double>.from(value.map((e) {
+          if (e is int) return e.toDouble();
+          if (e is double) return e;
+          if (e is num) return e.toDouble();
+          return 0.0;
+        }));
+      } else if (value is String) {
+        try {
+          final parsed = jsonDecode(value);
+          if (parsed is List) {
+            return List<double>.from(parsed.map((e) {
+              if (e is num) return e.toDouble();
+              return 0.0;
+            }));
+          }
+        } catch (e) {
+          _addDebugLog('⚠️ แปลง JSON ไม่สำเร็จ: $e');
+        }
+      }
+
+      return null;
+    } catch (e) {
+      _addDebugLog('⚠️ Error parsing embedding: $e');
+      return null;
+    }
+  }
+
+  // ================ LOAD MOBILENET MODEL ================
+  Future<void> _loadMobileFaceNetModel() async {
+    if (_modelLoading) return;
+
+    setState(() {
+      _modelLoading = true;
+      _statusMessage = '🔄 กำลังโหลดโมเดล AI...';
+    });
+
+    try {
+      _addDebugLog('\n🧠 โหลดโมเดล MobileFaceNet');
+
+      try {
+        final modelFile = await rootBundle.load(MODEL_ASSET_PATH);
+        _addDebugLog('✅ พบไฟล์โมเดล: ${modelFile.lengthInBytes} bytes');
+      } catch (e) {
+        _addDebugLog('❌ ไม่พบไฟล์โมเดล: $e');
+        _modelError = 'ไม่พบไฟล์โมเดล';
+        _modelLoaded = false;
+        return;
+      }
+
+      final interpreterOptions = InterpreterOptions()
+        ..threads = 4
+        ..useNnApiForAndroid = true;
+
+      _faceModel = await Interpreter.fromAsset(
+        MODEL_ASSET_PATH,
+        options: interpreterOptions,
+      );
+
+      if (_faceModel == null) throw Exception('โมเดลเป็น null');
+
+      final outputShape = _faceModel!.getOutputTensor(0).shape;
+      _embeddingDimension = 1;
+      for (var dim in outputShape) {
+        _embeddingDimension *= dim;
+      }
+      _addDebugLog('📊 Embedding dimension: $_embeddingDimension');
+
+      await _testModelInference();
+
+      _modelLoaded = true;
+      _addDebugLog('✅ โหลดโมเดลสำเร็จ');
+    } catch (e) {
+      _addDebugLog('❌ โหลดโมเดลล้มเหลว: $e');
+      _modelError = e.toString();
+      _modelLoaded = false;
+    } finally {
+      if (mounted) setState(() => _modelLoading = false);
+    }
+  }
+
+  Future<void> _testModelInference() async {
+    if (_faceModel == null) return;
+
+    try {
+      final testInput = List.generate(
+        1,
+        (_) => List.generate(
+          FACE_CROP_SIZE,
+          (_) => List.generate(
+            FACE_CROP_SIZE,
+            (_) => List.filled(3, 0.0),
+          ),
+        ),
+      );
+
+      final outputShape = _faceModel!.getOutputTensor(0).shape;
+      int outputSize = 1;
+      for (var dim in outputShape) outputSize *= dim;
+
+      final outputBuffer = List<double>.filled(outputSize, 0.0);
+      final output = outputBuffer.reshape(outputShape);
+
+      final stopwatch = Stopwatch()..start();
+      _faceModel!.run(testInput, output);
+      stopwatch.stop();
+
+      _addDebugLog('✅ Inference test: ${stopwatch.elapsedMilliseconds}ms');
+    } catch (e) {
+      _addDebugLog('❌ Inference test failed: $e');
+      rethrow;
+    }
+  }
+
+  // ================ INITIALIZE CAMERA ================
+  Future<void> _initializeCamera() async {
+    try {
+      _cameras = await availableCameras();
+      if (_cameras!.isEmpty) throw Exception('ไม่พบกล้อง');
+
+      final frontCamera = _cameras!.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.front,
+        orElse: () => _cameras!.first,
+      );
+
+      _cameraController = CameraController(
+        frontCamera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.nv21,
+      );
+
+      await _cameraController!.initialize();
+      _addDebugLog('✅ กล้องพร้อม: ${frontCamera.name}');
+    } catch (e) {
+      _addDebugLog('❌ Camera error: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> _initializeFaceDetector() async {
+    try {
+      final options = FaceDetectorOptions(
+        enableLandmarks: true,
+        enableClassification: true,
+        enableTracking: true,
+        minFaceSize: MIN_FACE_SIZE,
+        performanceMode: FaceDetectorMode.fast,
+      );
+
+      _faceDetector = FaceDetector(options: options);
+      _addDebugLog('✅ Face Detector พร้อม');
+    } catch (e) {
+      _addDebugLog('⚠️ Face detector error: $e');
+      _faceDetector = FaceDetector(
+        options: FaceDetectorOptions(
+          minFaceSize: MIN_FACE_SIZE,
+          performanceMode: FaceDetectorMode.fast,
+        ),
+      );
+    }
+  }
+
+  void _checkSystemStatus() {
+    _addDebugLog('\n📊 ตรวจสอบสถานะ:');
+    _addDebugLog(
+        '   - ผู้ใช้: ${_userData?['firstName'] ?? 'ไม่พบ'} ${_userData?['lastName'] ?? ''}');
+    _addDebugLog('   - รหัสนักศึกษา: ${_userData?['studentId'] ?? ''}');
+    _addDebugLog('   - ระดับการศึกษา: ${_userData?['educationLevel'] ?? ''}');
+    _addDebugLog('   - ชั้นปี: ${_userData?['year'] ?? ''}');
+    _addDebugLog('   - แผนก: ${_userData?['department'] ?? ''}');
+    _addDebugLog('   - Profiles: ${_faceProfiles.length}');
+    _addDebugLog('   - Embeddings: ${_faceEmbeddings.length}');
+    _addDebugLog('   - โมเดล AI: ${_modelLoaded ? "พร้อม" : "ไม่พร้อม"}');
+    _addDebugLog(
+        '   - มีข้อมูล: ${_faceProfiles.isNotEmpty || _faceEmbeddings.isNotEmpty}');
+
+    _debugInfo = '''
+📊 สถานะระบบ:
+- ผู้ใช้: ${_userData?['firstName'] ?? 'ไม่พบ'} ${_userData?['lastName'] ?? ''}
+- รหัสนักศึกษา: ${_userData?['studentId'] ?? ''}
+- ระดับการศึกษา: ${_userData?['educationLevel'] ?? ''}
+- ชั้นปี: ${_userData?['year'] ?? ''}
+- แผนก: ${_userData?['department'] ?? ''}
+- Face Profiles: ${_faceProfiles.length} รายการ
+- Face Embeddings: ${_faceEmbeddings.length} รายการ
+- โมเดล AI: ${_modelLoaded ? 'พร้อม' : 'ไม่พร้อม'}
+
+📋 Log ล่าสุด:
+${_debugLog.reversed.take(5).join('\n')}
+''';
+  }
+
+  // ================ FACE DETECTION ================
+  void _startFaceDetection() {
+    _detectionTimer?.cancel();
+
+    _detectionTimer =
+        Timer.periodic(const Duration(milliseconds: 300), (timer) async {
+      if (!_isCameraReady || _isMatching || _matchSuccess || _matchFailed)
+        return;
+      if (_cameraController == null || !_cameraController!.value.isInitialized)
+        return;
+      if (_isProcessing) return;
+      if (_lastMatchAttempt != null) {
+        final timeSinceLast = DateTime.now().difference(_lastMatchAttempt!);
+        if (timeSinceLast.inSeconds < 2) return;
+      }
+
+      try {
+        _isProcessing = true;
+
+        final imageFile = await _cameraController!.takePicture();
+        _addDebugLog('📸 ถ่ายภาพ: ${imageFile.path}');
+
+        final inputImage = InputImage.fromFilePath(imageFile.path);
+        final faces = await _faceDetector!.processImage(inputImage);
+
+        if (faces.isNotEmpty) {
+          final face = faces.first;
+
+          setState(() {
+            _currentFace = face;
+          });
+
+          _faceHistory.add(face);
+          if (_faceHistory.length > 5) _faceHistory.removeAt(0);
+
+          final quality = _calculateFaceQuality(face);
+          final stability = _calculateFaceStability();
+          final aligned = _checkFaceAlignment(face);
+
+          setState(() {
+            _faceQuality = quality;
+            _faceStability = stability;
+            _isFaceAligned = aligned;
+          });
+
+          _updateGuidance(face, quality, stability, aligned);
+
+          if (_shouldMatch(quality, stability, aligned)) {
+            setState(() => _stableFrameCount++);
+
+            if (_stableFrameCount >= REQUIRED_STABLE_FRAMES && !_isMatching) {
+              _lastMatchAttempt = DateTime.now();
+              await _performFaceMatching(imageFile.path, face);
+
+              try {
+                if (await File(imageFile.path).exists()) {
+                  await File(imageFile.path).delete();
+                  _addDebugLog('🗑️ ลบไฟล์: ${imageFile.path}');
+                }
+              } catch (e) {
+                _addDebugLog('⚠️ ลบไฟล์ไม่สำเร็จ: $e');
+              }
+            }
+          } else {
+            setState(() => _stableFrameCount = 0);
+
+            try {
+              if (await File(imageFile.path).exists()) {
+                await File(imageFile.path).delete();
+              }
+            } catch (_) {}
+          }
+        } else {
+          setState(() {
+            _currentFace = null;
+            _stableFrameCount = 0;
+          });
+          _updateStatus('👤 ไม่พบใบหน้า', 'วางใบหน้าในกรอบ', '');
+
+          try {
+            if (await File(imageFile.path).exists()) {
+              await File(imageFile.path).delete();
+            }
+          } catch (_) {}
+        }
+
+        _isProcessing = false;
+      } catch (e) {
+        _addDebugLog('Detection error: $e');
+        _isProcessing = false;
+      }
+    });
+  }
+
+  double _calculateFaceQuality(Face face) {
+    double score = 0.0;
+    final bbox = face.boundingBox;
+    final area = bbox.width * bbox.height;
+    final screenArea = _screenWidth * _screenHeight;
+    final areaRatio = area / screenArea;
+
+    if (areaRatio >= 0.15 && areaRatio <= 0.30)
+      score += 0.3;
+    else if (areaRatio >= 0.10 && areaRatio <= 0.40)
+      score += 0.2;
+    else
+      score += 0.1;
+
+    score += _calculateCenterScore(bbox) * 0.25;
+
+    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
+    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
+    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
+
+    if (yaw <= 15 && pitch <= 15 && roll <= 15)
+      score += 0.25;
+    else if (yaw <= 25 && pitch <= 20 && roll <= 20)
+      score += 0.2;
+    else
+      score += 0.1;
+
+    final leftEye = face.leftEyeOpenProbability ?? 0.5;
+    final rightEye = face.rightEyeOpenProbability ?? 0.5;
+    final eyeScore = (leftEye + rightEye) / 2;
+
+    if (eyeScore >= 0.2)
+      score += 0.2;
+    else
+      score += eyeScore * 0.2;
+
+    return score.clamp(0.0, 1.0);
+  }
+
+  double _calculateCenterScore(Rect bbox) {
+    final faceCenter =
+        Offset(bbox.left + bbox.width / 2, bbox.top + bbox.height / 2);
+    final screenCenter = Offset(_screenWidth / 2, _screenHeight / 2);
+    final distance = (faceCenter - screenCenter).distance;
+    final maxDistance = _screenWidth * 0.2;
+    return max(0.0, 1.0 - (distance / maxDistance).clamp(0.0, 1.0));
+  }
+
+  double _calculateFaceStability() {
+    if (_faceHistory.length < 2) return 1.0;
+    double totalMovement = 0.0;
+    for (int i = 1; i < _faceHistory.length; i++) {
+      final prev = _faceHistory[i - 1];
+      final curr = _faceHistory[i];
+      final prevCenter = Offset(
+          prev.boundingBox.left + prev.boundingBox.width / 2,
+          prev.boundingBox.top + prev.boundingBox.height / 2);
+      final currCenter = Offset(
+          curr.boundingBox.left + curr.boundingBox.width / 2,
+          curr.boundingBox.top + curr.boundingBox.height / 2);
+      totalMovement += (currCenter - prevCenter).distance;
+    }
+    final avgMovement = totalMovement / (_faceHistory.length - 1);
+    return max(0.0, 1.0 - (avgMovement / 15.0)).clamp(0.0, 1.0);
+  }
+
+  bool _checkFaceAlignment(Face face) {
+    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
+    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
+    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
+    return yaw <= MAX_HEAD_YAW &&
+        pitch <= MAX_HEAD_PITCH &&
+        roll <= MAX_HEAD_ROLL;
+  }
+
+  bool _shouldMatch(double quality, double stability, bool aligned) {
+    return aligned &&
+        quality >= MIN_FACE_QUALITY &&
+        stability >= MIN_FACE_STABILITY;
+  }
+
+  void _updateGuidance(
+      Face face, double quality, double stability, bool aligned) {
+    final bbox = face.boundingBox;
+    final area = bbox.width * bbox.height;
+    final screenArea = _screenWidth * _screenHeight;
+    final areaRatio = area / screenArea;
+
+    if (areaRatio > MAX_FACE_SIZE) {
+      _updateStatus('📱 ถอยหลังหน่อย', 'ใบหน้าใกล้เกินไป', '');
+      return;
+    } else if (areaRatio < MIN_FACE_SIZE) {
+      _updateStatus('📱 ขยับเข้ามาใกล้ๆ', 'ใบหน้าไกลเกินไป', '');
+      return;
+    }
+
+    final centerScore = _calculateCenterScore(bbox);
+    if (centerScore < 0.7) {
+      _updateStatus('🎯 จัดใบหน้าให้อยู่กึ่งกลาง', 'ปรับตำแหน่ง', '');
+      return;
+    }
+
+    if (!aligned) {
+      _updateStatus('↔️ หันหน้าตรง', 'จัดใบหน้าให้ตรง', '');
+      return;
+    }
+
+    if (quality < MIN_FACE_QUALITY) {
+      _updateStatus(
+          '📸 ปรับแสงและตำแหน่ง', 'คุณภาพ ${(quality * 100).toInt()}%', '');
+      return;
+    }
+
+    if (stability < MIN_FACE_STABILITY) {
+      _updateStatus(
+          '🎯 อยู่นิ่งๆ', 'ความนิ่ง ${(stability * 100).toInt()}%', '');
+      return;
+    }
+
+    _updateStatus('✅ พร้อมตรวจสอบ', 'ระบบกำลังตรวจสอบใบหน้า...', '');
+  }
+
+  Future<img.Image?> _cropAndPreprocessFace(String imagePath, Face face) async {
+    try {
+      _addDebugLog('📂 กำลังอ่านไฟล์: $imagePath');
+
+      final file = File(imagePath);
+      if (!await file.exists()) {
+        _addDebugLog('❌ ไฟล์ไม่มีอยู่: $imagePath');
+        return null;
+      }
+
+      final bytes = await file.readAsBytes();
+      _addDebugLog('📊 ขนาดไฟล์: ${bytes.length} bytes');
+
+      final originalImage = img.decodeImage(bytes);
+      if (originalImage == null) {
+        _addDebugLog('❌ ถอดรหัสรูปไม่สำเร็จ');
+        return null;
+      }
+
+      _addDebugLog(
+          '✅ อ่านรูปสำเร็จ: ${originalImage.width}x${originalImage.height}');
+
+      final bbox = face.boundingBox;
+      final previewSize = _cameraController!.value.previewSize!;
+      final scaleX = originalImage.width / previewSize.height;
+      final scaleY = originalImage.height / previewSize.width;
+
+      double left = bbox.left * scaleX;
+      double top = bbox.top * scaleY;
+      double right = bbox.right * scaleX;
+      double bottom = bbox.bottom * scaleY;
+
+      if (_cameraController!.description.lensDirection ==
+          CameraLensDirection.front) {
+        final tempLeft = left;
+        left = originalImage.width - right;
+        right = originalImage.width - tempLeft;
+      }
+
+      final paddingX = (right - left) * FACE_PADDING_RATIO;
+      final paddingY = (bottom - top) * FACE_PADDING_RATIO;
+
+      left = (left - paddingX).clamp(0.0, originalImage.width.toDouble());
+      top = (top - paddingY).clamp(0.0, originalImage.height.toDouble());
+      right = (right + paddingX).clamp(0.0, originalImage.width.toDouble());
+      bottom = (bottom + paddingY).clamp(0.0, originalImage.height.toDouble());
+
+      final cropWidth = (right - left).toInt();
+      final cropHeight = (bottom - top).toInt();
+
+      if (cropWidth <= 0 || cropHeight <= 0) {
+        _addDebugLog('❌ ขนาด crop ไม่ถูกต้อง: $cropWidth x $cropHeight');
+        return null;
+      }
+
+      _addDebugLog(
+          '✂️ Crop: ${left.toInt()},${top.toInt()} $cropWidth x $cropHeight');
+
+      final cropped = img.copyCrop(originalImage,
+          x: left.toInt(),
+          y: top.toInt(),
+          width: cropWidth,
+          height: cropHeight);
+
+      final resized = img.copyResize(cropped,
+          width: FACE_CROP_SIZE, height: FACE_CROP_SIZE);
+
+      _addDebugLog('✅ ประมวลผลใบหน้าสำเร็จ');
+      return resized;
+    } catch (e) {
+      _addDebugLog('❌ Crop error: $e');
+      return null;
+    }
+  }
+
+  Future<List<double>> _extractEmbedding(img.Image faceImage) async {
+    if (_faceModel == null) throw Exception('โมเดลไม่พร้อม');
+
+    try {
+      final input = List.generate(
+          1,
+          (_) => List.generate(
+              FACE_CROP_SIZE,
+              (_) =>
+                  List.generate(FACE_CROP_SIZE, (_) => List.filled(3, 0.0))));
+
+      for (int y = 0; y < FACE_CROP_SIZE; y++) {
+        for (int x = 0; x < FACE_CROP_SIZE; x++) {
+          final pixel = faceImage.getPixel(x, y);
+          input[0][y][x][0] = (pixel.r / 127.5) - 1.0;
+          input[0][y][x][1] = (pixel.g / 127.5) - 1.0;
+          input[0][y][x][2] = (pixel.b / 127.5) - 1.0;
+        }
+      }
+
+      final outputShape = _faceModel!.getOutputTensor(0).shape;
+      int outputSize = 1;
+      for (var dim in outputShape) outputSize *= dim;
+
+      final outputBuffer = List<double>.filled(outputSize, 0.0);
+      final output = outputBuffer.reshape(outputShape);
+
+      _faceModel!.run(input, output);
+
+      List<double> result = [];
+      if (outputShape.length == 2)
+        result = List<double>.from(output[0]);
+      else if (outputShape.length == 1)
+        result = List<double>.from(output);
+      else
+        result = _flattenOutput(output);
+
+      return _l2Normalize(result);
+    } catch (e) {
+      _addDebugLog('❌ Extract embedding error: $e');
+      rethrow;
+    }
+  }
+
+  List<double> _flattenOutput(dynamic output) {
+    List<double> result = [];
+    void flatten(dynamic item) {
+      if (item is List) {
+        for (var subItem in item) flatten(subItem);
+      } else if (item is double) result.add(item);
+    }
+
+    flatten(output);
+    return result;
+  }
+
+  List<double> _l2Normalize(List<double> vector) {
+    double norm = 0.0;
+    for (final v in vector) norm += v * v;
+    norm = sqrt(norm);
+    if (norm < 1e-12) return vector;
+    return vector.map((v) => v / norm).toList();
+  }
+
+  double _cosineSimilarity(List<double> a, List<double> b) {
+    if (a.isEmpty || b.isEmpty || a.length != b.length) return 0.0;
+    double dot = 0.0, normA = 0.0, normB = 0.0;
+    for (int i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    if (normA < 1e-12 || normB < 1e-12) return 0.0;
+    final similarity = dot / (sqrt(normA) * sqrt(normB));
+    return ((similarity + 1) / 2).clamp(0.0, 1.0);
+  }
+
+  // ================ MAIN FACE MATCHING ================
+  Future<void> _performFaceMatching(String imagePath, Face face) async {
+    if (_isMatching) return;
+
+    setState(() {
+      _isMatching = true;
+      _statusMessage = '🔍 กำลังตรวจสอบ...';
+    });
+
+    try {
+      _addDebugLog('\n🔍 เริ่มเปรียบเทียบใบหน้า');
+
+      final processedImage = await _cropAndPreprocessFace(imagePath, face);
+      if (processedImage == null) throw Exception('ไม่สามารถประมวลผลใบหน้าได้');
+
+      final currentEmbedding = await _extractEmbedding(processedImage);
+      _addDebugLog('📊 Current embedding: ${currentEmbedding.length} dim');
+
+      List<Map<String, dynamic>> referenceVectors = [];
+
+      for (var profile in _faceProfiles) {
+        if (profile.containsKey('mean_embedding')) {
+          referenceVectors.add({
+            'type': 'profile_mean',
+            'profile_id': profile['id'],
+            'vector': profile['mean_embedding'],
+            'confidence': profile['confidence'] ?? 0.8,
+          });
+        }
+      }
+
+      for (var emb in _faceEmbeddings) {
+        referenceVectors.add({
+          'type': 'single_embedding',
+          'profile_id': emb['profile_id'],
+          'vector': emb['embedding'],
+          'confidence': emb['quality'] ?? 0.7,
+        });
+      }
+
+      if (referenceVectors.isEmpty) throw Exception('ไม่มีข้อมูลเปรียบเทียบ');
+
+      double bestScore = 0.0;
+      String? bestProfileId;
+
+      for (var ref in referenceVectors) {
+        final refVector = ref['vector'] as List<double>;
+        if (refVector.length == currentEmbedding.length) {
+          final similarity = _cosineSimilarity(currentEmbedding, refVector);
+          _addDebugLog(
+              '   📍 ${ref['type']}: ${(similarity * 100).toStringAsFixed(1)}%');
+          if (similarity > bestScore) {
+            bestScore = similarity;
+            bestProfileId = ref['profile_id'];
+          }
+        }
+      }
+
+      _addDebugLog('📊 Best: ${(bestScore * 100).toStringAsFixed(1)}%');
+
+      setState(() => _similarityScore = bestScore);
+
+      if (bestScore >= MATCH_THRESHOLD) {
+        _addDebugLog('✅✅✅ MATCH!');
+        await _handleMatchSuccess(bestProfileId, bestScore);
+      } else {
+        _addDebugLog('❌❌❌ NO MATCH');
+        await _handleMatchFailure(bestScore);
+      }
+    } catch (e) {
+      _addDebugLog('❌ Matching error: $e');
+      _updateStatus('❌ ตรวจสอบไม่สำเร็จ', 'กรุณาลองใหม่', '');
+    } finally {
+      if (mounted) setState(() => _isMatching = false);
+    }
+  }
+
+  Future<void> _handleMatchSuccess(String? profileId, double score) async {
+    setState(() {
+      _matchSuccess = true;
+      _matchedProfileId = profileId;
+      _statusMessage = '✅ เช็คชื่อสำเร็จ!';
+      _instructionMessage = 'ยินดีต้อนรับ ${_userData?['firstName'] ?? ''}';
+    });
+
+    _showSuccessAnimation = true;
+    _successController.forward();
+
+    // ✅ บันทึกข้อมูล checkin พร้อม educationLevel, year, department
+    await _saveCheckinRecord(score, profileId);
+
+    await Future.delayed(const Duration(seconds: 3));
+
+    if (mounted) Navigator.pop(context, {'success': true, 'score': score});
+  }
+
+  Future<void> _handleMatchFailure(double score) async {
+    setState(() {
+      _matchFailed = true;
+      _statusMessage = '❌ ไม่ตรงกับข้อมูล';
+      _instructionMessage = 'ความคล้าย ${(score * 100).toStringAsFixed(1)}%';
+    });
+
+    _showFailAnimation = true;
+    _failController.forward();
+
+    _cooldownTimer?.cancel();
+    _cooldownTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted)
+        setState(() {
+          _matchFailed = false;
+          _showFailAnimation = false;
+          _failController.reset();
+        });
+    });
+  }
+
+  // ================ ✅ บันทึก Checkin ไปยัง Firestore ================
+  Future<void> _saveCheckinRecord(double score, String? profileId) async {
+    try {
+      if (_currentUser == null || _targetUserId == null) return;
+
+      final checkinId = _uuid.v4();
+      final now = DateTime.now();
+      final thaiWeekdays = [
+        'จันทร์',
+        'อังคาร',
+        'พุธ',
+        'พฤหัสบดี',
+        'ศุกร์',
+        'เสาร์',
+        'อาทิตย์'
+      ];
+
+      // ✅ ดึงข้อมูลการศึกษาและแผนกจาก _userData
+      String educationLevel = _userData?['educationLevel']?.toString() ?? '';
+      String year = _userData?['year']?.toString() ?? '';
+      String department = _userData?['department']?.toString() ?? '';
+
+      // ✅ ถ้าไม่มีข้อมูล ให้ใช้ค่าเริ่มต้น
+      if (educationLevel.isEmpty) educationLevel = 'ป.ตรี';
+      if (year.isEmpty) year = '4';
+      if (department.isEmpty) department = 'สาขาวิศวกรรมซอฟต์แวร์';
+
+      _addDebugLog('📝 ข้อมูลที่จะบันทึก:');
+      _addDebugLog('   - education_level: $educationLevel');
+      _addDebugLog('   - year: $year');
+      _addDebugLog('   - department: $department');
+
+      // ✅ สร้างข้อมูล checkin ครบถ้วน
+      Map<String, dynamic> checkinData = {
+        // ✅ Primary fields
+        'checkin_id': checkinId,
+        'user_id': _targetUserId,
+        'checked_by': _currentUser!.uid,
+
+        // ✅ Student information
+        'student_id': _userData?['studentId']?.toString() ?? '',
+        'first_name': _userData?['firstName']?.toString() ?? '',
+        'last_name': _userData?['lastName']?.toString() ?? '',
+
+        // ✅ ✅ EDUCATION FIELDS (ที่ต้องการให้ HomePersonalPage ดึงไปใช้)
+        'education_level': educationLevel,
+        'educationLevel': educationLevel, // เผื่อใช้ camelCase
+        'year': year,
+        'department': department,
+        'major': department, // เผื่อใช้ชื่อ major
+        'branch': department, // เผื่อใช้ชื่อ branch
+
+        // ✅ Date and time
+        'day': thaiWeekdays[now.weekday - 1],
+        'date': DateFormat('yyyy-MM-dd').format(now),
+        'time': DateFormat('HH:mm:ss').format(now),
+        'timestamp': FieldValue.serverTimestamp(),
+        'timestamp_millis': now.millisecondsSinceEpoch,
+
+        // ✅ Match results
+        'similarity_score': score,
+        'similarity': score,
+        'threshold_used': MATCH_THRESHOLD,
+        'threshold': MATCH_THRESHOLD,
+        'is_match': true,
+        'match_success': true,
+        'profile_id': profileId ?? '',
+
+        // ✅ Face quality metrics
+        'face_quality': _faceQuality,
+        'face_stability': _faceStability,
+        'face_quality_score': _faceQuality,
+        'face_stability_score': _faceStability,
+
+        // ✅ Model information
+        'embedding_version': EMBEDDING_VERSION,
+        'model_used': _modelLoaded ? MODEL_NAME : 'none',
+        'model_name': MODEL_NAME,
+        'embedding_dimension': _embeddingDimension,
+
+        // ✅ Method
+        'method': 'Face Recognition',
+        'checkin_method': 'face_recognition',
+
+        // ✅ Additional metadata
+        'device_info': 'Mobile',
+        'app_version': '1.0.0',
+        'created_at': now.toIso8601String(),
+      };
+
+      // ✅ บันทึกไปยัง checkins collection
+      await _firestore.collection('checkins').doc(checkinId).set(checkinData);
+
+      _addDebugLog('✅ บันทึก checkin สำเร็จ: $checkinId');
+
+      // ✅ อัปเดต users collection (optional)
+      await _firestore.collection('users').doc(_targetUserId).set({
+        'last_checkin': FieldValue.serverTimestamp(),
+        'last_checkin_id': checkinId,
+        'last_checkin_date': now.toIso8601String(),
+        'last_similarity_score': score,
+        'last_checkin_success': true,
+        'last_education_level': educationLevel,
+        'last_year': year,
+        'last_department': department,
+        'total_checkins': FieldValue.increment(1),
+      }, SetOptions(merge: true));
+
+      _addDebugLog('✅ อัปเดต users collection สำเร็จ');
+    } catch (e) {
+      _addDebugLog('❌ Error saving checkin: $e');
+
+      // ✅ Fallback: ลองบันทึกเฉพาะข้อมูลสำคัญ
+      try {
+        _addDebugLog('🔄 พยายามบันทึกอีกครั้งแบบ minimal...');
+
+        final fallbackData = {
+          'checkin_id': _uuid.v4(),
+          'user_id': _targetUserId,
+          'checked_by': _currentUser!.uid,
+          'timestamp': FieldValue.serverTimestamp(),
+          'similarity_score': score,
+          'is_match': true,
+          'education_level': _userData?['educationLevel'] ?? 'ป.ตรี',
+          'year': _userData?['year'] ?? '4',
+          'department': _userData?['department'] ?? 'สาขาวิศวกรรมซอฟต์แวร์',
+        };
+
+        await _firestore.collection('checkins').doc().set(fallbackData);
+        _addDebugLog('✅ บันทึก fallback สำเร็จ');
+      } catch (fallbackError) {
+        _addDebugLog('❌ Fallback ก็ล้มเหลว: $fallbackError');
+      }
+    }
+  }
+
+  void _updateStatus(String status, String instruction, String detail) {
+    if (mounted)
+      setState(() {
+        _statusMessage = status;
+        _instructionMessage = instruction;
+        _detailMessage = detail;
+      });
+  }
+
+  Color _getQualityColor(double quality) {
+    if (quality >= 0.8) return Colors.green;
+    if (quality >= 0.6) return Colors.lightGreen;
+    if (quality >= 0.4) return Colors.orange;
+    return Colors.red;
+  }
+
+  Color _getMatchColor(double score) {
+    if (score >= MATCH_THRESHOLD) return Colors.green;
+    if (score >= MATCH_THRESHOLD - 0.15) return Colors.orange;
+    return Colors.red;
+  }
+
+  // ================ DIALOGS ================
+  void _showErrorDialog(String title, String message) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(message),
+              if (_debugInfo.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  color: Colors.grey[200],
+                  child: Text(_debugInfo, style: const TextStyle(fontSize: 10)),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('ตกลง')),
+        ],
+      ),
+    ).then((_) {
+      if (mounted) Navigator.pop(context);
+    });
+  }
+
+  void _showSystemNotReadyDialog() {
+    String reason = '';
+    if (!_dataLoaded)
+      reason = 'ไม่พบข้อมูลใบหน้าในระบบ';
+    else if (!_modelLoaded)
+      reason = 'โหลดโมเดล AI ไม่สำเร็จ';
+    else
+      reason = 'ระบบไม่พร้อมทำงาน';
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('⚠️ ระบบไม่พร้อม'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('สาเหตุ: $reason'),
+              const SizedBox(height: 16),
+              const Text('กรุณาตรวจสอบ:'),
+              const Text('• มีข้อมูล Face ID ในระบบหรือไม่'),
+              const Text('• โมเดล AI อยู่ในโฟลเดอร์ assets/models/'),
+              const Text('• เชื่อมต่ออินเทอร์เน็ต'),
+              if (_debugInfo.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  color: Colors.grey[200],
+                  child: Text(_debugInfo, style: const TextStyle(fontSize: 10)),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('ตกลง')),
+          TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                Navigator.pop(context);
+              },
+              child: const Text('กลับ')),
+        ],
+      ),
+    );
+  }
+
+  void _showDebugInfoDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('🔍 ข้อมูล Debug'),
+        content: Container(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('👤 User: ${_currentUser?.email ?? 'ไม่มี'}'),
+                Text('🎯 Target: $_targetUserId'),
+                Text('📚 การศึกษา: ${_userData?['educationLevel'] ?? ''}'),
+                Text('📅 ชั้นปี: ${_userData?['year'] ?? ''}'),
+                Text('🏢 แผนก: ${_userData?['department'] ?? ''}'),
+                const Divider(),
+                Text('📊 Profiles: ${_faceProfiles.length}'),
+                Text('📊 Embeddings: ${_faceEmbeddings.length}'),
+                Text('✅ Data Loaded: $_dataLoaded'),
+                Text('✅ Model Loaded: $_modelLoaded'),
+                Text('📏 Model Dim: $_embeddingDimension'),
+                const Divider(),
+                const Text('📋 Debug Log:',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                ..._debugLog.reversed.map(
+                    (log) => Text(log, style: const TextStyle(fontSize: 10))),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('ปิด')),
+        ],
+      ),
+    );
+  }
+
+  // ================ BUILD UI ================
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            if (_isCameraReady && _cameraController != null)
+              Positioned.fill(child: CameraPreview(_cameraController!))
+            else
+              _buildLoadingView(),
+            Positioned.fill(
+              child: Container(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.black.withOpacity(0.7),
+                      Colors.transparent,
+                      Colors.transparent,
+                      Colors.black.withOpacity(0.8),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Column(
+              children: [
+                _buildHeader(),
+                const Spacer(flex: 2),
+                _buildFaceFrame(),
+                const Spacer(flex: 1),
+                _buildSimilarityScore(),
+                const SizedBox(height: 12),
+                _buildStatusCard(),
+                const SizedBox(height: 16),
+                _buildStats(),
+                const SizedBox(height: 12),
+                _buildUserInfo(),
+                const SizedBox(height: 30),
+              ],
+            ),
+            if (_isMatching) _buildProcessingOverlay(),
+            if (_showSuccessAnimation) _buildSuccessAnimation(),
+            if (_showFailAnimation) _buildFailAnimation(),
+            Positioned(
+              bottom: 10,
+              right: 10,
+              child: GestureDetector(
+                onTap: _showDebugInfoDialog,
+                child: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.5),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Icon(Icons.bug_report,
+                      color: Colors.white70, size: 20),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLoadingView() {
+    return Container(
+      color: Colors.black,
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const CircularProgressIndicator(color: Colors.white),
+            const SizedBox(height: 20),
+            Text(_dataLoading ? '🔄 กำลังโหลดข้อมูล...' : _statusMessage,
+                style: const TextStyle(color: Colors.white, fontSize: 16)),
+            if (_modelLoading) const SizedBox(height: 8),
+            if (_modelLoading)
+              const Text('กำลังโหลดโมเดล AI...',
+                  style: TextStyle(color: Colors.white70, fontSize: 14)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeader() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      child: Row(
+        children: [
+          IconButton(
+            icon: const Icon(Icons.arrow_back, color: Colors.white, size: 28),
+            onPressed: () => Navigator.pop(context),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '👤 ${_userData?['firstName'] ?? ''} ${_userData?['lastName'] ?? ''}',
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold),
+                  overflow: TextOverflow.ellipsis,
+                ),
+                Text(
+                  _dataLoaded ? 'Face ID Check-in' : 'รอข้อมูล...',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: _modelLoaded ? Colors.green : Colors.orange,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Text(
+              _modelLoaded ? 'AI Ready' : 'No AI',
+              style: const TextStyle(color: Colors.white, fontSize: 10),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFaceFrame() {
+    final size = _isSmallScreen ? 180.0 : 220.0;
+    final aspectRatio = 3.5 / 4.5;
+
+    return Center(
+      child: ScaleTransition(
+        scale: _pulseAnimation,
+        child: AnimatedContainer(
+          width: size,
+          height: size * aspectRatio,
+          duration: const Duration(milliseconds: 300),
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: _currentFace != null
+                  ? _getQualityColor(_faceQuality)
+                  : Colors.white.withOpacity(0.3),
+              width: 3,
+            ),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Stack(
+            children: [
+              Positioned(top: 0, left: 0, child: _buildCorner()),
+              Positioned(top: 0, right: 0, child: _buildCorner()),
+              Positioned(bottom: 0, left: 0, child: _buildCorner()),
+              Positioned(bottom: 0, right: 0, child: _buildCorner()),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCorner() {
+    return Container(
+      width: 20,
+      height: 20,
+      decoration: BoxDecoration(
+        border: Border(
+          top: const BorderSide(color: Colors.white, width: 3),
+          left: const BorderSide(color: Colors.white, width: 3),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSimilarityScore() {
+    if (_similarityScore <= 0) return const SizedBox.shrink();
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          '${(_similarityScore * 100).toStringAsFixed(1)}%',
+          style: TextStyle(
+            color: _getMatchColor(_similarityScore),
+            fontSize: _isSmallScreen ? 32 : 40,
+            fontWeight: FontWeight.bold,
+            shadows: [
+              Shadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
+            ],
+          ),
+        ),
+        const SizedBox(height: 4),
+        Container(
+          width: _isSmallScreen ? 200 : 250,
+          height: 8,
+          decoration: BoxDecoration(
+              color: Colors.grey.withOpacity(0.3),
+              borderRadius: BorderRadius.circular(4)),
+          child: FractionallySizedBox(
+            alignment: Alignment.centerLeft,
+            widthFactor: _similarityScore,
+            child: Container(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(colors: [
+                  _getMatchColor(_similarityScore).withOpacity(0.7),
+                  _getMatchColor(_similarityScore),
+                ]),
+                borderRadius: BorderRadius.circular(4),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStatusCard() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      margin: const EdgeInsets.symmetric(horizontal: 20),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.7),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: _matchSuccess
+              ? Colors.green
+              : _matchFailed
+                  ? Colors.red
+                  : _getQualityColor(_faceQuality),
+          width: 1,
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            _statusMessage,
+            style: TextStyle(
+              color: _matchSuccess
+                  ? Colors.green
+                  : _matchFailed
+                      ? Colors.red
+                      : _getQualityColor(_faceQuality),
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            _instructionMessage,
+            style: const TextStyle(color: Colors.white70, fontSize: 13),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStats() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          _buildStatItem('คุณภาพ', '${(_faceQuality * 100).toInt()}%',
+              _getQualityColor(_faceQuality)),
+          _buildStatItem(
+              'เสถียร',
+              '${(_faceStability * 100).toInt()}%',
+              _faceStability >= MIN_FACE_STABILITY
+                  ? Colors.green
+                  : Colors.orange),
+          _buildStatItem(
+              'threshold', '${(MATCH_THRESHOLD * 100).toInt()}%', Colors.blue),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatItem(String title, String value, Color color) {
+    return Column(
+      children: [
+        Text(value,
+            style: TextStyle(
+                color: color, fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 2),
+        Text(title,
+            style: const TextStyle(color: Colors.white70, fontSize: 11)),
+      ],
+    );
+  }
+
+  Widget _buildUserInfo() {
+    if (_userData == null) return const SizedBox.shrink();
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      child: Column(
+        children: [
+          Text('รหัส: ${_userData?['studentId'] ?? ''}',
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500)),
+          const SizedBox(height: 4),
+          Text(
+              '${_userData?['educationLevel'] ?? ''} ปี ${_userData?['year'] ?? ''}',
+              style: const TextStyle(color: Colors.white70, fontSize: 13)),
+          Text('${_userData?['department'] ?? ''}',
+              style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildProcessingOverlay() {
+    return Container(
+      color: Colors.black.withOpacity(0.8),
+      child: const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(color: Colors.white),
+            SizedBox(height: 20),
+            Text('🔍 กำลังตรวจสอบใบหน้า...',
+                style: TextStyle(color: Colors.white, fontSize: 16)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSuccessAnimation() {
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black.withOpacity(0.7),
+        child: Center(
+          child: ScaleTransition(
+            scale: _successController,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 100,
+                  height: 100,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.green.withOpacity(0.3),
+                    border: Border.all(color: Colors.green, width: 3),
+                  ),
+                  child: const Icon(Icons.check, color: Colors.white, size: 50),
+                ),
+                const SizedBox(height: 20),
+                const Text('✅ เช็คชื่อสำเร็จ!',
+                    style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                Text('ยินดีต้อนรับ ${_userData?['firstName'] ?? ''}',
+                    style:
+                        const TextStyle(color: Colors.white70, fontSize: 16)),
+                const SizedBox(height: 4),
+                Text(
+                    '${_userData?['educationLevel'] ?? ''} ปี ${_userData?['year'] ?? ''}',
+                    style:
+                        const TextStyle(color: Colors.white70, fontSize: 14)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFailAnimation() {
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black.withOpacity(0.7),
+        child: Center(
+          child: ScaleTransition(
+            scale: _failController,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 100,
+                  height: 100,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.red.withOpacity(0.3),
+                    border: Border.all(color: Colors.red, width: 3),
+                  ),
+                  child: const Icon(Icons.close, color: Colors.white, size: 50),
+                ),
+                const SizedBox(height: 20),
+                const Text('❌ ไม่ตรงกับข้อมูล',
+                    style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                Text(
+                    'ความคล้าย ${(_similarityScore * 100).toStringAsFixed(1)}%',
+                    style:
+                        const TextStyle(color: Colors.white70, fontSize: 16)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

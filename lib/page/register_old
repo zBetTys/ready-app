@@ -1,0 +1,1389 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:ready/page/pdpa.dart';
+import 'package:flutter/services.dart';
+
+class RegisterPage extends StatefulWidget {
+  const RegisterPage({super.key});
+
+  @override
+  State<RegisterPage> createState() => _RegisterPageState();
+}
+
+class _RegisterPageState extends State<RegisterPage> {
+  final _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  // Controllers
+  final TextEditingController _studentIdController = TextEditingController();
+  final TextEditingController _firstNameController = TextEditingController();
+  final TextEditingController _lastNameController = TextEditingController();
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _confirmPasswordController =
+      TextEditingController();
+
+  // Dropdown variables
+  String? _selectedLevel;
+  String? _selectedYear;
+
+  // State variables
+  bool _isLoading = false;
+  bool _obscurePassword = true;
+  bool _obscureConfirmPassword = true;
+  bool _emailVerified = false;
+  bool _isSendingVerification = false;
+  bool _isCheckingVerification = false;
+  int _resendTimer = 0;
+  Timer? _timer;
+  bool _showSuccessAnimation = false;
+  bool _accountCreated = false;
+  String? _tempUid;
+
+  // Options
+  final List<String> _educationLevels = ['ปวช.', 'ปวส.'];
+  List<String> _yearLevels = ['1/1', '1/2', '2/1', '2/2', '3/1', '3/2'];
+
+  // สีหลัก
+  final Color _primaryDark = Color(0xFF4A148C);
+  final Color _primaryColor = Color(0xFF6A1B9A);
+  final Color _primaryMedium = Color(0xFF8E24AA);
+  final Color _primaryLight = Color(0xFFAB47BC);
+  final Color _primaryVeryLight = Color(0xFFE1BEE7);
+  final Color _accentColor = Color(0xFFCE93D8);
+  final Color _backgroundColor = Color(0xFFF8F4FF);
+  final Color _cardColor = Colors.white;
+  final Color _textColor = Color(0xFF4A148C);
+  final Color _successColor = Color(0xFF66BB6A);
+  final Color _errorColor = Color(0xFFEF5350);
+  final Color _warningColor = Color(0xFFFFB74D);
+
+  @override
+  void initState() {
+    super.initState();
+    _emailController.addListener(_onEmailChanged);
+    _startAuthListener();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _emailController.removeListener(_onEmailChanged);
+    super.dispose();
+  }
+
+  void _startAuthListener() {
+    _auth.authStateChanges().listen((User? user) {
+      if (user != null && _accountCreated) {
+        _checkEmailVerificationStatus();
+      }
+    });
+  }
+
+  void _onEmailChanged() {
+    if (_emailController.text.contains('@')) {
+      setState(() {});
+    }
+  }
+
+  void _startResendTimer() {
+    _resendTimer = 60;
+    _timer = Timer.periodic(Duration(seconds: 1), (timer) {
+      if (_resendTimer > 0) {
+        setState(() {
+          _resendTimer--;
+        });
+      } else {
+        timer.cancel();
+      }
+    });
+  }
+
+  void _updateYearLevels() {
+    if (_selectedLevel == 'ปวส.') {
+      _yearLevels = ['1/1', '1/2', '2/1', '2/2'];
+    } else {
+      _yearLevels = ['1/1', '1/2', '2/1', '2/2', '3/1', '3/2'];
+    }
+
+    if (_selectedYear != null && !_yearLevels.contains(_selectedYear)) {
+      _selectedYear = null;
+    }
+  }
+
+  bool _isDisposableEmail(String email) {
+    final domain = email.split('@')[1].toLowerCase();
+    final disposableDomains = [
+      'tempmail.com',
+      '10minutemail.com',
+      'guerrillamail.com',
+      'mailinator.com',
+      'yopmail.com',
+      'trashmail.com',
+      'fakeinbox.com',
+      'sharklasers.com',
+      'guerillamail.info',
+      'maildrop.cc',
+      'getairmail.com',
+      'temp-mail.org',
+    ];
+    return disposableDomains.contains(domain);
+  }
+
+  bool _validateForm() {
+    if (_studentIdController.text.isEmpty ||
+        _studentIdController.text.length != 11) {
+      _showSnackBar("กรุณากรอกรหัสนักศึกษา 11 หลัก", _errorColor);
+      return false;
+    }
+
+    if (_firstNameController.text.isEmpty) {
+      _showSnackBar("กรุณากรอกชื่อจริง", _errorColor);
+      return false;
+    }
+
+    if (_lastNameController.text.isEmpty) {
+      _showSnackBar("กรุณากรอกนามสกุล", _errorColor);
+      return false;
+    }
+
+    if (_selectedLevel == null) {
+      _showSnackBar("กรุณาเลือกระดับการศึกษา", _errorColor);
+      return false;
+    }
+
+    if (_selectedYear == null) {
+      _showSnackBar("กรุณาเลือกชั้นปี", _errorColor);
+      return false;
+    }
+
+    final email = _emailController.text.trim();
+    if (email.isEmpty || !email.contains('@')) {
+      _showSnackBar("กรุณากรอกอีเมลให้ถูกต้อง", _errorColor);
+      return false;
+    }
+
+    final emailRegex = RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$');
+    if (!emailRegex.hasMatch(email)) {
+      _showSnackBar("รูปแบบอีเมลไม่ถูกต้อง", _errorColor);
+      return false;
+    }
+
+    if (_isDisposableEmail(email)) {
+      _showSnackBar("ไม่อนุญาตให้ใช้อีเมลชั่วคราว", _errorColor);
+      return false;
+    }
+
+    if (_passwordController.text.length < 6) {
+      _showSnackBar("รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร", _errorColor);
+      return false;
+    }
+
+    if (_passwordController.text != _confirmPasswordController.text) {
+      _showSnackBar("รหัสผ่านไม่ตรงกัน", _errorColor);
+      return false;
+    }
+
+    return true;
+  }
+
+  void _showSnackBar(String message, Color color) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(
+              color == _successColor ? Icons.check_circle : Icons.error,
+              color: Colors.white,
+              size: 24,
+            ),
+            SizedBox(width: 12),
+            Expanded(child: Text(message)),
+          ],
+        ),
+        backgroundColor: color,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        duration: Duration(seconds: 3),
+        padding: EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        elevation: 10,
+        showCloseIcon: true,
+      ),
+    );
+  }
+
+  Future<void> _createAccountAndSendVerification() async {
+    if (!_validateForm()) return;
+
+    FocusScope.of(context).unfocus();
+
+    setState(() {
+      _isLoading = true;
+      _isSendingVerification = true;
+    });
+
+    try {
+      final email = _emailController.text.trim();
+      final password = _passwordController.text.trim();
+
+      // 1. สร้างบัญชีผู้ใช้ใหม่
+      final userCredential = await _auth.createUserWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+
+      final user = userCredential.user!;
+      _tempUid = user.uid;
+
+      // 2. ส่งอีเมลยืนยัน
+      await user.sendEmailVerification();
+
+      // 3. บันทึกข้อมูลใน Firestore (โดยไม่ต้องรอการยืนยันอีเมล)
+      await _firestore.collection('users').doc(user.uid).set({
+        'studentId': _studentIdController.text.trim(),
+        'firstName': _firstNameController.text.trim(),
+        'lastName': _lastNameController.text.trim(),
+        'level': _selectedLevel,
+        'year': _selectedYear,
+        'email': email,
+        'emailVerified': false, // ยังไม่ได้ยืนยัน
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+        'faceRegistered': false,
+        'role': 'student',
+        'status': 'pending', // สถานะรอยืนยันอีเมล
+        'lastLogin': FieldValue.serverTimestamp(),
+      });
+
+      setState(() {
+        _accountCreated = true;
+        _startResendTimer();
+      });
+
+      _showSnackBar(
+        "✨ สร้างบัญชีและส่งลิงก์ยืนยันไปยังอีเมลแล้ว",
+        _successColor,
+      );
+
+      // 4. ออกจากระบบชั่วคราว
+      await _auth.signOut();
+    } on FirebaseAuthException catch (e) {
+      String errorMessage = "ไม่สามารถสร้างบัญชีได้";
+      if (e.code == 'email-already-in-use') {
+        errorMessage = "อีเมลนี้ถูกใช้งานแล้ว";
+      } else if (e.code == 'weak-password') {
+        errorMessage = "รหัสผ่านไม่แข็งแรงพอ";
+      } else if (e.code == 'invalid-email') {
+        errorMessage = "รูปแบบอีเมลไม่ถูกต้อง";
+      } else if (e.code == 'network-request-failed') {
+        errorMessage = "เชื่อมต่ออินเทอร์เน็ตล้มเหลว";
+      } else if (e.code == 'too-many-requests') {
+        errorMessage = "ร้องขอมากเกินไป กรุณารอสักครู่";
+      }
+      _showSnackBar(errorMessage, _errorColor);
+    } catch (e) {
+      _showSnackBar("เกิดข้อผิดพลาด: $e", _errorColor);
+    } finally {
+      setState(() {
+        _isLoading = false;
+        _isSendingVerification = false;
+      });
+    }
+  }
+
+  Future<void> _checkEmailVerificationStatus() async {
+    if (!_accountCreated || _tempUid == null) return;
+
+    setState(() => _isCheckingVerification = true);
+
+    try {
+      final user = _auth.currentUser;
+
+      // หากยังไม่ได้ล็อกอิน ให้ล็อกอินเพื่อตรวจสอบ
+      if (user == null) {
+        final email = _emailController.text.trim();
+        final password = _passwordController.text.trim();
+
+        try {
+          await _auth.signInWithEmailAndPassword(
+            email: email,
+            password: password,
+          );
+        } catch (e) {
+          // ถ้าไม่สามารถล็อกอินได้ (เช่น รหัสผ่านผิด)
+          return;
+        }
+      }
+
+      final currentUser = _auth.currentUser;
+      if (currentUser != null) {
+        await currentUser.reload();
+        final refreshedUser = _auth.currentUser;
+
+        if (refreshedUser!.emailVerified) {
+          setState(() {
+            _emailVerified = true;
+            _showSuccessAnimation = true;
+          });
+
+          // อัพเดทสถานะใน Firestore
+          await _firestore.collection('users').doc(refreshedUser.uid).update({
+            'emailVerified': true,
+            'status': 'active',
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
+
+          _showSnackBar("🎉 ยืนยันอีเมลสำเร็จ!", _successColor);
+
+          Future.delayed(Duration(seconds: 2), () {
+            if (mounted) {
+              setState(() {
+                _showSuccessAnimation = false;
+              });
+              _navigateToPDPA(refreshedUser.uid);
+            }
+          });
+        }
+      }
+    } catch (e) {
+      // ไม่ต้องแสดง error
+    } finally {
+      setState(() => _isCheckingVerification = false);
+    }
+  }
+
+  Future<void> _resendVerificationEmail() async {
+    if (!_accountCreated) return;
+
+    setState(() => _isSendingVerification = true);
+
+    try {
+      final email = _emailController.text.trim();
+      final password = _passwordController.text.trim();
+
+      // ล็อกอินเพื่อส่งอีเมลยืนยันใหม่
+      await _auth.signInWithEmailAndPassword(email: email, password: password);
+
+      final user = _auth.currentUser;
+      if (user != null) {
+        await user.sendEmailVerification();
+        _showSnackBar("✨ ส่งลิงก์ยืนยันใหม่ไปยังอีเมลแล้ว", _successColor);
+
+        setState(() {
+          _startResendTimer();
+        });
+
+        // ออกจากระบบหลังส่งอีเมล
+        await _auth.signOut();
+      }
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'wrong-password' || e.code == 'user-not-found') {
+        _showSnackBar(
+          "ไม่สามารถส่งอีเมลยืนยันได้ กรุณาตรวจสอบข้อมูล",
+          _errorColor,
+        );
+      } else {
+        _showSnackBar("ไม่สามารถส่งลิงก์ยืนยันได้: ${e.message}", _errorColor);
+      }
+    } catch (e) {
+      _showSnackBar("เกิดข้อผิดพลาด: $e", _errorColor);
+    } finally {
+      setState(() => _isSendingVerification = false);
+    }
+  }
+
+  Future<void> _navigateToPDPA(String uid) async {
+    await Future.delayed(Duration(milliseconds: 500));
+
+    if (mounted) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => PDPAPage(),
+          settings: RouteSettings(
+            arguments: {
+              'userId': uid,
+              'studentId': _studentIdController.text.trim(),
+              'email': _emailController.text.trim(),
+            },
+          ),
+        ),
+      );
+    }
+  }
+
+  void _navigateToLogin() {
+    Navigator.pop(context);
+  }
+
+  Widget _buildHeader() {
+    return Container(
+      height: 250,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [_primaryDark, _primaryColor, _primaryMedium],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          stops: [0.0, 0.5, 1.0],
+        ),
+        borderRadius: BorderRadius.only(
+          bottomLeft: Radius.circular(40),
+          bottomRight: Radius.circular(40),
+        ),
+      ),
+      child: Stack(
+        children: [
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: Container(
+              height: 50,
+              decoration: BoxDecoration(
+                color: _cardColor,
+                borderRadius: BorderRadius.only(
+                  topLeft: Radius.circular(40),
+                  topRight: Radius.circular(40),
+                ),
+              ),
+            ),
+          ),
+
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 100,
+                height: 100,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [Colors.white, _primaryVeryLight],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: BorderRadius.circular(50),
+                  boxShadow: [
+                    BoxShadow(
+                      color: _primaryDark.withOpacity(0.3),
+                      blurRadius: 25,
+                      spreadRadius: 3,
+                      offset: Offset(0, 10),
+                    ),
+                  ],
+                ),
+                child: Icon(
+                  Icons.person_add_alt_1,
+                  size: 50,
+                  color: _primaryColor,
+                ),
+              ),
+              SizedBox(height: 20),
+              Text(
+                "สมัครสมาชิก",
+                style: TextStyle(
+                  fontSize: 36,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                  shadows: [
+                    Shadow(
+                      blurRadius: 10,
+                      color: Colors.black26,
+                      offset: Offset(2, 2),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(height: 8),
+              Text(
+                "ระบบเช็คชื่อด้วยใบหน้า",
+                style: TextStyle(
+                  fontSize: 16,
+                  color: Colors.white.withOpacity(0.9),
+                  fontWeight: FontWeight.w300,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFormField({
+    required String label,
+    required IconData icon,
+    required TextEditingController controller,
+    bool isPassword = false,
+    bool? obscureText,
+    VoidCallback? onToggleVisibility,
+    TextInputType? keyboardType,
+    int? maxLength,
+    List<TextInputFormatter>? inputFormatters,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(20),
+        gradient: LinearGradient(
+          colors: [Colors.white, _primaryVeryLight.withOpacity(0.1)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: _primaryLight.withOpacity(0.1),
+            blurRadius: 15,
+            offset: Offset(0, 5),
+          ),
+          BoxShadow(
+            color: Colors.white.withOpacity(0.5),
+            blurRadius: 15,
+            offset: Offset(-5, -5),
+          ),
+        ],
+        border: Border.all(color: _primaryVeryLight.withOpacity(0.3), width: 1),
+      ),
+      child: TextFormField(
+        controller: controller,
+        obscureText: obscureText ?? false,
+        keyboardType: keyboardType,
+        maxLength: maxLength,
+        inputFormatters: inputFormatters,
+        style: TextStyle(color: _textColor, fontSize: 16),
+        decoration: InputDecoration(
+          labelText: label,
+          labelStyle: TextStyle(
+            color: _textColor.withOpacity(0.7),
+            fontWeight: FontWeight.w500,
+          ),
+          prefixIcon: Container(
+            margin: EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [_primaryLight, _primaryMedium],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, color: Colors.white, size: 20),
+          ),
+          suffixIcon: isPassword && onToggleVisibility != null
+              ? IconButton(
+                  icon: Icon(
+                    obscureText! ? Icons.visibility_off : Icons.visibility,
+                    color: _primaryMedium,
+                  ),
+                  onPressed: onToggleVisibility,
+                )
+              : null,
+          filled: true,
+          fillColor: Colors.transparent,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(20),
+            borderSide: BorderSide.none,
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(20),
+            borderSide: BorderSide(color: _primaryMedium, width: 2),
+          ),
+          contentPadding: EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+          counterText: "",
+          floatingLabelBehavior: FloatingLabelBehavior.auto,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDropdown({
+    required String label,
+    required IconData icon,
+    required String? value,
+    required List<String> items,
+    required Function(String?) onChanged,
+    String Function(String)? displayText,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(20),
+        gradient: LinearGradient(
+          colors: [Colors.white, _primaryVeryLight.withOpacity(0.1)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: _primaryLight.withOpacity(0.1),
+            blurRadius: 15,
+            offset: Offset(0, 5),
+          ),
+          BoxShadow(
+            color: Colors.white.withOpacity(0.5),
+            blurRadius: 15,
+            offset: Offset(-5, -5),
+          ),
+        ],
+        border: Border.all(color: _primaryVeryLight.withOpacity(0.3), width: 1),
+      ),
+      child: DropdownButtonFormField<String>(
+        value: value,
+        decoration: InputDecoration(
+          labelText: label,
+          labelStyle: TextStyle(
+            color: _textColor.withOpacity(0.7),
+            fontWeight: FontWeight.w500,
+          ),
+          prefixIcon: Container(
+            margin: EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [_primaryLight, _primaryMedium],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, color: Colors.white, size: 20),
+          ),
+          filled: true,
+          fillColor: Colors.transparent,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(20),
+            borderSide: BorderSide.none,
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(20),
+            borderSide: BorderSide(color: _primaryMedium, width: 2),
+          ),
+          contentPadding: EdgeInsets.symmetric(horizontal: 20),
+        ),
+        items: items.map((item) {
+          return DropdownMenuItem<String>(
+            value: item,
+            child: Text(
+              displayText != null ? displayText(item) : item,
+              style: TextStyle(color: _textColor, fontSize: 16),
+            ),
+          );
+        }).toList(),
+        onChanged: onChanged,
+        dropdownColor: _cardColor,
+        icon: Icon(Icons.arrow_drop_down_circle, color: _primaryMedium),
+        style: TextStyle(color: _textColor, fontSize: 16),
+        borderRadius: BorderRadius.circular(15),
+        elevation: 5,
+      ),
+    );
+  }
+
+  Widget _buildVerificationSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Stack(
+          children: [
+            _buildFormField(
+              label: "อีเมล",
+              icon: Icons.email,
+              controller: _emailController,
+              keyboardType: TextInputType.emailAddress,
+            ),
+            if (_emailController.text.contains('@') && !_accountCreated)
+              Positioned(
+                right: 10,
+                top: 10,
+                child: Container(
+                  padding: EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: _successColor.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: _successColor, width: 1),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.check, size: 14, color: Colors.green),
+                      SizedBox(width: 4),
+                      Text(
+                        "รูปแบบถูกต้อง",
+                        style: TextStyle(fontSize: 10, color: Colors.green),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+        SizedBox(height: 20),
+
+        _buildFormField(
+          label: "รหัสผ่าน",
+          icon: Icons.lock,
+          controller: _passwordController,
+          isPassword: true,
+          obscureText: _obscurePassword,
+          onToggleVisibility: () =>
+              setState(() => _obscurePassword = !_obscurePassword),
+        ),
+        SizedBox(height: 20),
+
+        _buildFormField(
+          label: "ยืนยันรหัสผ่าน",
+          icon: Icons.lock_outline,
+          controller: _confirmPasswordController,
+          isPassword: true,
+          obscureText: _obscureConfirmPassword,
+          onToggleVisibility: () => setState(
+            () => _obscureConfirmPassword = !_obscureConfirmPassword,
+          ),
+        ),
+        SizedBox(height: 25),
+
+        if (_accountCreated)
+          Container(
+            padding: EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              gradient: _emailVerified
+                  ? LinearGradient(
+                      colors: [_successColor.withOpacity(0.1), Colors.white],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    )
+                  : LinearGradient(
+                      colors: [
+                        _primaryVeryLight.withOpacity(0.2),
+                        Colors.white,
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: _emailVerified ? _successColor : _primaryLight,
+                width: 1.5,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: (_emailVerified ? _successColor : _primaryLight)
+                      .withOpacity(0.1),
+                  blurRadius: 20,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        gradient: _emailVerified
+                            ? LinearGradient(
+                                colors: [_successColor, Colors.green],
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                              )
+                            : LinearGradient(
+                                colors: [_primaryLight, _primaryMedium],
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                              ),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        _emailVerified ? Icons.verified : Icons.pending,
+                        color: Colors.white,
+                        size: 24,
+                      ),
+                    ),
+                    SizedBox(width: 16),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _emailVerified
+                                ? "✅ ยืนยันอีเมลสำเร็จแล้ว"
+                                : "📧 รอการยืนยันอีเมล",
+                            style: TextStyle(
+                              color: _emailVerified
+                                  ? _successColor
+                                  : _primaryMedium,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
+                          SizedBox(height: 4),
+                          Text(
+                            _emailController.text,
+                            style: TextStyle(
+                              color: _textColor.withOpacity(0.7),
+                              fontSize: 14,
+                              fontStyle: FontStyle.italic,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+
+                if (!_emailVerified) ...[
+                  SizedBox(height: 16),
+                  Container(
+                    padding: EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: _warningColor.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: _warningColor, width: 1),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Icons.info, color: _warningColor, size: 20),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            "กรุณาตรวจสอบอีเมลและคลิกลิงก์ยืนยันที่ส่งไปให้",
+                            style: TextStyle(
+                              color: _textColor.withOpacity(0.8),
+                              fontSize: 14,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  SizedBox(height: 16),
+
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _isCheckingVerification
+                            ? Container(
+                                padding: EdgeInsets.symmetric(vertical: 14),
+                                decoration: BoxDecoration(
+                                  color: _primaryColor.withOpacity(0.1),
+                                  borderRadius: BorderRadius.circular(15),
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: _primaryColor,
+                                      ),
+                                    ),
+                                    SizedBox(width: 10),
+                                    Text(
+                                      "กำลังตรวจสอบ...",
+                                      style: TextStyle(color: _primaryColor),
+                                    ),
+                                  ],
+                                ),
+                              )
+                            : Container(
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    colors: [_primaryColor, _primaryMedium],
+                                    begin: Alignment.topLeft,
+                                    end: Alignment.bottomRight,
+                                  ),
+                                  borderRadius: BorderRadius.circular(15),
+                                ),
+                                child: ElevatedButton.icon(
+                                  onPressed: _checkEmailVerificationStatus,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.transparent,
+                                    shadowColor: Colors.transparent,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(15),
+                                    ),
+                                    padding: EdgeInsets.symmetric(
+                                      vertical: 16,
+                                      horizontal: 20,
+                                    ),
+                                  ),
+                                  icon: Icon(
+                                    Icons.refresh,
+                                    size: 20,
+                                    color: Colors.white,
+                                  ),
+                                  label: Text(
+                                    "ตรวจสอบสถานะ",
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                      ),
+                      SizedBox(width: 12),
+
+                      if (_resendTimer > 0)
+                        Container(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 14,
+                          ),
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                Colors.grey.shade200,
+                                Colors.grey.shade100,
+                              ],
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
+                            ),
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                "ส่งใหม่ใน",
+                                style: TextStyle(
+                                  color: _textColor.withOpacity(0.6),
+                                  fontSize: 12,
+                                ),
+                              ),
+                              Text(
+                                "$_resendTimer วินาที",
+                                style: TextStyle(
+                                  color: _primaryColor,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else
+                        OutlinedButton(
+                          onPressed: _resendVerificationEmail,
+                          style: OutlinedButton.styleFrom(
+                            side: BorderSide(color: _primaryColor, width: 2),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(15),
+                            ),
+                            padding: EdgeInsets.symmetric(
+                              vertical: 16,
+                              horizontal: 20,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.send, size: 20, color: _primaryColor),
+                              SizedBox(width: 8),
+                              Text(
+                                "ส่งลิงก์ใหม่",
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  color: _primaryColor,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          )
+        else
+          _isSendingVerification
+              ? Center(
+                  child: Column(
+                    children: [
+                      Container(
+                        width: 60,
+                        height: 60,
+                        padding: EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: _primaryColor.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(30),
+                        ),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 3,
+                          color: _primaryColor,
+                        ),
+                      ),
+                      SizedBox(height: 16),
+                      Text(
+                        "กำลังสร้างบัญชี...",
+                        style: TextStyle(
+                          color: _primaryColor,
+                          fontWeight: FontWeight.w500,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              : Container(
+                  width: double.infinity,
+                  height: 60,
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [_primaryMedium, _primaryColor],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    borderRadius: BorderRadius.circular(15),
+                    boxShadow: [
+                      BoxShadow(
+                        color: _primaryColor.withOpacity(0.4),
+                        blurRadius: 8,
+                        offset: Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: ElevatedButton(
+                    onPressed: _createAccountAndSendVerification,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.transparent,
+                      shadowColor: Colors.transparent,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(15),
+                      ),
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.person_add, color: Colors.white, size: 24),
+                        SizedBox(width: 12),
+                        Text(
+                          "สร้างบัญชีและส่งลิงก์ยืนยัน",
+                          style: TextStyle(
+                            fontSize: 18,
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+      ],
+    );
+  }
+
+  Widget _buildRegisterButton() {
+    return Container(
+      width: double.infinity,
+      height: 60,
+      decoration: BoxDecoration(
+        gradient: _emailVerified
+            ? LinearGradient(
+                colors: [_successColor, Colors.green],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              )
+            : LinearGradient(
+                colors: [Colors.grey.shade300, Colors.grey.shade400],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+        borderRadius: BorderRadius.circular(15),
+        boxShadow: _emailVerified
+            ? [
+                BoxShadow(
+                  color: _successColor.withOpacity(0.4),
+                  blurRadius: 20,
+                  spreadRadius: 2,
+                  offset: Offset(0, 10),
+                ),
+              ]
+            : [],
+      ),
+      child: ElevatedButton(
+        onPressed: _emailVerified ? _checkEmailVerificationStatus : null,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.transparent,
+          shadowColor: Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(15),
+          ),
+          padding: EdgeInsets.zero,
+        ),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  _emailVerified ? Icons.check_circle : Icons.lock,
+                  color: Colors.white,
+                  size: 24,
+                ),
+                SizedBox(width: 12),
+                Text(
+                  _emailVerified ? "ดำเนินการต่อ" : "รอยืนยันอีเมล",
+                  style: TextStyle(
+                    fontSize: 18,
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    shadows: [
+                      Shadow(
+                        blurRadius: 4,
+                        color: Colors.black26,
+                        offset: Offset(1, 1),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            if (_emailVerified)
+              Positioned(
+                right: 20,
+                child: Container(
+                  padding: EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    Icons.arrow_forward,
+                    color: _successColor,
+                    size: 20,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: _backgroundColor,
+      body: Stack(
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [_backgroundColor, _primaryVeryLight.withOpacity(0.05)],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+              ),
+            ),
+          ),
+
+          SingleChildScrollView(
+            padding: EdgeInsets.zero,
+            child: Column(
+              children: [
+                _buildHeader(),
+
+                Container(
+                  width: double.infinity,
+                  padding: EdgeInsets.symmetric(
+                    horizontal: 24.0,
+                    vertical: 30.0,
+                  ),
+                  decoration: BoxDecoration(
+                    color: _cardColor,
+                    borderRadius: BorderRadius.only(
+                      topLeft: Radius.circular(40),
+                      topRight: Radius.circular(40),
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: _primaryDark.withOpacity(0.1),
+                        blurRadius: 40,
+                        spreadRadius: 5,
+                        offset: Offset(0, -10),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    children: [
+                      _buildFormField(
+                        label: "รหัสนักศึกษา",
+                        icon: Icons.badge,
+                        controller: _studentIdController,
+                        keyboardType: TextInputType.number,
+                        maxLength: 11,
+                        inputFormatters: [
+                          FilteringTextInputFormatter.digitsOnly,
+                        ],
+                      ),
+                      SizedBox(height: 20),
+
+                      _buildFormField(
+                        label: "ชื่อจริง",
+                        icon: Icons.person,
+                        controller: _firstNameController,
+                      ),
+                      SizedBox(height: 20),
+
+                      _buildFormField(
+                        label: "นามสกุล",
+                        icon: Icons.person_outline,
+                        controller: _lastNameController,
+                      ),
+                      SizedBox(height: 20),
+
+                      _buildDropdown(
+                        label: "ระดับการศึกษา",
+                        icon: Icons.school,
+                        value: _selectedLevel,
+                        items: _educationLevels,
+                        onChanged: (value) => setState(() {
+                          _selectedLevel = value;
+                          _updateYearLevels();
+                        }),
+                      ),
+                      SizedBox(height: 20),
+
+                      _buildDropdown(
+                        label: "ชั้นปี",
+                        icon: Icons.class_,
+                        value: _selectedYear,
+                        items: _yearLevels,
+                        onChanged: (value) =>
+                            setState(() => _selectedYear = value),
+                        displayText: (item) => 'ปี $item',
+                      ),
+                      SizedBox(height: 20),
+
+                      _buildVerificationSection(),
+
+                      SizedBox(height: 30),
+
+                      if (_accountCreated) _buildRegisterButton(),
+
+                      SizedBox(height: 30),
+
+                      Container(
+                        padding: EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(20),
+                          gradient: LinearGradient(
+                            colors: [
+                              Colors.white,
+                              _primaryVeryLight.withOpacity(0.3),
+                            ],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          ),
+                          border: Border.all(
+                            color: _primaryVeryLight,
+                            width: 1,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              "มีบัญชีแล้ว? ",
+                              style: TextStyle(
+                                color: _textColor.withOpacity(0.7),
+                                fontSize: 16,
+                              ),
+                            ),
+                            GestureDetector(
+                              onTap: _navigateToLogin,
+                              child: Container(
+                                padding: EdgeInsets.symmetric(
+                                  horizontal: 24,
+                                  vertical: 14,
+                                ),
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    colors: [_primaryLight, _primaryMedium],
+                                    begin: Alignment.topLeft,
+                                    end: Alignment.bottomRight,
+                                  ),
+                                  borderRadius: BorderRadius.circular(15),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: _primaryColor.withOpacity(0.3),
+                                      blurRadius: 15,
+                                      offset: Offset(0, 8),
+                                    ),
+                                  ],
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      Icons.login,
+                                      color: Colors.white,
+                                      size: 20,
+                                    ),
+                                    SizedBox(width: 8),
+                                    Text(
+                                      "เข้าสู่ระบบ",
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 16,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          if (_showSuccessAnimation)
+            Container(
+              color: Colors.black.withOpacity(0.7),
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Container(
+                      width: 150,
+                      height: 150,
+                      decoration: BoxDecoration(
+                        color: _successColor,
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: _successColor.withOpacity(0.5),
+                            blurRadius: 20,
+                            spreadRadius: 5,
+                          ),
+                        ],
+                      ),
+                      child: Icon(Icons.check, size: 80, color: Colors.white),
+                    ),
+                    SizedBox(height: 20),
+                    Text(
+                      "ยืนยันอีเมลสำเร็จ!",
+                      style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
