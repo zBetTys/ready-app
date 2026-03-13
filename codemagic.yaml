@@ -1,0 +1,23 @@
+workflows:
+  ios-workflow:
+    name: iOS Build
+    environment:
+      flutter: stable
+
+    scripts:
+      - name: Install dependencies
+        script: |
+          flutter clean
+          flutter pub get
+          flutter precache --ios
+
+      - name: Install pods
+        script: |
+          cd ios
+          rm -rf Pods Podfile.lock
+          pod install
+          cd ..
+
+      - name: Build iOS
+        script: |
+          flutter build ios --debug --no-codesign
