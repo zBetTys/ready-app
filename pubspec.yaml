@@ -58,7 +58,7 @@ dependencies:
   geolocator: ^11.0.1
   
   image: ^4.1.6
-  google_mlkit_face_detection: ^0.13.1
+  google_mlkit_face_detection: ^0.13.2
   flutter_launcher_icons: ^0.14.4
   convert: ^3.1.1  
   pointycastle: ^3.7.3  
