@@ -22,11 +22,15 @@ workflows:
           pod install
           cd ..
 
-      - name: Build IPA
+      - name: Build iOS
         script: |
-          flutter build ipa --release --no-codesign
+          flutter build ios --release --no-codesign
+
+      - name: Create IPA
+        script: |
+          mkdir -p build/ios/ipa
+          cd build/ios/iphoneos
+          zip -r ../ipa/Runner.ipa Runner.app
 
     artifacts:
       - build/ios/ipa/*.ipa
-      - build/ios/archive/*.xcarchive
-      - build/ios/**/*.ipa
