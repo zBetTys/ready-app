@@ -8,27 +8,24 @@ workflows:
 
     scripts:
       - name: Clean project
-        script: |
-          flutter clean
+        script: flutter clean
 
       - name: Get dependencies
-        script: |
-          flutter pub get
+        script: flutter pub get
 
       - name: Precache iOS
-        script: |
-          flutter precache --ios
+        script: flutter precache --ios
 
       - name: Install CocoaPods
         script: |
           cd ios
-          rm -rf Pods Podfile.lock
           pod install
           cd ..
 
       - name: Build IPA
         script: |
-          flutter build ipa --debug --no-codesign
+          flutter build ipa --release --no-codesign
 
     artifacts:
       - build/ios/ipa/*.ipa
+      - build/ios/archive/*.xcarchive
