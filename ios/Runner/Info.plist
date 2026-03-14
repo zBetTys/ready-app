@@ -65,29 +65,219 @@
 
 	<!-- Camera -->
 	<key>NSCameraUsageDescription</key>
-	<string>ต้องการใช้งานกล้องสำหรับบันทึกข้อมูลใบหน้า</string>
+	<string>ต้องการใช้งานกล้องสำหรับบันทึกข้อมูลใบหน้าและเช็คชื่อ</string>
 
 	<!-- Photo Library -->
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>ต้องการเข้าถึงรูปภาพเพื่อเลือกภาพจากคลัง</string>
+	<string>ต้องการเข้าถึงรูปภาพเพื่อเลือกภาพโปรไฟล์</string>
 
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>ต้องการบันทึกรูปภาพลงในคลัง</string>
 
 	<!-- Location -->
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>แอปต้องการใช้ตำแหน่งที่ตั้งขณะใช้งาน</string>
+	<string>แอปต้องการใช้ตำแหน่งที่ตั้งเพื่อตรวจสอบสถานที่เช็คชื่อ</string>
 
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>แอปต้องการใช้ตำแหน่งเพื่อการทำงานของระบบ</string>
+	<string>แอปต้องการใช้ตำแหน่งเพื่อการทำงานของระบบเช็คชื่อ</string>
 
 	<!-- Microphone -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>ต้องการใช้ไมโครโฟนสำหรับการบันทึกวิดีโอ</string>
 
-	<!-- Firebase Notification -->
+	<!-- Face ID -->
+	<key>NSFaceIDUsageDescription</key>
+	<string>ต้องการใช้ Face ID สำหรับยืนยันตัวตน</string>
+
+	<!-- ==================== FIREBASE & NOTIFICATIONS ==================== -->
+	
+	<!-- Firebase App Delegate Proxy (ต้องเป็น false สำหรับ background tasks) -->
 	<key>FirebaseAppDelegateProxyEnabled</key>
 	<false/>
+
+	<!-- Remote Notifications -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+
+	<!-- Notification Permission -->
+	<key>UNNotificationDefaultCenterEnabled</key>
+	<true/>
+
+	<!-- Background App Refresh -->
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.ready.app.refresh</string>
+		<string>com.ready.app.missedcheck</string>
+		<string>com.ready.app.cleanup</string>
+	</array>
+
+	<!-- ==================== NETWORK SECURITY ==================== -->
+	
+	<!-- Allow HTTP for development (remove in production) -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+
+	<!-- ==================== APP STATE PRESERVATION ==================== -->
+	
+	<!-- Preserve app state for better background handling -->
+	<key>UIApplicationExitsOnSuspend</key>
+	<false/>
+	
+	<key>UIApplicationPrefersDefaultContext</key>
+	<true/>
+
+	<!-- ==================== BACKGROUND FETCH INTERVAL ==================== -->
+	
+	<!-- Minimum background fetch interval (optional) -->
+	<key>BGInterval</key>
+	<integer>900</integer> <!-- 15 นาที -->
+
+	<!-- ==================== APPLE PUSH NOTIFICATION ==================== -->
+	
+	<!-- APNS Environment (development or production) -->
+	<key>aps-environment</key>
+	<string>development</string> <!-- เปลี่ยนเป็น production เมื่ออัปโหลด -->
+
+	<!-- ==================== REQUIRED DEVICE CAPABILITIES ==================== -->
+	
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>armv7</string>
+		<string>push-notifications</string>
+	</array>
+
+	<!-- ==================== LOCAL NOTIFICATIONS ==================== -->
+	
+	<!-- Maximum number of local notifications -->
+	<key>NSLocalNotificationUsageDescription</key>
+	<string>แอปต้องการส่งการแจ้งเตือนเกี่ยวกับเวลาเช็คชื่อและ missed count</string>
+
+	<!-- ==================== BLUETOOTH (ถ้าใช้) ==================== -->
+	<!-- 
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>ต้องการใช้บลูทูธสำหรับเชื่อมต่อกับอุปกรณ์เสริม</string>
+	
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>ต้องการใช้บลูทูธสำหรับการเชื่อมต่ออุปกรณ์</string>
+	-->
+
+	<!-- ==================== CALENDAR (ถ้าใช้) ==================== -->
+	<!-- 
+	<key>NSCalendarsUsageDescription</key>
+	<string>ต้องการเข้าถึงปฏิทินเพื่อเพิ่มนัดหมายการเช็คชื่อ</string>
+	
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>ต้องการเข้าถึงปฏิทินเพื่อเพิ่มนัดหมายการเช็คชื่อ</string>
+	
+	<key>NSCalendarsWriteOnlyAccessUsageDescription</key>
+	<string>ต้องการเขียนปฏิทินเพื่อเพิ่มนัดหมายการเช็คชื่อ</string>
+	-->
+
+	<!-- ==================== REMINDERS (ถ้าใช้) ==================== -->
+	<!-- 
+	<key>NSRemindersUsageDescription</key>
+	<string>ต้องการใช้ Reminders เพื่อแจ้งเตือนการเช็คชื่อ</string>
+	
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>ต้องการใช้ Reminders เพื่อแจ้งเตือนการเช็คชื่อ</string>
+	-->
+
+	<!-- ==================== CONTACTS (ถ้าใช้) ==================== -->
+	<!-- 
+	<key>NSContactsUsageDescription</key>
+	<string>ต้องการเข้าถึงรายชื่อเพื่อเพิ่มเพื่อนในระบบ</string>
+	-->
+
+	<!-- ==================== FONTS ==================== -->
+	
+	<key>UIAppFonts</key>
+	<array>
+		<string>Roboto-Regular.ttf</string>
+		<string>Roboto-Bold.ttf</string>
+		<string>Roboto-Italic.ttf</string>
+	</array>
+
+	<!-- ==================== STATUS BAR ==================== -->
+	
+	<key>UIStatusBarHidden</key>
+	<false/>
+	
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleLightContent</string>
+
+	<!-- ==================== VIEW CONTROLLER ==================== -->
+	
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<true/>
+
+	<!-- ==================== SUPPORTS MULTITASKING ==================== -->
+	
+	<key>UIApplicationSupportsMultipleScenes</key>
+	<false/>
+
+	<!-- ==================== LAUNCH IMAGE ==================== -->
+	
+	<key>UILaunchImages</key>
+	<array>
+		<dict>
+			<key>UILaunchImageMinimumOSVersion</key>
+			<string>8.0</string>
+			<key>UILaunchImageName</key>
+			<string>Default</string>
+			<key>UILaunchImageOrientation</key>
+			<string>Portrait</string>
+			<key>UILaunchImageSize</key>
+			<string>{320, 480}</string>
+		</dict>
+	</array>
+
+	<!-- ==================== APP STORE ICON ==================== -->
+	
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+
+	<key>CFBundleIconFiles</key>
+	<array>
+		<string>Icon-20.png</string>
+		<string>Icon-40.png</string>
+		<string>Icon-60.png</string>
+		<string>Icon-76.png</string>
+		<string>Icon-83.5.png</string>
+		<string>Icon-120.png</string>
+		<string>Icon-152.png</string>
+		<string>Icon-167.png</string>
+		<string>Icon-180.png</string>
+		<string>Icon-1024.png</string>
+	</array>
+
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>Icon-20.png</string>
+				<string>Icon-40.png</string>
+				<string>Icon-60.png</string>
+				<string>Icon-76.png</string>
+				<string>Icon-83.5.png</string>
+				<string>Icon-120.png</string>
+				<string>Icon-152.png</string>
+				<string>Icon-167.png</string>
+				<string>Icon-180.png</string>
+				<string>Icon-1024.png</string>
+			</array>
+		</dict>
+	</dict>
 
 </dict>
 </plist>
