@@ -73,27 +73,54 @@ bool _isMissedSystemRunning = false;
 DateTime? _lastFullCheckTime;
 bool _isAppInForeground = true;
 
+// สถานะการโหลด
+bool _isFirebaseInitialized = false;
+bool _isSystemReady = false;
+
+// ==================== HELPER FUNCTION FOR FIREBASE INIT ====================
+
+/// ฟังก์ชันช่วยในการ initialize Firebase (ใช้ได้ทุกที่)
+Future<FirebaseApp> _initializeFirebase() async {
+  try {
+    // ตรวจสอบว่า Firebase initialized หรือยัง
+    return await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+  } catch (e) {
+    // ถ้า initialized แล้ว จะ throw exception ให้ลอง get app แทน
+    return Firebase.app();
+  }
+}
+
 // ==================== FIREBASE MESSAGING BACKGROUND HANDLER ====================
 
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   print("📨 [Background] Message: ${message.messageId}");
 
-  // จัดการ silent notification สำหรับ iOS
-  if (message.data['type'] == 'check_missed') {
-    print("🔍 [iOS Background] Checking missed count from push");
-    await _checkAllUsersMissedCount(isBackground: true);
-  }
+  try {
+    // ตรวจสอบและ initialize Firebase ใน background
+    await _initializeFirebase();
+    print("✅ [Background] Firebase ready");
 
-  // แสดง notification เมื่อได้รับ message ตอนแอปปิด
-  if (message.notification != null) {
-    await _showLocalNotification(
-      id: DateTime.now().millisecond,
-      title: message.notification?.title ?? 'การแจ้งเตือน',
-      body: message.notification?.body ?? '',
-      payload: message.data.toString(),
-    );
+    // จัดการ silent notification สำหรับ iOS
+    if (message.data['type'] == 'check_missed') {
+      print("🔍 [iOS Background] Checking missed count from push");
+      await _checkAllUsersMissedCount(isBackground: true);
+    }
+
+    // แสดง notification เมื่อได้รับ message ตอนแอปปิด
+    if (message.notification != null) {
+      await _showLocalNotification(
+        id: DateTime.now().millisecond,
+        title: message.notification?.title ?? 'การแจ้งเตือน',
+        body: message.notification?.body ?? '',
+        payload: message.data.toString(),
+      );
+    }
+  } catch (e, stackTrace) {
+    print('❌ [Background] Error: $e');
+    print('📚 Stack trace: $stackTrace');
   }
 }
 
@@ -111,8 +138,9 @@ void callbackDispatcher() {
     }
 
     try {
-      await Firebase.initializeApp(
-          options: DefaultFirebaseOptions.currentPlatform);
+      // ตรวจสอบและ initialize Firebase ใน WorkManager
+      await _initializeFirebase();
+      print("✅ [WorkManager] Firebase ready");
 
       switch (task) {
         case 'checkin_notification_task':
@@ -135,8 +163,6 @@ void callbackDispatcher() {
       }
     } catch (e, stackTrace) {
       print('❌ [WorkManager] Error: $e');
-      await _logSystemError(
-          'WorkManager Error', e.toString(), stackTrace.toString());
     }
 
     return Future.value(true);
@@ -148,72 +174,75 @@ void callbackDispatcher() {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  try {
-    print(
-        '\n🚀 ===== เริ่มต้นระบบ (Platform: ${Platform.operatingSystem}) =====');
-
-    // Initialize Firebase
-    await Firebase.initializeApp(
-        options: DefaultFirebaseOptions.currentPlatform);
-    print('✅ Firebase initialized');
-
-    // Initialize timezone
-    tz_data.initializeTimeZones();
-    print('✅ Timezone initialized');
-
-    // Setup Notifications (Platform specific)
-    await _setupNotifications();
-    print('✅ Notifications setup completed');
-
-    // Setup Firebase Messaging
-    await _setupFirebaseMessaging();
-    print('✅ Firebase Messaging setup completed');
-
-    // ตั้งค่า Firestore Settings
-    FirebaseFirestore.instance.settings = const Settings(
-      persistenceEnabled: true,
-      cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
-    );
-    print('✅ Firestore settings configured');
-
-    // ตั้งค่า Listener สำหรับข้อมูลที่เกี่ยวข้อง
-    await _setupAllListeners();
-    print('✅ All listeners setup completed');
-
-    // Setup Background Tasks (แยกตาม Platform)
-    await _setupBackgroundTasks();
-    print('✅ Background tasks setup completed');
-
-    // โหลดข้อมูลเริ่มต้น
-    await _loadInitialData();
-    print('✅ Initial data loaded');
-
-    // เริ่มระบบ Missed Count (Platform aware)
-    _initializeMissedCountSystem();
-    print('✅ Missed Count System initialized');
-
-    // ตรวจสอบและตั้งเวลาการแจ้งเตือนครั้งแรก
-    await _checkAndScheduleNotifications();
-    print('✅ Initial notifications scheduled');
-
-    // ตั้งค่า App Lifecycle Listener (สำคัญสำหรับ iOS)
-    _setupAppLifecycleListener();
-    print('✅ App lifecycle listener setup');
-
-    print('✅ ===== ระบบพร้อมทำงานบน ${Platform.operatingSystem} =====\n');
-  } catch (e, stackTrace) {
-    print('❌ [FATAL] Error initializing app: $e');
-    print('📚 Stack trace: $stackTrace');
-
-    try {
-      await _logSystemError(
-          'Main Initialization Error', e.toString(), stackTrace.toString());
-    } catch (logError) {
-      print('❌ Could not log error: $logError');
-    }
-  }
-
+  // รันแอปทันทีโดยไม่รอ Firebase
   runApp(const FaceApp());
+
+  // หลังจากแอปแสดงแล้ว ค่อยเริ่มต้นระบบต่างๆ
+  _initializeAppSystems();
+}
+
+/// เริ่มต้นระบบทั้งหมดหลังจากแอปแสดงแล้ว
+void _initializeAppSystems() {
+  print('\n🚀 ===== เริ่มต้นระบบหลังแอปแสดง =====');
+
+  // หน่วงเวลาเล็กน้อยให้ UI แสดงก่อน
+  Future.delayed(const Duration(milliseconds: 500), () async {
+    try {
+      // 1. Initialize Firebase
+      await _initializeFirebase();
+      _isFirebaseInitialized = true;
+      print('✅ Firebase initialized');
+
+      // 2. Initialize timezone
+      tz_data.initializeTimeZones();
+      print('✅ Timezone initialized');
+
+      // 3. Setup Notifications (Platform specific)
+      await _setupNotifications();
+      print('✅ Notifications setup completed');
+
+      // 4. Setup Firebase Messaging
+      await _setupFirebaseMessaging();
+      print('✅ Firebase Messaging setup completed');
+
+      // 5. ตั้งค่า Firestore Settings
+      FirebaseFirestore.instance.settings = const Settings(
+        persistenceEnabled: true,
+        cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
+      );
+      print('✅ Firestore settings configured');
+
+      // 6. ตั้งค่า Listener สำหรับข้อมูลที่เกี่ยวข้อง
+      await _setupAllListeners();
+      print('✅ All listeners setup completed');
+
+      // 7. Setup Background Tasks (แยกตาม Platform)
+      await _setupBackgroundTasks();
+      print('✅ Background tasks setup completed');
+
+      // 8. โหลดข้อมูลเริ่มต้น
+      await _loadInitialData();
+      print('✅ Initial data loaded');
+
+      // 9. เริ่มระบบ Missed Count (Platform aware)
+      _initializeMissedCountSystem();
+      print('✅ Missed Count System initialized');
+
+      // 10. ตรวจสอบและตั้งเวลาการแจ้งเตือนครั้งแรก
+      await _checkAndScheduleNotifications();
+      print('✅ Initial notifications scheduled');
+
+      // 11. ตั้งค่า App Lifecycle Listener (สำคัญสำหรับ iOS)
+      _setupAppLifecycleListener();
+      print('✅ App lifecycle listener setup');
+
+      _isSystemReady = true;
+      print('✅ ===== ระบบพร้อมทำงานบน ${Platform.operatingSystem} =====\n');
+    } catch (e, stackTrace) {
+      print('❌ [FATAL] Error initializing systems: $e');
+      print('📚 Stack trace: $stackTrace');
+    }
+  });
 }
 
 // ==================== SETUP FUNCTIONS ====================
@@ -225,6 +254,13 @@ void _setupAppLifecycleListener() {
       onResume: () {
         print('📱 App resumed to foreground');
         _isAppInForeground = true;
+
+        // ตรวจสอบว่าระบบพร้อมหรือยัง
+        if (!_isSystemReady) {
+          print('⏳ ระบบยังไม่พร้อม ข้ามการตรวจสอบ');
+          return;
+        }
+
         // ตรวจสอบ missed count ทันทีเมื่อกลับเข้าแอป
         _checkAllUsersMissedCount(isBackground: false);
 
@@ -362,8 +398,6 @@ Future<void> _setupNotifications() async {
     print('✅ Notifications setup completed for ${Platform.operatingSystem}');
   } catch (e, stackTrace) {
     print('❌ Error setting up notifications: $e');
-    await _logSystemError(
-        'Setup Notifications Error', e.toString(), stackTrace.toString());
   }
 }
 
@@ -371,21 +405,11 @@ Future<void> _setupNotifications() async {
 void _onDidReceiveLocalNotification(
     int id, String? title, String? body, String? payload) async {
   print('📱 iOS Local Notification: $id - $title');
-
-  // แสดง in-app notification เมื่อแอป foreground
-  if (_isAppInForeground) {
-    // สามารถแสดง Snackbar หรือ Dialog ได้ที่นี่
-    // แต่ต้องมี BuildContext ซึ่งไม่สามารถใช้ตรงนี้ได้
-    // แนะนำให้ใช้ event bus หรือ stream แทน
-  }
 }
 
 /// จัดการเมื่อผู้ใช้แตะ notification
 void _handleNotificationTap(String? payload) {
   print('📲 Notification tapped: $payload');
-
-  // สามารถนำทางไปยังหน้าต่างๆ ตาม payload ได้
-  // ต้องใช้ navigator key หรือ method channel
 }
 
 /// ตั้งค่า Firebase Messaging (รองรับทั้ง iOS และ Android)
@@ -411,7 +435,9 @@ Future<void> _setupFirebaseMessaging() async {
       // จัดการ silent notification สำหรับ iOS
       if (message.data['type'] == 'check_missed') {
         print("🔍 [iOS Foreground] Checking missed count from push");
-        _checkAllUsersMissedCount(isBackground: false);
+        if (_isSystemReady) {
+          _checkAllUsersMissedCount(isBackground: false);
+        }
       }
 
       // แสดง notification เฉพาะเมื่อมี content
@@ -430,7 +456,7 @@ Future<void> _setupFirebaseMessaging() async {
         await FirebaseMessaging.instance.getInitialMessage();
     if (initialMessage != null) {
       print('📨 [Terminated] App opened from terminated state');
-      if (initialMessage.data['type'] == 'check_missed') {
+      if (initialMessage.data['type'] == 'check_missed' && _isSystemReady) {
         _checkAllUsersMissedCount(isBackground: false);
       }
       _handleNotificationTap(initialMessage.data.toString());
@@ -451,8 +477,6 @@ Future<void> _setupFirebaseMessaging() async {
     }
   } catch (e, stackTrace) {
     print('❌ Error setting up Firebase Messaging: $e');
-    await _logSystemError(
-        'Setup Firebase Messaging Error', e.toString(), stackTrace.toString());
   }
 }
 
@@ -532,8 +556,6 @@ Future<void> _setupAndroidWorkManager() async {
     print('   ✅ Missed check task: ทุก 15 นาที');
   } catch (e, stackTrace) {
     print('❌ Error setting up WorkManager: $e');
-    await _logSystemError(
-        'Setup WorkManager Error', e.toString(), stackTrace.toString());
   }
 }
 
@@ -544,13 +566,10 @@ Future<void> _setupIOSBackgroundTasks() async {
 
     // iOS ไม่สามารถใช้ WorkManager ได้ ใช้ push notifications แทน
 
-    // สร้าง local trigger สำหรับตรวจสอบเมื่อแอปทำงาน
-    _startIOSBackgroundSimulator();
-
     // ตั้งค่า silent notification handling
     FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
       print('📱 [iOS] App opened from notification');
-      if (message.data['type'] == 'check_missed') {
+      if (message.data['type'] == 'check_missed' && _isSystemReady) {
         _checkAllUsersMissedCount(isBackground: false);
       }
     });
@@ -568,11 +587,12 @@ void _startIOSBackgroundSimulator() {
   // ตรวจสอบทุก 15 นาที เฉพาะเมื่อแอปอยู่ foreground
   _iosBackgroundSimulatorTimer =
       Timer.periodic(const Duration(minutes: 15), (timer) {
-    if (_isAppInForeground) {
+    if (_isAppInForeground && _isSystemReady) {
       print('📱 [iOS Simulator] Checking missed count (app in foreground)');
       _checkAllUsersMissedCount(isBackground: false);
     } else {
-      print('📱 [iOS Simulator] App in background, skipping check');
+      print(
+          '📱 [iOS Simulator] App in background or system not ready, skipping check');
     }
   });
 }
@@ -605,7 +625,7 @@ void _initializeMissedCountSystem() {
     print('✅ iOS: ตรวจสอบทุก 15 นาที (เมื่อแอปทำงาน) + Push triggers');
   }
 
-  // ตรวจสอบครั้งแรกหลังจากเริ่มแอป 5 วินาที
+  // ตรวจสอบครั้งแรกหลังจากเริ่มระบบ 5 วินาที
   Future.delayed(const Duration(seconds: 5), () {
     print('\n🔍 [Initial] First missed count check...');
     _checkAllUsersMissedCount(isBackground: false);
@@ -616,6 +636,12 @@ void _initializeMissedCountSystem() {
 
 /// ตรวจสอบ Missed Count สำหรับผู้ใช้ที่ active = true ทุกคน
 Future<void> _checkAllUsersMissedCount({bool isBackground = false}) async {
+  // ตรวจสอบว่าระบบพร้อมหรือยัง
+  if (!_isFirebaseInitialized || !_isSystemReady) {
+    print('⚠️ ระบบยังไม่พร้อม ข้ามการตรวจสอบ');
+    return;
+  }
+
   // ป้องกันการทำงานซ้ำ
   if (_isMissedSystemRunning && !isBackground) {
     print('⚠️ ระบบกำลังทำงานอยู่ ข้ามการทำงานนี้');
@@ -699,9 +725,6 @@ Future<void> _checkAllUsersMissedCount({bool isBackground = false}) async {
   } catch (e, stackTrace) {
     print('❌ [FATAL] Error checking all users missed count: $e');
     print('📚 Stack trace: $stackTrace');
-
-    await _logSystemError(
-        'Check All Users Missed Error', e.toString(), stackTrace.toString());
   } finally {
     _isMissedSystemRunning = false;
   }
@@ -723,247 +746,6 @@ Future<void> _sendSilentNotificationForIOS(int missedCount) async {
     print('📱 [iOS] Sent silent notification for $missedCount missed counts');
   } catch (e) {
     print('❌ Error sending silent notification: $e');
-  }
-}
-
-// ==================== NOTIFICATION FUNCTIONS (ปรับปรุงสำหรับ iOS) ====================
-
-/// แสดง Local Notification (รองรับทั้ง iOS และ Android)
-Future<void> _showLocalNotification({
-  required int id,
-  required String title,
-  required String body,
-  String? payload,
-}) async {
-  try {
-    NotificationDetails details;
-
-    if (Platform.isAndroid) {
-      const androidDetails = AndroidNotificationDetails(
-        'checkin_channel',
-        'การแจ้งเตือนการเช็คชื่อ',
-        channelDescription: 'การแจ้งเตือนเกี่ยวกับเวลาเช็คชื่อ',
-        importance: Importance.high,
-        priority: Priority.high,
-        color: Color(0xFF6A1B9A),
-        icon: '@mipmap/ic_launcher',
-        largeIcon: DrawableResourceAndroidBitmap('@mipmap/ic_launcher'),
-        styleInformation: DefaultStyleInformation(true, true),
-        enableVibration: true,
-        playSound: true,
-        visibility: NotificationVisibility.public,
-        ticker: 'checkin_ticker',
-        showWhen: true,
-        usesChronometer: false,
-        timeoutAfter: 5000,
-      );
-
-      details = const NotificationDetails(android: androidDetails);
-    } else {
-      const iosDetails = DarwinNotificationDetails(
-        presentAlert: true,
-        presentBadge: true,
-        presentSound: true,
-        interruptionLevel: InterruptionLevel.timeSensitive,
-        threadIdentifier: 'checkin_notifications',
-      );
-
-      details = const NotificationDetails(iOS: iosDetails);
-    }
-
-    await flutterLocalNotificationsPlugin.show(
-      id,
-      title,
-      body,
-      details,
-      payload: payload,
-    );
-
-    print('✅ Local notification shown: $id');
-  } catch (e) {
-    print('❌ Error showing local notification: $e');
-  }
-}
-
-/// ตั้งเวลา notification จากข้อมูล (ปรับปรุงสำหรับ iOS)
-Future<void> _scheduleNotificationsFromData(Map<String, dynamic> data) async {
-  try {
-    final startHour = data['checkInStartHour'] ?? 7;
-    final startMinute = data['checkInStartMinute'] ?? 45;
-    final endHour = data['checkInEndHour'] ?? 4;
-    final endMinute = data['checkInEndMinute'] ?? 15;
-
-    print('⏰ Times from Firebase:');
-    print('   Start: $startHour:$startMinute');
-    print('   End: $endHour:$endMinute');
-
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-
-    DateTime startTime = DateTime(
-      today.year,
-      today.month,
-      today.day,
-      startHour,
-      startMinute,
-    );
-
-    DateTime endTime = DateTime(
-      today.year,
-      today.month,
-      today.day,
-      endHour,
-      endMinute,
-    );
-
-    if (endTime.isBefore(startTime)) {
-      endTime = endTime.add(const Duration(days: 1));
-      print('   ⏰ กรณีข้ามวัน: เวลาสิ้นสุด调整为 $endTime');
-    }
-
-    print('📅 Scheduled times for today:');
-    print('   Start: $startTime');
-    print('   End: $endTime');
-
-    await flutterLocalNotificationsPlugin.cancelAll();
-
-    int scheduledCount = 0;
-
-    // iOS: จำกัดการ schedule ไม่เกิน 64 notifications
-    final maxDate = DateTime.now().add(const Duration(days: 64));
-
-    bool canSchedule(DateTime time) {
-      if (Platform.isIOS && time.isAfter(maxDate)) {
-        print('⚠️ iOS: Cannot schedule beyond 64 days');
-        return false;
-      }
-      return time.isAfter(DateTime.now());
-    }
-
-    final beforeStartTime = startTime.subtract(const Duration(minutes: 10));
-    if (canSchedule(beforeStartTime)) {
-      await _scheduleNotification(
-        id: 1,
-        title: '📝 ใกล้ถึงเวลาเช็คชื่อ',
-        body:
-            'อีก 10 นาที ระบบจะเปิดให้เช็คชื่อ (เวลา ${_formatTimeInt(startHour, startMinute)})',
-        scheduledDate: beforeStartTime,
-      );
-      scheduledCount++;
-    }
-
-    if (canSchedule(startTime)) {
-      await _scheduleNotification(
-        id: 2,
-        title: '✅ ระบบพร้อมให้เช็คชื่อ',
-        body:
-            'คุณสามารถเช็คชื่อได้แล้ววันนี้ ถึงเวลา ${_formatTimeInt(endHour, endMinute)}',
-        scheduledDate: startTime,
-      );
-      scheduledCount++;
-    }
-
-    final beforeEndTime = endTime.subtract(const Duration(minutes: 10));
-    if (canSchedule(beforeEndTime)) {
-      await _scheduleNotification(
-        id: 3,
-        title: '⏰ ใกล้ถึงเวลาปิดระบบ',
-        body:
-            'อีก 10 นาที ระบบเช็คชื่อจะปิด (เวลา ${_formatTimeInt(endHour, endMinute)})',
-        scheduledDate: beforeEndTime,
-      );
-      scheduledCount++;
-    }
-
-    if (canSchedule(endTime)) {
-      await _scheduleNotification(
-        id: 4,
-        title: '🔒 ระบบปิดการเช็คชื่อ',
-        body:
-            'หมดเขตเช็คชื่อสำหรับวันนี้ พบกันใหม่พรุ่งนี้ เวลา ${_formatTimeInt(startHour, startMinute)}',
-        scheduledDate: endTime,
-      );
-      scheduledCount++;
-    }
-
-    print(
-        '✅ Scheduled $scheduledCount notifications for ${Platform.operatingSystem}');
-  } catch (e, stackTrace) {
-    print('❌ Error scheduling notifications: $e');
-    await _logSystemError(
-        'Schedule Notifications Error', e.toString(), stackTrace.toString());
-  }
-}
-
-/// จัดการการแจ้งเตือนตามเวลาที่กำหนด (รองรับทั้ง iOS และ Android)
-Future<void> _scheduleNotification({
-  required int id,
-  required String title,
-  required String body,
-  required DateTime scheduledDate,
-}) async {
-  try {
-    print('⏰ Scheduling notification $id at: $scheduledDate');
-
-    if (scheduledDate.isBefore(DateTime.now())) {
-      print('⚠️ Cannot schedule in the past!');
-      return;
-    }
-
-    final tz.TZDateTime scheduledTZDate = tz.TZDateTime.from(
-      scheduledDate,
-      tz.local,
-    );
-
-    NotificationDetails details;
-
-    if (Platform.isAndroid) {
-      const androidDetails = AndroidNotificationDetails(
-        'checkin_channel',
-        'การแจ้งเตือนการเช็คชื่อ',
-        channelDescription: 'การแจ้งเตือนเกี่ยวกับเวลาเช็คชื่อ',
-        importance: Importance.high,
-        priority: Priority.high,
-        color: Color(0xFF6A1B9A),
-        icon: '@mipmap/ic_launcher',
-        largeIcon: DrawableResourceAndroidBitmap('@mipmap/ic_launcher'),
-        styleInformation: DefaultStyleInformation(true, true),
-        enableVibration: true,
-        playSound: true,
-        visibility: NotificationVisibility.public,
-        ticker: 'checkin_ticker',
-        showWhen: true,
-        usesChronometer: false,
-      );
-
-      details = const NotificationDetails(android: androidDetails);
-    } else {
-      const iosDetails = DarwinNotificationDetails(
-        presentAlert: true,
-        presentBadge: true,
-        presentSound: true,
-        interruptionLevel: InterruptionLevel.timeSensitive,
-        threadIdentifier: 'checkin_notifications',
-      );
-
-      details = const NotificationDetails(iOS: iosDetails);
-    }
-
-    await flutterLocalNotificationsPlugin.zonedSchedule(
-      id,
-      title,
-      body,
-      scheduledTZDate,
-      details,
-      androidScheduleMode:
-          Platform.isAndroid ? AndroidScheduleMode.exactAllowWhileIdle : null,
-      uiLocalNotificationDateInterpretation:
-          UILocalNotificationDateInterpretation.absoluteTime,
-      matchDateTimeComponents: DateTimeComponents.time,
-      payload: 'checkin_notification_$id',
-    );
-  } catch (e) {
-    print('❌ Error scheduling notification: $e');
   }
 }
 
@@ -1063,8 +845,6 @@ Future<void> _handleCheckinTimeChange(Map<String, dynamic> newData) async {
     print('✅ Real-time update completed successfully');
   } catch (e, stackTrace) {
     print('❌ Error handling real-time update: $e');
-    await _logSystemError(
-        'Real-time Update Error', e.toString(), stackTrace.toString());
   } finally {
     _isScheduling = false;
   }
@@ -1668,9 +1448,264 @@ Future<void> _incrementMissedCount(String userId, DateTime date,
     print('   🔚 ===== จบการเพิ่ม Missed Out =====\n');
   } catch (e, stackTrace) {
     print('   ❌ Error incrementing missed count: $e');
-    await _logSystemError(
-        'Increment Missed Error', e.toString(), stackTrace.toString(),
-        userId: userId);
+  }
+}
+
+/// แสดง Local Notification (รองรับทั้ง iOS และ Android)
+Future<void> _showLocalNotification({
+  required int id,
+  required String title,
+  required String body,
+  String? payload,
+}) async {
+  try {
+    NotificationDetails details;
+
+    if (Platform.isAndroid) {
+      const androidDetails = AndroidNotificationDetails(
+        'checkin_channel',
+        'การแจ้งเตือนการเช็คชื่อ',
+        channelDescription: 'การแจ้งเตือนเกี่ยวกับเวลาเช็คชื่อ',
+        importance: Importance.high,
+        priority: Priority.high,
+        color: Color(0xFF6A1B9A),
+        icon: '@mipmap/ic_launcher',
+        largeIcon: DrawableResourceAndroidBitmap('@mipmap/ic_launcher'),
+        styleInformation: DefaultStyleInformation(true, true),
+        enableVibration: true,
+        playSound: true,
+        visibility: NotificationVisibility.public,
+        ticker: 'checkin_ticker',
+        showWhen: true,
+        usesChronometer: false,
+        timeoutAfter: 5000,
+      );
+
+      details = const NotificationDetails(android: androidDetails);
+    } else {
+      const iosDetails = DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+        interruptionLevel: InterruptionLevel.timeSensitive,
+        threadIdentifier: 'checkin_notifications',
+      );
+
+      details = const NotificationDetails(iOS: iosDetails);
+    }
+
+    await flutterLocalNotificationsPlugin.show(
+      id,
+      title,
+      body,
+      details,
+      payload: payload,
+    );
+
+    print('✅ Local notification shown: $id');
+  } catch (e) {
+    print('❌ Error showing local notification: $e');
+  }
+}
+
+/// ตรวจสอบและตั้งเวลาการแจ้งเตือนตามเวลาจาก Firebase
+Future<void> _checkAndScheduleNotifications() async {
+  try {
+    print('🔍 Checking check-in times from Firebase...');
+
+    final firestore = FirebaseFirestore.instance;
+    final settingsDoc =
+        await firestore.collection('system_settings').doc('checkin_time').get();
+
+    if (!settingsDoc.exists) {
+      print('⚠️ No check-in settings found');
+      return;
+    }
+
+    final data = settingsDoc.data()!;
+    await _scheduleNotificationsFromData(data);
+  } catch (e, stackTrace) {
+    print('❌ Error checking notifications: $e');
+  }
+}
+
+/// ตั้งเวลา notification จากข้อมูล (ปรับปรุงสำหรับ iOS)
+Future<void> _scheduleNotificationsFromData(Map<String, dynamic> data) async {
+  try {
+    final startHour = data['checkInStartHour'] ?? 7;
+    final startMinute = data['checkInStartMinute'] ?? 45;
+    final endHour = data['checkInEndHour'] ?? 4;
+    final endMinute = data['checkInEndMinute'] ?? 15;
+
+    print('⏰ Times from Firebase:');
+    print('   Start: $startHour:$startMinute');
+    print('   End: $endHour:$endMinute');
+
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+
+    DateTime startTime = DateTime(
+      today.year,
+      today.month,
+      today.day,
+      startHour,
+      startMinute,
+    );
+
+    DateTime endTime = DateTime(
+      today.year,
+      today.month,
+      today.day,
+      endHour,
+      endMinute,
+    );
+
+    if (endTime.isBefore(startTime)) {
+      endTime = endTime.add(const Duration(days: 1));
+      print('   ⏰ กรณีข้ามวัน: เวลาสิ้นสุด调整为 $endTime');
+    }
+
+    print('📅 Scheduled times for today:');
+    print('   Start: $startTime');
+    print('   End: $endTime');
+
+    await flutterLocalNotificationsPlugin.cancelAll();
+
+    int scheduledCount = 0;
+
+    // iOS: จำกัดการ schedule ไม่เกิน 64 notifications
+    final maxDate = DateTime.now().add(const Duration(days: 64));
+
+    bool canSchedule(DateTime time) {
+      if (Platform.isIOS && time.isAfter(maxDate)) {
+        print('⚠️ iOS: Cannot schedule beyond 64 days');
+        return false;
+      }
+      return time.isAfter(DateTime.now());
+    }
+
+    final beforeStartTime = startTime.subtract(const Duration(minutes: 10));
+    if (canSchedule(beforeStartTime)) {
+      await _scheduleNotification(
+        id: 1,
+        title: '📝 ใกล้ถึงเวลาเช็คชื่อ',
+        body:
+            'อีก 10 นาที ระบบจะเปิดให้เช็คชื่อ (เวลา ${_formatTimeInt(startHour, startMinute)})',
+        scheduledDate: beforeStartTime,
+      );
+      scheduledCount++;
+    }
+
+    if (canSchedule(startTime)) {
+      await _scheduleNotification(
+        id: 2,
+        title: '✅ ระบบพร้อมให้เช็คชื่อ',
+        body:
+            'คุณสามารถเช็คชื่อได้แล้ววันนี้ ถึงเวลา ${_formatTimeInt(endHour, endMinute)}',
+        scheduledDate: startTime,
+      );
+      scheduledCount++;
+    }
+
+    final beforeEndTime = endTime.subtract(const Duration(minutes: 10));
+    if (canSchedule(beforeEndTime)) {
+      await _scheduleNotification(
+        id: 3,
+        title: '⏰ ใกล้ถึงเวลาปิดระบบ',
+        body:
+            'อีก 10 นาที ระบบเช็คชื่อจะปิด (เวลา ${_formatTimeInt(endHour, endMinute)})',
+        scheduledDate: beforeEndTime,
+      );
+      scheduledCount++;
+    }
+
+    if (canSchedule(endTime)) {
+      await _scheduleNotification(
+        id: 4,
+        title: '🔒 ระบบปิดการเช็คชื่อ',
+        body:
+            'หมดเขตเช็คชื่อสำหรับวันนี้ พบกันใหม่พรุ่งนี้ เวลา ${_formatTimeInt(startHour, startMinute)}',
+        scheduledDate: endTime,
+      );
+      scheduledCount++;
+    }
+
+    print(
+        '✅ Scheduled $scheduledCount notifications for ${Platform.operatingSystem}');
+  } catch (e, stackTrace) {
+    print('❌ Error scheduling notifications: $e');
+  }
+}
+
+/// จัดการการแจ้งเตือนตามเวลาที่กำหนด (รองรับทั้ง iOS และ Android)
+Future<void> _scheduleNotification({
+  required int id,
+  required String title,
+  required String body,
+  required DateTime scheduledDate,
+}) async {
+  try {
+    print('⏰ Scheduling notification $id at: $scheduledDate');
+
+    if (scheduledDate.isBefore(DateTime.now())) {
+      print('⚠️ Cannot schedule in the past!');
+      return;
+    }
+
+    final tz.TZDateTime scheduledTZDate = tz.TZDateTime.from(
+      scheduledDate,
+      tz.local,
+    );
+
+    NotificationDetails details;
+
+    if (Platform.isAndroid) {
+      const androidDetails = AndroidNotificationDetails(
+        'checkin_channel',
+        'การแจ้งเตือนการเช็คชื่อ',
+        channelDescription: 'การแจ้งเตือนเกี่ยวกับเวลาเช็คชื่อ',
+        importance: Importance.high,
+        priority: Priority.high,
+        color: Color(0xFF6A1B9A),
+        icon: '@mipmap/ic_launcher',
+        largeIcon: DrawableResourceAndroidBitmap('@mipmap/ic_launcher'),
+        styleInformation: DefaultStyleInformation(true, true),
+        enableVibration: true,
+        playSound: true,
+        visibility: NotificationVisibility.public,
+        ticker: 'checkin_ticker',
+        showWhen: true,
+        usesChronometer: false,
+      );
+
+      details = const NotificationDetails(android: androidDetails);
+    } else {
+      const iosDetails = DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+        interruptionLevel: InterruptionLevel.timeSensitive,
+        threadIdentifier: 'checkin_notifications',
+      );
+
+      details = const NotificationDetails(iOS: iosDetails);
+    }
+
+    await flutterLocalNotificationsPlugin.zonedSchedule(
+      id,
+      title,
+      body,
+      scheduledTZDate,
+      details,
+      androidScheduleMode:
+          Platform.isAndroid ? AndroidScheduleMode.exactAllowWhileIdle : null,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
+      matchDateTimeComponents: DateTimeComponents.time,
+      payload: 'checkin_notification_$id',
+    );
+  } catch (e) {
+    print('❌ Error scheduling notification: $e');
   }
 }
 
@@ -1709,29 +1744,6 @@ Future<void> _sendDailyMissedSummary() async {
     }
   } catch (e) {
     print('❌ Error sending daily summary: $e');
-  }
-}
-
-/// ตรวจสอบและตั้งเวลาการแจ้งเตือนตามเวลาจาก Firebase
-Future<void> _checkAndScheduleNotifications() async {
-  try {
-    print('🔍 Checking check-in times from Firebase...');
-
-    final firestore = FirebaseFirestore.instance;
-    final settingsDoc =
-        await firestore.collection('system_settings').doc('checkin_time').get();
-
-    if (!settingsDoc.exists) {
-      print('⚠️ No check-in settings found');
-      return;
-    }
-
-    final data = settingsDoc.data()!;
-    await _scheduleNotificationsFromData(data);
-  } catch (e, stackTrace) {
-    print('❌ Error checking notifications: $e');
-    await _logSystemError(
-        'Check Notifications Error', e.toString(), stackTrace.toString());
   }
 }
 
