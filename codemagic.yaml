@@ -6,6 +6,7 @@ workflows:
       xcode: latest
 
     scripts:
+      - flutter clean
       - flutter pub get
       - flutter build ipa --release --no-codesign
 
