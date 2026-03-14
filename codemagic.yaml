@@ -8,8 +8,7 @@ workflows:
     scripts:
       - flutter clean
       - flutter pub get
-      - flutter build ios --release --no-codesign
-      - xcodebuild -exportArchive -archivePath build/ios/archive/Runner.xcarchive -exportPath build/ios/ipa -exportOptionsPlist ios/Runner/ExportOptions.plist
+      - flutter build ipa --release --no-codesign
 
     artifacts:
       - build/ios/ipa/*.ipa
