@@ -1,14 +1,22 @@
 workflows:
-  ios-build:
-    name: iOS Build
+  ios-release-build:
+    name: iOS Release Build
     environment:
       flutter: stable
       xcode: latest
 
     scripts:
-      - flutter clean
-      - flutter pub get
-      - flutter build ipa --release --no-codesign
+      - name: Clean project
+        script: |
+          flutter clean
+
+      - name: Get Flutter packages
+        script: |
+          flutter pub get
+
+      - name: Build iOS Release (no codesign)
+        script: |
+          flutter build ios --release --no-codesign
 
     artifacts:
-      - build/ios/ipa/*.ipa
+      - build/ios/iphoneos/Runner.app
