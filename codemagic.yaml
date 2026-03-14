@@ -1,22 +1,26 @@
 workflows:
   ios-release-build:
-    name: iOS Release Build
+    name: iOS Release IPA
+    max_build_duration: 60
+    instance_type: mac_mini_m1
+
     environment:
       flutter: stable
-      xcode: latest
 
     scripts:
-      - name: Clean project
-        script: |
-          flutter clean
-
       - name: Get Flutter packages
         script: |
           flutter pub get
 
-      - name: Build iOS Release (no codesign)
+      - name: Build iOS (release)
         script: |
           flutter build ios --release --no-codesign
 
+      - name: Create IPA
+        script: |
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r Runner.ipa Payload
+
     artifacts:
-      - build/ios/iphoneos/Runner.app
+      - Runner.ipa
