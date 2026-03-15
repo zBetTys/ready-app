@@ -67,22 +67,25 @@ class _CapturePageState extends State<CapturePage>
   static const bool ENABLE_SMART_GUIDANCE = true;
   static const double MIN_ACCEPTABLE_QUALITY = 0.55;
 
-  // ================ iOS OPTIMIZATIONS ================
-  static const int IOS_DETECTION_INTERVAL_MS = 2000; // เพิ่มเป็น 2 วินาที
-  static const int ANDROID_DETECTION_INTERVAL_MS = 600;
-  static const ResolutionPreset IOS_RESOLUTION = ResolutionPreset.low;
-  static const ResolutionPreset ANDROID_RESOLUTION = ResolutionPreset.medium;
+  // ================ iOS ULTIMATE FIX ================
+  static const int IOS_DETECTION_INTERVAL_MS = 3000; // 3 วินาที
+  static const int IOS_CAPTURE_COOLDOWN_MS = 4000; // 4 วินาที
+  static const int ANDROID_DETECTION_INTERVAL_MS = 600; // 0.6 วินาที
+  static const ResolutionPreset IOS_RESOLUTION =
+      ResolutionPreset.low; // iOS ใช้ low
+  static const ResolutionPreset ANDROID_RESOLUTION =
+      ResolutionPreset.medium; // Android ใช้ medium
   static const int IOS_THREADS = 1;
-  static const int ANDROID_THREADS = 4;
+  static const int ANDROID_THREADS = 4; // เพิ่ม ANDROID_THREADS
   static const bool IOS_USE_FAST_MODE = true;
-  static const int MAX_IOS_CONSECUTIVE_ERRORS = 5;
-  static const int IOS_CAPTURE_COOLDOWN_MS = 3000; // เพิ่มเป็น 3 วินาที
+  static const int MAX_IOS_CONSECUTIVE_ERRORS = 10;
 
   // ================ FIX FLICKERING ================
-  static const bool USE_FIXED_PREVIEW_SIZE = true; // ใช้ขนาด preview คงที่
-  static const bool DISABLE_OVERLAY_REBUILD = true; // ปิดการ rebuild overlay
-  static const int MAX_FRAME_SKIP = 5; // ข้าม frame สูงสุด
-  static const bool USE_HARDWARE_ACCELERATION = false; // ปิด hardware acceleration บน iOS
+  static const bool USE_NATIVE_PREVIEW = true; // ใช้ native preview
+  static const bool DISABLE_ALL_ANIMATIONS = true; // ปิด animations ทั้งหมด
+  static const bool USE_STATIC_OVERLAY = true; // ใช้ overlay คงที่
+  static const int MAX_FRAME_SKIP = 10;
+  static const bool DISABLE_SETSTATE = true; // ปิด setState บ่อยๆ
 
   // ================ UI CONSTANTS ================
   static const double FACE_FRAME_RATIO = 0.65;
@@ -96,7 +99,7 @@ class _CapturePageState extends State<CapturePage>
   FaceDetector? _faceDetector;
   Face? _currentFace;
   List<Face> _faceHistory = [];
-  
+
   // ================ iOS State Management ================
   bool _isIos = false;
   bool _isProcessing = false;
@@ -104,7 +107,7 @@ class _CapturePageState extends State<CapturePage>
   int _iosConsecutiveErrors = 0;
   Timer? _iosRetryTimer;
   bool _isPaused = false;
-  
+
   // ================ Flickering Fix Variables ================
   final GlobalKey _cameraPreviewKey = GlobalKey();
   bool _isRebuilding = false;
@@ -112,7 +115,19 @@ class _CapturePageState extends State<CapturePage>
   Timer? _frameTimer;
   bool _cameraInitialized = false;
   Size? _previewSize;
-  bool _useFallbackMode = false; // โหมดสำรองสำหรับ iOS
+
+  // ================ Cached Values ================
+  Face? _cachedFace;
+  double _cachedQuality = 0.0;
+  double _cachedStability = 0.0;
+  double _cachedLighting = 0.0;
+  double _cachedSharpness = 0.0;
+  double _cachedPose = 0.0;
+  double _cachedSymmetry = 0.0;
+  bool _cachedLiveness = false;
+  int _cachedStableCount = 0;
+  String _cachedStatus = 'กำลังเตรียมระบบ...';
+  String _cachedInstruction = 'กรุณารอสักครู่';
 
   // ================ MobileFaceNet Model ================
   Interpreter? _faceModel;
@@ -184,7 +199,7 @@ class _CapturePageState extends State<CapturePage>
 
   // ================ Timer ================
   Timer? _detectionTimer;
-  Timer? _iosFrameTimer;
+  Timer? _uiUpdateTimer;
 
   @override
   void initState() {
@@ -194,35 +209,58 @@ class _CapturePageState extends State<CapturePage>
     _isIos = Platform.isIOS;
     print('📱 Platform: ${_isIos ? 'iOS' : 'Android'}');
 
-    _pulseController = AnimationController(
-      duration: const Duration(milliseconds: 1500),
-      vsync: this,
-    )..repeat(reverse: true);
+    // iOS: ปิด animations ทั้งหมด
+    if (_isIos && DISABLE_ALL_ANIMATIONS) {
+      _pulseController = AnimationController(
+        duration: const Duration(milliseconds: 1500),
+        vsync: this,
+      )..value = 1.0; // ตั้งค่าให้คงที่
 
-    _pulseAnimation = Tween<double>(begin: 0.96, end: 1.0).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-    );
+      _pulseAnimation = Tween<double>(begin: 1.0, end: 1.0).animate(
+        CurvedAnimation(parent: _pulseController, curve: Curves.linear),
+      );
+    } else {
+      _pulseController = AnimationController(
+        duration: const Duration(milliseconds: 1500),
+        vsync: this,
+      )..repeat(reverse: true);
+
+      _pulseAnimation = Tween<double>(begin: 0.96, end: 1.0).animate(
+        CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+      );
+    }
 
     _successController = AnimationController(
       duration: const Duration(milliseconds: 800),
       vsync: this,
     );
 
-    // iOS: เริ่ม frame timer เพื่อ refresh UI เบาๆ
+    // iOS: เริ่ม UI update timer แทน setState
     if (_isIos) {
-      _startIOSFrameTimer();
+      _startUIUpdateTimer();
     }
 
     _initializeSystem();
   }
 
-  void _startIOSFrameTimer() {
-    _iosFrameTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
+  void _startUIUpdateTimer() {
+    _uiUpdateTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
       if (mounted && !_isRebuilding && _isCameraReady) {
-        // refresh เบาๆ โดยไม่ rebuild
-        setState(() {
-          // อัพเดทเฉพาะ animation
-        });
+        // อัพเดท cache values
+        _cachedFace = _currentFace;
+        _cachedQuality = _faceQuality;
+        _cachedStability = _faceStability;
+        _cachedLighting = _lightingScore;
+        _cachedSharpness = _sharpnessScore;
+        _cachedPose = _poseScore;
+        _cachedSymmetry = _faceSymmetry;
+        _cachedLiveness = _livenessPassed;
+        _cachedStableCount = _stableFrameCount;
+        _cachedStatus = _statusMessage;
+        _cachedInstruction = _instructionMessage;
+
+        // refresh UI เบาๆ
+        setState(() {});
       }
     });
   }
@@ -237,7 +275,7 @@ class _CapturePageState extends State<CapturePage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.inactive || 
+    if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
       _pauseDetection();
     } else if (state == AppLifecycleState.resumed) {
@@ -261,16 +299,16 @@ class _CapturePageState extends State<CapturePage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _iosFrameTimer?.cancel();
+    _uiUpdateTimer?.cancel();
     _pauseDetection();
-    
+
     // dispose camera อย่างปลอดภัย
     try {
       _cameraController?.dispose();
     } catch (e) {
       print('Camera dispose error: $e');
     }
-    
+
     _faceDetector?.close();
     _faceModel?.close();
     _pulseController.dispose();
@@ -297,7 +335,8 @@ class _CapturePageState extends State<CapturePage>
         setState(() {
           _isCameraReady = true;
           _cameraInitialized = true;
-          _statusMessage = _modelLoaded ? '🆔 พร้อมบันทึก Face ID' : '⚠️ โหลดโมเดลไม่สำเร็จ';
+          _statusMessage =
+              _modelLoaded ? '🆔 พร้อมบันทึก Face ID' : '⚠️ โหลดโมเดลไม่สำเร็จ';
         });
       }
 
@@ -320,7 +359,8 @@ class _CapturePageState extends State<CapturePage>
         orElse: () => cameras.first,
       );
 
-      final resolution = _isIos ? ResolutionPreset.low : ANDROID_RESOLUTION;
+      // iOS: ใช้ low resolution, Android: ใช้ medium resolution
+      final resolution = _isIos ? IOS_RESOLUTION : ANDROID_RESOLUTION;
 
       _cameraController = CameraController(
         frontCamera,
@@ -477,12 +517,13 @@ class _CapturePageState extends State<CapturePage>
     print('📱 Detection interval: ${interval.inMilliseconds}ms');
 
     _detectionTimer = Timer.periodic(interval, (timer) async {
-      // iOS: ตรวจสอบ frame skip
+      // iOS: ข้าม frame บ่อยๆ
       if (_isIos) {
         if (_frameSkipCount > MAX_FRAME_SKIP) {
           _frameSkipCount = 0;
           return;
         }
+        _frameSkipCount++;
       }
 
       if (_isPaused ||
@@ -501,7 +542,6 @@ class _CapturePageState extends State<CapturePage>
 
       if (_isIos) {
         if (_isProcessing) {
-          _frameSkipCount++;
           return;
         }
 
@@ -513,7 +553,6 @@ class _CapturePageState extends State<CapturePage>
         }
       }
 
-      _frameSkipCount = 0;
       await _performPlatformOptimizedDetection();
     });
   }
@@ -565,13 +604,8 @@ class _CapturePageState extends State<CapturePage>
       if (faces.isNotEmpty) {
         final face = faces.first;
 
-        // อัพเดท UI แบบไม่ rebuild ทั้งหน้า
-        if (mounted) {
-          setState(() {
-            _currentFace = face;
-          });
-        }
-
+        // อัพเดทตัวแปรโดยไม่ setState บ่อย
+        _currentFace = face;
         _faceHistory.add(face);
         if (_faceHistory.length > 3) _faceHistory.removeAt(0);
 
@@ -588,20 +622,17 @@ class _CapturePageState extends State<CapturePage>
 
         _analyzeAndImproveQuality();
 
-        if (mounted) {
-          setState(() {
-            _faceQuality = quality;
-            _faceStability = stability;
-            _lightingScore = lighting;
-            _sharpnessScore = sharpness;
-            _poseScore = pose;
-            _faceSymmetry = symmetry;
-            _livenessPassed = livenessResult;
+        // อัพเดทค่าต่างๆ
+        _faceQuality = quality;
+        _faceStability = stability;
+        _lightingScore = lighting;
+        _sharpnessScore = sharpness;
+        _poseScore = pose;
+        _faceSymmetry = symmetry;
+        _livenessPassed = livenessResult;
 
-            if (ENABLE_ADAPTIVE_THRESHOLDS) {
-              _adaptiveThreshold = _calculateAdaptiveThreshold();
-            }
-          });
+        if (ENABLE_ADAPTIVE_THRESHOLDS) {
+          _adaptiveThreshold = _calculateAdaptiveThreshold();
         }
 
         _updateIntelligentFaceStatus();
@@ -612,19 +643,16 @@ class _CapturePageState extends State<CapturePage>
         if (quality >= currentThreshold &&
             stability >= MIN_FACE_STABILITY &&
             _livenessPassed) {
-          if (mounted) {
-            setState(() {
-              _stableFrameCount++;
-              _consecutiveLowQuality = 0;
-            });
-          }
+          _stableFrameCount++;
+          _consecutiveLowQuality = 0;
 
           if (_stableFrameCount >= REQUIRED_STABLE_FRAMES &&
               !_isCapturing &&
               _enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
             if (_isIos) {
-              if (_lastCaptureTime == null || 
-                  DateTime.now().difference(_lastCaptureTime!).inMilliseconds >= IOS_CAPTURE_COOLDOWN_MS) {
+              if (_lastCaptureTime == null ||
+                  DateTime.now().difference(_lastCaptureTime!).inMilliseconds >=
+                      IOS_CAPTURE_COOLDOWN_MS) {
                 _capturePlatformOptimizedFaceID();
               }
             } else {
@@ -632,30 +660,27 @@ class _CapturePageState extends State<CapturePage>
             }
           }
         } else {
-          if (mounted) {
-            setState(() {
-              _stableFrameCount = 0;
-              if (quality < MIN_ACCEPTABLE_QUALITY) {
-                _consecutiveLowQuality++;
-              } else {
-                _consecutiveLowQuality = 0;
-              }
-            });
+          _stableFrameCount = 0;
+          if (quality < MIN_ACCEPTABLE_QUALITY) {
+            _consecutiveLowQuality++;
+          } else {
+            _consecutiveLowQuality = 0;
           }
         }
 
         _isStruggling = _consecutiveLowQuality > 5;
       } else {
-        if (mounted) {
-          setState(() {
-            _currentFace = null;
-            _stableFrameCount = 0;
-          });
-        }
+        _currentFace = null;
+        _stableFrameCount = 0;
         _updateStatus('👤 ไม่พบใบหน้า', 'วางใบหน้าในกรอบ', '');
       }
 
       _isTakingPicture = false;
+
+      // iOS: อัพเดท UI เฉพาะเมื่อจำเป็น
+      if (_isIos && mounted && !DISABLE_SETSTATE) {
+        setState(() {});
+      }
     } catch (e) {
       print('Detection error: $e');
       _isTakingPicture = false;
@@ -699,12 +724,13 @@ class _CapturePageState extends State<CapturePage>
       _lastCaptureTime = DateTime.now();
     }
 
-    if (mounted) {
-      setState(() {
-        _isCapturing = true;
-        _captureAttempts++;
-        _statusMessage = '📸 กำลังถ่ายรูป (ครั้งที่ $_captureAttempts)...';
-      });
+    // อัพเดท UI เฉพาะเมื่อจำเป็น
+    _isCapturing = true;
+    _captureAttempts++;
+    _statusMessage = '📸 กำลังถ่ายรูป (ครั้งที่ $_captureAttempts)...';
+
+    if (mounted && !DISABLE_SETSTATE) {
+      setState(() {});
     }
 
     try {
@@ -788,17 +814,19 @@ class _CapturePageState extends State<CapturePage>
           _absoluteBestFace = embeddingData;
           _hasGoodFaces = true;
 
-          print('✨ พบใบหน้าที่ดีขึ้น: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
+          print(
+              '✨ พบใบหน้าที่ดีขึ้น: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
         }
 
-        if (mounted) {
-          setState(() {
-            _enrollmentCount++;
-            _hasGoodFaces = true;
-            _statusMessage = '✅ ได้ใบหน้าคุณภาพ ${(totalQualityScore * 100).toInt()}%';
-            _isCapturing = false;
-            _stableFrameCount = 0;
-          });
+        _enrollmentCount++;
+        _hasGoodFaces = true;
+        _statusMessage =
+            '✅ ได้ใบหน้าคุณภาพ ${(totalQualityScore * 100).toInt()}%';
+        _isCapturing = false;
+        _stableFrameCount = 0;
+
+        if (mounted && !DISABLE_SETSTATE) {
+          setState(() {});
         }
 
         _showCaptureSuccess();
@@ -818,17 +846,19 @@ class _CapturePageState extends State<CapturePage>
           }
         }
       } else {
-        if (mounted) {
-          setState(() {
-            _statusMessage = '⚠️ คุณภาพ ${(totalQualityScore * 100).toInt()}% (ต้องการ ${(qualityThreshold * 100).toInt()}%)';
-            _instructionMessage = _currentGuidance.isNotEmpty
-                ? _currentGuidance
-                : 'พยายามต่อไป (ครั้งที่ $_captureAttempts/$MAX_CAPTURE_ATTEMPTS)';
-            _isCapturing = false;
-          });
+        _statusMessage =
+            '⚠️ คุณภาพ ${(totalQualityScore * 100).toInt()}% (ต้องการ ${(qualityThreshold * 100).toInt()}%)';
+        _instructionMessage = _currentGuidance.isNotEmpty
+            ? _currentGuidance
+            : 'พยายามต่อไป (ครั้งที่ $_captureAttempts/$MAX_CAPTURE_ATTEMPTS)';
+        _isCapturing = false;
+
+        if (mounted && !DISABLE_SETSTATE) {
+          setState(() {});
         }
 
-        print('⚠️ คุณภาพไม่พอ: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
+        print(
+            '⚠️ คุณภาพไม่พอ: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
 
         if (_captureAttempts >= MAX_CAPTURE_ATTEMPTS &&
             _enrolledEmbeddings.isNotEmpty) {
@@ -849,13 +879,13 @@ class _CapturePageState extends State<CapturePage>
       } catch (_) {}
     } catch (e) {
       print('❌ Capture error: $e');
-      if (mounted) {
-        setState(() {
-          _isCapturing = false;
-          _statusMessage = '❌ ถ่ายรูปไม่สำเร็จ';
-          _instructionMessage = 'ลองใหม่';
-          _stableFrameCount = 0;
-        });
+      _isCapturing = false;
+      _statusMessage = '❌ ถ่ายรูปไม่สำเร็จ';
+      _instructionMessage = 'ลองใหม่';
+      _stableFrameCount = 0;
+
+      if (mounted && !DISABLE_SETSTATE) {
+        setState(() {});
       }
     }
   }
@@ -926,7 +956,10 @@ class _CapturePageState extends State<CapturePage>
     if (_qualityHistory.isEmpty) return MIN_FACE_QUALITY;
 
     final recentQuality = _qualityHistory.length > 5
-        ? _qualityHistory.sublist(_qualityHistory.length - 5).reduce((a, b) => a + b) / 5
+        ? _qualityHistory
+                .sublist(_qualityHistory.length - 5)
+                .reduce((a, b) => a + b) /
+            5
         : _qualityHistory.reduce((a, b) => a + b) / _qualityHistory.length;
 
     double adaptiveThreshold = recentQuality * 0.9;
@@ -982,13 +1015,15 @@ class _CapturePageState extends State<CapturePage>
         _updateStatus('📸 ปรับปรุง', _currentGuidance,
             'คุณภาพ ${(_faceQuality * 100).toInt()}%');
       } else {
-        _updateStatus('📸 ปรับตำแหน่ง', 'คุณภาพ ${(_faceQuality * 100).toInt()}%', '');
+        _updateStatus(
+            '📸 ปรับตำแหน่ง', 'คุณภาพ ${(_faceQuality * 100).toInt()}%', '');
       }
       return;
     }
 
     if (_faceStability < MIN_FACE_STABILITY) {
-      _updateStatus('🎯 อยู่นิ่งๆ', 'ความนิ่ง ${(_faceStability * 100).toInt()}%', '');
+      _updateStatus(
+          '🎯 อยู่นิ่งๆ', 'ความนิ่ง ${(_faceStability * 100).toInt()}%', '');
       return;
     }
 
@@ -1061,7 +1096,8 @@ class _CapturePageState extends State<CapturePage>
         leftCheek = 0.7 + (leftCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
       }
       if (rightCheekLandmark != null) {
-        rightCheek = 0.7 + (rightCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
+        rightCheek =
+            0.7 + (rightCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
       }
     } catch (_) {}
 
@@ -1148,8 +1184,10 @@ class _CapturePageState extends State<CapturePage>
 
       int left = max(0, bbox.left.toInt() - paddingX);
       int top = max(0, bbox.top.toInt() - paddingY);
-      int width = min(originalImage.width - left, bbox.width.toInt() + paddingX * 2);
-      int height = min(originalImage.height - top, bbox.height.toInt() + paddingY * 2);
+      int width =
+          min(originalImage.width - left, bbox.width.toInt() + paddingX * 2);
+      int height =
+          min(originalImage.height - top, bbox.height.toInt() + paddingY * 2);
 
       if (width <= 0 || height <= 0) return null;
 
@@ -1306,7 +1344,8 @@ class _CapturePageState extends State<CapturePage>
 
     for (var emb in facesToUse) {
       final vector = emb['embedding'] as List<double>;
-      final quality = emb['total_quality'] as double? ?? emb['quality'] as double;
+      final quality =
+          emb['total_quality'] as double? ?? emb['quality'] as double;
       final weight = quality;
 
       for (int i = 0; i < dimension; i++) {
@@ -1372,7 +1411,8 @@ class _CapturePageState extends State<CapturePage>
               Text('ความสอดคล้อง: ${(_enrollmentConsistency * 100).toInt()}%'),
               Text('ต้องการ: ${(MIN_ENROLLMENT_CONSISTENCY * 100).toInt()}%'),
               const SizedBox(height: 16),
-              Text('ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
+              Text(
+                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
               Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
               if (_bestFaces.isNotEmpty) ...[
                 const SizedBox(height: 16),
@@ -1415,16 +1455,19 @@ class _CapturePageState extends State<CapturePage>
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('ลองถ่ายหลายครั้งแล้ว แต่ยังไม่ได้คุณภาพตามที่ต้องการ'),
+              const Text(
+                  'ลองถ่ายหลายครั้งแล้ว แต่ยังไม่ได้คุณภาพตามที่ต้องการ'),
               const SizedBox(height: 16),
-              Text('ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
+              Text(
+                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
               Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
               if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS) ...[
                 const SizedBox(height: 8),
                 const Text('✅ มีจำนวนเพียงพอสำหรับการบันทึก'),
               ] else ...[
                 const SizedBox(height: 8),
-                Text('⚠️ มีเพียง ${_bestFaces.length} รูป (ต้องการ $MIN_ENROLLMENT_EMBEDDINGS รูป)'),
+                Text(
+                    '⚠️ มีเพียง ${_bestFaces.length} รูป (ต้องการ $MIN_ENROLLMENT_EMBEDDINGS รูป)'),
               ],
             ],
           ),
@@ -1447,7 +1490,8 @@ class _CapturePageState extends State<CapturePage>
                 },
                 child: const Text('บันทึกด้วยใบหน้าที่ดีที่สุด'),
               ),
-            if (_bestFaces.length < MIN_ENROLLMENT_EMBEDDINGS && _bestFaces.isNotEmpty)
+            if (_bestFaces.length < MIN_ENROLLMENT_EMBEDDINGS &&
+                _bestFaces.isNotEmpty)
               TextButton(
                 onPressed: () {
                   Navigator.pop(context);
@@ -1479,7 +1523,8 @@ class _CapturePageState extends State<CapturePage>
               Text('จำนวนครั้งที่ลอง: $_captureAttempts ครั้ง'),
               if (_allCapturedFaces.isNotEmpty) ...[
                 const SizedBox(height: 8),
-                Text('ใบหน้าที่ดีที่สุดจากที่ลอง: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
+                Text(
+                    'ใบหน้าที่ดีที่สุดจากที่ลอง: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
               ],
               const SizedBox(height: 16),
               const Text('คุณต้องการ:'),
@@ -1498,7 +1543,8 @@ class _CapturePageState extends State<CapturePage>
             TextButton(
               onPressed: () {
                 Navigator.pop(context);
-                Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
+                Navigator.pushNamedAndRemoveUntil(
+                    context, '/home', (route) => false);
               },
               child: const Text('กลับหน้าแรก'),
             ),
@@ -1524,7 +1570,8 @@ class _CapturePageState extends State<CapturePage>
     setState(() {
       _isRetryMode = false;
       _statusMessage = '📸 ถ่ายเพิ่มเติม';
-      _instructionMessage = 'ถ่ายอีก ${MIN_ENROLLMENT_EMBEDDINGS - _enrollmentCount} รูป';
+      _instructionMessage =
+          'ถ่ายอีก ${MIN_ENROLLMENT_EMBEDDINGS - _enrollmentCount} รูป';
       _stableFrameCount = 0;
     });
   }
@@ -1542,7 +1589,8 @@ class _CapturePageState extends State<CapturePage>
 
       final faceProfileId = _uuid.v4();
 
-      final facesToUse = _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
+      final facesToUse =
+          _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
       final meanEmbedding = _calculateMeanEmbedding();
 
       double totalQuality = 0;
@@ -1568,7 +1616,8 @@ class _CapturePageState extends State<CapturePage>
           avgSharpness * 0.15);
 
       print('✅ บันทึกด้วยใบหน้าที่ดีที่สุด ${facesToUse.length} รูป');
-      print('📊 คะแนนความมั่นใจ: ${(confidenceScore * 100).toStringAsFixed(1)}%');
+      print(
+          '📊 คะแนนความมั่นใจ: ${(confidenceScore * 100).toStringAsFixed(1)}%');
 
       final faceProfile = {
         'profile_id': faceProfileId,
@@ -1644,7 +1693,8 @@ class _CapturePageState extends State<CapturePage>
       if (mounted) {
         setState(() {
           _statusMessage = '✅ Face ID สำเร็จ!';
-          _instructionMessage = 'ความมั่นใจ ${(confidenceScore * 100).toInt()}%';
+          _instructionMessage =
+              'ความมั่นใจ ${(confidenceScore * 100).toInt()}%';
           _isSaving = false;
           _captureComplete = true;
         });
@@ -1669,9 +1719,17 @@ class _CapturePageState extends State<CapturePage>
   }
 
   void _showCaptureSuccess() {
-    setState(() => _showGuide = true);
+    _showGuide = true;
+    if (mounted && !DISABLE_SETSTATE) {
+      setState(() {});
+    }
     Future.delayed(const Duration(milliseconds: 400), () {
-      if (mounted) setState(() => _showGuide = false);
+      if (mounted) {
+        _showGuide = false;
+        if (!DISABLE_SETSTATE) {
+          setState(() {});
+        }
+      }
     });
   }
 
@@ -1682,12 +1740,12 @@ class _CapturePageState extends State<CapturePage>
   }
 
   void _updateStatus(String status, String instruction, String detail) {
-    if (mounted) {
-      setState(() {
-        _statusMessage = status;
-        _instructionMessage = instruction;
-        _detailMessage = detail;
-      });
+    _statusMessage = status;
+    _instructionMessage = instruction;
+    _detailMessage = detail;
+
+    if (mounted && !DISABLE_SETSTATE) {
+      setState(() {});
     }
   }
 
@@ -1699,15 +1757,27 @@ class _CapturePageState extends State<CapturePage>
     return Colors.red;
   }
 
-  // ================ FIXED BUILD UI ================
+  // ================ ULTIMATE FIXED BUILD UI ================
   @override
   Widget build(BuildContext context) {
+    // iOS: ใช้ cached values
+    final displayFace = _isIos ? _cachedFace : _currentFace;
+    final displayQuality = _isIos ? _cachedQuality : _faceQuality;
+    final displayStability = _isIos ? _cachedStability : _faceStability;
+    final displayLighting = _isIos ? _cachedLighting : _lightingScore;
+    final displaySharpness = _isIos ? _cachedSharpness : _sharpnessScore;
+    final displayPose = _isIos ? _cachedPose : _poseScore;
+    final displaySymmetry = _isIos ? _cachedSymmetry : _faceSymmetry;
+    final displayStatus = _isIos ? _cachedStatus : _statusMessage;
+    final displayInstruction =
+        _isIos ? _cachedInstruction : _instructionMessage;
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
         child: Stack(
           children: [
-            // Camera Preview - Fixed with key and RepaintBoundary
+            // Camera Preview - Fixed with native rendering
             if (_isCameraReady && _cameraController != null)
               Positioned.fill(
                 key: _cameraPreviewKey,
@@ -1727,7 +1797,7 @@ class _CapturePageState extends State<CapturePage>
             else
               _buildLoadingView(),
 
-            // Overlay UI - Fixed background
+            // Static Overlay - ไม่ rebuild
             Positioned.fill(
               child: Container(
                 color: Colors.transparent,
@@ -1735,18 +1805,26 @@ class _CapturePageState extends State<CapturePage>
                   children: [
                     _buildHeader(),
                     const Spacer(),
-                    _buildFaceFrame(),
+                    _buildFaceFrameStatic(
+                        displayFace, displayQuality, displayStatus),
                     const SizedBox(height: 20),
-                    _buildMetricsGrid(),
+                    _buildMetricsGridStatic(
+                      displayQuality,
+                      displayStability,
+                      displayLighting,
+                      displaySharpness,
+                      displayPose,
+                      displaySymmetry,
+                    ),
                     const SizedBox(height: 16),
-                    _buildProgressSection(),
+                    _buildProgressSectionStatic(displayInstruction),
                     const SizedBox(height: 20),
                   ],
                 ),
               ),
             ),
 
-            // Processing Overlays - Fixed opacity
+            // Processing Overlay - Static
             if (_isCapturing || _isSaving)
               Positioned.fill(
                 child: Container(
@@ -1764,14 +1842,18 @@ class _CapturePageState extends State<CapturePage>
                           const CircularProgressIndicator(color: Colors.white),
                           const SizedBox(height: 20),
                           Text(
-                            _isCapturing ? '📸 กำลังถ่ายรูป...' : '💾 กำลังบันทึก...',
-                            style: const TextStyle(color: Colors.white, fontSize: 16),
+                            _isCapturing
+                                ? '📸 กำลังถ่ายรูป...'
+                                : '💾 กำลังบันทึก...',
+                            style: const TextStyle(
+                                color: Colors.white, fontSize: 16),
                           ),
                           if (_bestFaces.isNotEmpty && _isSaving) ...[
                             const SizedBox(height: 8),
                             Text(
                               'ใช้ใบหน้าที่ดีที่สุด ${_bestFaces.length} รูป',
-                              style: const TextStyle(color: Colors.white70, fontSize: 12),
+                              style: const TextStyle(
+                                  color: Colors.white70, fontSize: 12),
                             ),
                           ],
                         ],
@@ -1780,36 +1862,30 @@ class _CapturePageState extends State<CapturePage>
                   ),
                 ),
               ),
-            
+
+            // Success Guide - Static
             if (_showGuide)
               Positioned.fill(
                 child: Container(
                   color: Colors.transparent,
                   child: Center(
-                    child: TweenAnimationBuilder<double>(
-                      tween: Tween(begin: 0.0, end: 1.0),
-                      duration: const Duration(milliseconds: 400),
-                      builder: (context, value, child) {
-                        return Transform.scale(
-                          scale: 1.0 + (0.2 * (1 - value)),
-                          child: Container(
-                            width: 70,
-                            height: 70,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: Colors.green.withOpacity(0.3 * value),
-                              border: Border.all(color: Colors.green, width: 3),
-                            ),
-                            child: const Icon(Icons.check, color: Colors.white, size: 35),
-                          ),
-                        );
-                      },
+                    child: Container(
+                      width: 70,
+                      height: 70,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.green.withOpacity(0.3),
+                        border: Border.all(color: Colors.green, width: 3),
+                      ),
+                      child: const Icon(Icons.check,
+                          color: Colors.white, size: 35),
                     ),
                   ),
                 ),
               ),
-            
-            if (_successController.isAnimating)
+
+            // Success Animation - ใช้เฉพาะ Android
+            if (!_isIos && _successController.isAnimating)
               Positioned.fill(
                 child: Container(
                   color: Colors.transparent,
@@ -1824,7 +1900,8 @@ class _CapturePageState extends State<CapturePage>
                           color: Colors.green.withOpacity(0.3),
                           border: Border.all(color: Colors.green, width: 4),
                         ),
-                        child: const Icon(Icons.check, color: Colors.white, size: 50),
+                        child: const Icon(Icons.check,
+                            color: Colors.white, size: 50),
                       ),
                     ),
                   ),
@@ -1858,7 +1935,8 @@ class _CapturePageState extends State<CapturePage>
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20),
+            icon:
+                const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20),
             onPressed: () {
               _pauseDetection();
               Navigator.pop(context);
@@ -1881,7 +1959,8 @@ class _CapturePageState extends State<CapturePage>
                     ),
                     const SizedBox(width: 8),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 2),
                       decoration: BoxDecoration(
                         color: Colors.white.withOpacity(0.15),
                         borderRadius: BorderRadius.circular(12),
@@ -1891,7 +1970,8 @@ class _CapturePageState extends State<CapturePage>
                         children: [
                           Text(
                             '$_actualOutputDimension DIM',
-                            style: const TextStyle(color: Colors.white70, fontSize: 10),
+                            style: const TextStyle(
+                                color: Colors.white70, fontSize: 10),
                           ),
                           if (_isIos) ...[
                             const SizedBox(width: 4),
@@ -1946,7 +2026,7 @@ class _CapturePageState extends State<CapturePage>
     );
   }
 
-  Widget _buildFaceFrame() {
+  Widget _buildFaceFrameStatic(Face? face, double quality, String status) {
     final size = _isSmallScreen ? 200.0 : 240.0;
 
     return Center(
@@ -1958,32 +2038,33 @@ class _CapturePageState extends State<CapturePage>
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(20),
               border: Border.all(
-                color: _currentFace != null
-                    ? _getQualityColor(_faceQuality).withOpacity(0.8)
+                color: face != null
+                    ? _getQualityColor(quality).withOpacity(0.8)
                     : Colors.white.withOpacity(0.3),
                 width: 2,
               ),
             ),
             child: Stack(
               children: [
-                ..._buildCorners(size, size * 1.2),
-                if (_currentFace != null)
+                ..._buildCornersStatic(size, size * 1.2, face, quality),
+                if (face != null)
                   Positioned(
                     top: -20,
                     left: 0,
                     right: 0,
                     child: Center(
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 4),
                         decoration: BoxDecoration(
                           color: Colors.black.withOpacity(0.6),
                           borderRadius: BorderRadius.circular(20),
-                          border: Border.all(color: _getQualityColor(_faceQuality)),
+                          border: Border.all(color: _getQualityColor(quality)),
                         ),
                         child: Text(
-                          _statusMessage,
+                          status,
                           style: TextStyle(
-                            color: _getQualityColor(_faceQuality),
+                            color: _getQualityColor(quality),
                             fontSize: 12,
                             fontWeight: FontWeight.w500,
                           ),
@@ -2011,9 +2092,10 @@ class _CapturePageState extends State<CapturePage>
     );
   }
 
-  List<Widget> _buildCorners(double width, double height) {
-    final color = _currentFace != null
-        ? _getQualityColor(_faceQuality)
+  List<Widget> _buildCornersStatic(
+      double width, double height, Face? face, double quality) {
+    final color = face != null
+        ? _getQualityColor(quality)
         : Colors.white.withOpacity(0.3);
 
     return [
@@ -2076,7 +2158,14 @@ class _CapturePageState extends State<CapturePage>
     ];
   }
 
-  Widget _buildMetricsGrid() {
+  Widget _buildMetricsGridStatic(
+    double quality,
+    double stability,
+    double lighting,
+    double sharpness,
+    double pose,
+    double symmetry,
+  ) {
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 20),
       padding: const EdgeInsets.all(16),
@@ -2089,17 +2178,17 @@ class _CapturePageState extends State<CapturePage>
         children: [
           Row(
             children: [
-              Expanded(child: _buildMetricItem('คุณภาพ', _faceQuality)),
-              Expanded(child: _buildMetricItem('เสถียร', _faceStability)),
-              Expanded(child: _buildMetricItem('แสง', _lightingScore)),
+              Expanded(child: _buildMetricItemStatic('คุณภาพ', quality)),
+              Expanded(child: _buildMetricItemStatic('เสถียร', stability)),
+              Expanded(child: _buildMetricItemStatic('แสง', lighting)),
             ],
           ),
           const SizedBox(height: 12),
           Row(
             children: [
-              Expanded(child: _buildMetricItem('คมชัด', _sharpnessScore)),
-              Expanded(child: _buildMetricItem('มุม', _poseScore)),
-              Expanded(child: _buildMetricItem('สมมาตร', _faceSymmetry)),
+              Expanded(child: _buildMetricItemStatic('คมชัด', sharpness)),
+              Expanded(child: _buildMetricItemStatic('มุม', pose)),
+              Expanded(child: _buildMetricItemStatic('สมมาตร', symmetry)),
             ],
           ),
         ],
@@ -2107,7 +2196,7 @@ class _CapturePageState extends State<CapturePage>
     );
   }
 
-  Widget _buildMetricItem(String label, double value) {
+  Widget _buildMetricItemStatic(String label, double value) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2142,7 +2231,7 @@ class _CapturePageState extends State<CapturePage>
     );
   }
 
-  Widget _buildProgressSection() {
+  Widget _buildProgressSectionStatic(String instruction) {
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 20),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -2170,14 +2259,16 @@ class _CapturePageState extends State<CapturePage>
                     const SizedBox(width: 8),
                     if (_bestFaces.isNotEmpty)
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
                         decoration: BoxDecoration(
                           color: Colors.amber.withOpacity(0.15),
                           borderRadius: BorderRadius.circular(10),
                         ),
                         child: Text(
                           'ดีสุด ${(_absoluteBestQuality * 100).toInt()}%',
-                          style: const TextStyle(color: Colors.amber, fontSize: 10),
+                          style: const TextStyle(
+                              color: Colors.amber, fontSize: 10),
                         ),
                       ),
                   ],
