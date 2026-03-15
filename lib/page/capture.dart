@@ -68,18 +68,19 @@ class _CapturePageState extends State<CapturePage>
   static const double MIN_ACCEPTABLE_QUALITY = 0.55;
 
   // ================ iOS OPTIMIZATIONS ================
-  static const int IOS_DETECTION_INTERVAL_MS = 1000; // 1 วินาทีสำหรับ iOS
+  static const int IOS_DETECTION_INTERVAL_MS =
+      1500; // เพิ่มเป็น 1.5 วินาทีสำหรับ iOS
   static const int ANDROID_DETECTION_INTERVAL_MS =
-      500; // 0.5 วินาทีสำหรับ Android
+      600; // 0.6 วินาทีสำหรับ Android
   static const ResolutionPreset IOS_RESOLUTION =
-      ResolutionPreset.low; // ความละเอียดต่ำสำหรับ iOS
-  static const ResolutionPreset ANDROID_RESOLUTION =
-      ResolutionPreset.medium; // ความละเอียดกลางสำหรับ Android
-  static const int IOS_THREADS = 2; // ลด threads สำหรับ iOS
-  static const int ANDROID_THREADS = 4; // เพิ่ม threads สำหรับ Android
-  static const bool IOS_USE_FAST_MODE = true; // ใช้ fast mode บน iOS
-  static const int MAX_IOS_CONSECUTIVE_ERRORS =
-      3; // จำนวน error ติดต่อกันที่อนุญาตบน iOS
+      ResolutionPreset.low; // ใช้ low สำหรับ iOS
+  static const ResolutionPreset ANDROID_RESOLUTION = ResolutionPreset.medium;
+  static const int IOS_THREADS = 1; // ลดเหลือ 1 thread สำหรับ iOS
+  static const int ANDROID_THREADS = 4;
+  static const bool IOS_USE_FAST_MODE = true;
+  static const int MAX_IOS_CONSECUTIVE_ERRORS = 5;
+  static const int IOS_CAPTURE_COOLDOWN_MS =
+      2000; // cooldown 2 วินาทีระหว่าง capture
 
   // ================ UI CONSTANTS ================
   static const double FACE_FRAME_RATIO = 0.65;
@@ -93,6 +94,14 @@ class _CapturePageState extends State<CapturePage>
   FaceDetector? _faceDetector;
   Face? _currentFace;
   List<Face> _faceHistory = [];
+
+  // ================ iOS State Management ================
+  bool _isIos = false;
+  bool _isProcessing = false;
+  DateTime? _lastCaptureTime;
+  int _iosConsecutiveErrors = 0;
+  Timer? _iosRetryTimer;
+  bool _isPaused = false; // สำหรับ pause detection ชั่วคราว
 
   // ================ MobileFaceNet Model ================
   Interpreter? _faceModel;
@@ -114,18 +123,11 @@ class _CapturePageState extends State<CapturePage>
 
   // ================ INTELLIGENT TRACKING ================
   List<double> _qualityHistory = [];
-  Map<String, String> _improvementTips = {}; // เปลี่ยนเป็น Map<String, String>
+  Map<String, String> _improvementTips = {};
   String _currentGuidance = '';
   double _adaptiveThreshold = 0.65;
   int _consecutiveLowQuality = 0;
   bool _isStruggling = false;
-
-  // ================ iOS OPTIMIZATION VARIABLES ================
-  bool _isIos = false; // ตรวจสอบว่าเป็น iOS หรือไม่
-  bool _isProcessing = false; // ป้องกันการทำงานซ้ำ
-  int _iosConsecutiveErrors = 0; // นับ error ติดต่อกันบน iOS
-  DateTime? _lastIosDetectionTime; // เวลาที่ตรวจสอบล่าสุดบน iOS
-  Timer? _iosRetryTimer; // Timer สำหรับ retry บน iOS
 
   // ================ BEST FACE STORAGE ================
   List<Map<String, dynamic>> _allCapturedFaces = [];
@@ -207,10 +209,33 @@ class _CapturePageState extends State<CapturePage>
   }
 
   @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // จัดการ lifecycle เพื่อป้องกันปัญหา
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      _pauseDetection();
+    } else if (state == AppLifecycleState.resumed) {
+      _resumeDetection();
+    }
+  }
+
+  void _pauseDetection() {
+    _isPaused = true;
     _detectionTimer?.cancel();
     _iosRetryTimer?.cancel();
+  }
+
+  void _resumeDetection() {
+    _isPaused = false;
+    if (_modelLoaded && _isCameraReady && mounted) {
+      _startPlatformOptimizedDetection();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _pauseDetection();
     _cameraController?.dispose();
     _faceDetector?.close();
     _faceModel?.close();
@@ -261,8 +286,8 @@ class _CapturePageState extends State<CapturePage>
         orElse: () => cameras.first,
       );
 
-      // เลือกความละเอียดตามแพลตฟอร์ม
-      final resolution = _isIos ? IOS_RESOLUTION : ANDROID_RESOLUTION;
+      // เลือกความละเอียดตามแพลตฟอร์ม - ใช้ low สำหรับ iOS เสมอ
+      final resolution = _isIos ? ResolutionPreset.low : ANDROID_RESOLUTION;
 
       _cameraController = CameraController(
         frontCamera,
@@ -276,22 +301,26 @@ class _CapturePageState extends State<CapturePage>
       // iOS: ปรับแต่งกล้องเพิ่มเติม
       if (_isIos) {
         try {
-          // ลองตั้งค่า exposure และ focus
+          // ตั้งค่า exposure mode และ focus mode
           await _cameraController!.setExposureMode(ExposureMode.auto);
           await _cameraController!.setFocusMode(FocusMode.auto);
+
+          // ไม่มี setFpsRange ใน CameraController โดยตรง
+          // ให้ใช้การตั้งค่าอื่นแทน
+          print('✅ iOS camera configured with low resolution mode');
         } catch (e) {
           print('⚠️ iOS camera settings error: $e');
         }
       }
 
-      // คำนวณขนาดกล้อง预览
+      // คำนวณขนาดกล้อง preview
       final size = MediaQuery.of(context).size;
       final cameraRatio = _cameraController!.value.aspectRatio;
       _cameraPreviewSize = Size(size.width, size.width / cameraRatio);
 
       print('✅ กล้องพร้อม');
+      print('📱 Resolution: $resolution');
       print('📱 Camera ratio: $cameraRatio');
-      print('📱 Preview size: $_cameraPreviewSize');
     } catch (e) {
       print('❌ Camera error: $e');
       rethrow;
@@ -339,7 +368,7 @@ class _CapturePageState extends State<CapturePage>
         throw Exception('ไม่พบไฟล์โมเดล');
       }
 
-      // กำหนด threads ตามแพลตฟอร์ม
+      // กำหนด threads ตามแพลตฟอร์ม - iOS ใช้ 1 thread
       final threads = _isIos ? IOS_THREADS : ANDROID_THREADS;
 
       final interpreterOptions = InterpreterOptions()
@@ -415,7 +444,7 @@ class _CapturePageState extends State<CapturePage>
   void _startPlatformOptimizedDetection() {
     _detectionTimer?.cancel();
 
-    // เลือก interval ตามแพลตฟอร์ม
+    // เลือก interval ตามแพลตฟอร์ม - iOS ใช้ interval นานขึ้น
     final interval = _isIos
         ? Duration(milliseconds: IOS_DETECTION_INTERVAL_MS)
         : Duration(milliseconds: ANDROID_DETECTION_INTERVAL_MS);
@@ -424,7 +453,8 @@ class _CapturePageState extends State<CapturePage>
 
     _detectionTimer = Timer.periodic(interval, (timer) async {
       // ตรวจสอบสถานะต่างๆ
-      if (!_isCameraReady ||
+      if (_isPaused ||
+          !_isCameraReady ||
           _isCapturing ||
           _isSaving ||
           _captureComplete ||
@@ -437,18 +467,18 @@ class _CapturePageState extends State<CapturePage>
         return;
       }
 
-      // iOS: ตรวจสอบการทำงานซ้ำ
+      // iOS: ตรวจสอบการทำงานซ้ำและ cooldown
       if (_isIos) {
         if (_isProcessing) {
           print('⚠️ iOS: Already processing, skipping...');
           return;
         }
 
-        // ตรวจสอบเวลาที่ผ่านไป
-        if (_lastIosDetectionTime != null) {
-          final elapsed = DateTime.now().difference(_lastIosDetectionTime!);
-          if (elapsed.inMilliseconds < IOS_DETECTION_INTERVAL_MS - 100) {
-            return; // ยังไม่ถึงเวลาที่กำหนด
+        // ตรวจสอบ cooldown หลังการ capture
+        if (_lastCaptureTime != null) {
+          final elapsed = DateTime.now().difference(_lastCaptureTime!);
+          if (elapsed.inMilliseconds < IOS_CAPTURE_COOLDOWN_MS) {
+            return; // ยังอยู่ในช่วง cooldown
           }
         }
       }
@@ -461,7 +491,6 @@ class _CapturePageState extends State<CapturePage>
     if (_isIos) {
       if (_isProcessing) return;
       _isProcessing = true;
-      _lastIosDetectionTime = DateTime.now();
     }
 
     try {
@@ -478,9 +507,11 @@ class _CapturePageState extends State<CapturePage>
             _updateStatus('⚠️ ระบบกล้องมีปัญหา', 'กรุณาเปิดแอปใหม่', '');
             _iosConsecutiveErrors = 0;
           }
+          _isTakingPicture = false;
+          _isProcessing = false;
           return;
         }
-        _iosConsecutiveErrors = 0; // reset error count
+        _iosConsecutiveErrors = 0;
       } else {
         imageFile = await _cameraController!.takePicture();
       }
@@ -494,7 +525,7 @@ class _CapturePageState extends State<CapturePage>
         print('Face detection error: $e');
       }
 
-      // ลบไฟล์รูปทันทีเพื่อประหยัดพื้นที่
+      // ลบไฟล์รูปทันที
       try {
         final file = File(imageFile.path);
         if (await file.exists()) {
@@ -555,11 +586,13 @@ class _CapturePageState extends State<CapturePage>
           if (_stableFrameCount >= REQUIRED_STABLE_FRAMES &&
               !_isCapturing &&
               _enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-            // iOS: หน่วงเวลาเล็กน้อยก่อน capture
+            // iOS: ตรวจสอบ cooldown ก่อน capture
             if (_isIos) {
-              Future.delayed(const Duration(milliseconds: 300), () {
+              if (_lastCaptureTime == null ||
+                  DateTime.now().difference(_lastCaptureTime!).inMilliseconds >=
+                      IOS_CAPTURE_COOLDOWN_MS) {
                 _capturePlatformOptimizedFaceID();
-              });
+              }
             } else {
               _capturePlatformOptimizedFaceID();
             }
@@ -602,14 +635,14 @@ class _CapturePageState extends State<CapturePage>
   // ================ iOS OPTIMIZED CAPTURE ================
   Future<XFile?> _captureIosOptimized() async {
     try {
-      // iOS: ลองถ่ายรูปด้วยวิธีต่างๆ
+      // iOS: ลองถ่ายรูปด้วยวิธีที่ปลอดภัย
       try {
         return await _cameraController!.takePicture();
       } catch (e) {
         print('⚠️ iOS takePicture error: $e');
 
         // รอสักครู่แล้วลองใหม่
-        await Future.delayed(const Duration(milliseconds: 200));
+        await Future.delayed(const Duration(milliseconds: 500));
 
         try {
           return await _cameraController!.takePicture();
@@ -627,6 +660,11 @@ class _CapturePageState extends State<CapturePage>
   // ================ PLATFORM OPTIMIZED CAPTURE ================
   Future<void> _capturePlatformOptimizedFaceID() async {
     if (_isCapturing || _captureComplete) return;
+
+    // iOS: บันทึกเวลา capture
+    if (_isIos) {
+      _lastCaptureTime = DateTime.now();
+    }
 
     setState(() {
       _isCapturing = true;
@@ -768,6 +806,7 @@ class _CapturePageState extends State<CapturePage>
         }
       }
 
+      // ลบไฟล์รูป
       try {
         final file = File(imageFile.path);
         if (await file.exists()) {
@@ -938,50 +977,6 @@ class _CapturePageState extends State<CapturePage>
         '',
       );
     }
-  }
-
-  // ================ FACE QUALITY ================
-  double _calculateFaceQuality(Face face) {
-    double score = 0.0;
-
-    final bbox = face.boundingBox;
-    final area = bbox.width * bbox.height;
-    final screenArea = _screenWidth * _screenHeight;
-    final areaRatio = area / screenArea;
-
-    if (areaRatio >= IDEAL_MIN_FACE_AREA && areaRatio <= IDEAL_MAX_FACE_AREA) {
-      score += 0.3;
-    } else if (areaRatio >= MIN_FACE_AREA_RATIO &&
-        areaRatio <= MAX_FACE_AREA_RATIO) {
-      score += 0.2;
-    }
-
-    final centerScore = _calculateCenterScore(bbox);
-    score += centerScore * 0.25;
-
-    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
-    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
-    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
-
-    if (yaw <= MAX_HEAD_YAW &&
-        pitch <= MAX_HEAD_PITCH &&
-        roll <= MAX_HEAD_ROLL) {
-      score += 0.25;
-    } else {
-      score += 0.15;
-    }
-
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-    final eyeScore = (leftEye + rightEye) / 2;
-
-    if (eyeScore >= MIN_EYE_OPENNESS) {
-      score += 0.2;
-    } else {
-      score += eyeScore * 0.2;
-    }
-
-    return score.clamp(0.0, 1.0);
   }
 
   double _calculateCenterScore(Rect bbox) {
@@ -1629,7 +1624,7 @@ class _CapturePageState extends State<CapturePage>
         });
       }
 
-      // อัปเดต user document - บันทึกเฉพาะ active = true
+      // อัปเดต user document
       await _firestore.collection('users').doc(user.uid).set({
         'active': true,
       }, SetOptions(merge: true));
@@ -1701,29 +1696,23 @@ class _CapturePageState extends State<CapturePage>
       body: SafeArea(
         child: Stack(
           children: [
-            // Camera Preview
+            // Camera Preview - ใช้ ClipRect เพื่อป้องกันการกระพริบ
             if (_isCameraReady && _cameraController != null)
               Positioned.fill(
-                child: CameraPreview(_cameraController!),
+                child: ClipRect(
+                  child: Transform.scale(
+                    scale: 1.0,
+                    child: CameraPreview(_cameraController!),
+                  ),
+                ),
               )
             else
               _buildLoadingView(),
 
-            // Overlay UI
+            // Overlay UI - ใช้ Container ทึบแสงบางส่วนเพื่อป้องกันการกระพริบ
             Positioned.fill(
               child: Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      Colors.black.withOpacity(0.5),
-                      Colors.transparent,
-                      Colors.transparent,
-                      Colors.black.withOpacity(0.7),
-                    ],
-                  ),
-                ),
+                color: Colors.transparent,
                 child: Column(
                   children: [
                     _buildHeader(),
@@ -1774,8 +1763,7 @@ class _CapturePageState extends State<CapturePage>
             icon:
                 const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20),
             onPressed: () {
-              _detectionTimer?.cancel();
-              _iosRetryTimer?.cancel();
+              _pauseDetection();
               Navigator.pop(context);
             },
           ),
@@ -1815,7 +1803,7 @@ class _CapturePageState extends State<CapturePage>
                             Container(
                               width: 6,
                               height: 6,
-                              decoration: BoxDecoration(
+                              decoration: const BoxDecoration(
                                 shape: BoxShape.circle,
                                 color: Colors.blue,
                               ),
@@ -1869,7 +1857,7 @@ class _CapturePageState extends State<CapturePage>
     return Center(
       child: Column(
         children: [
-          // กรอบใบหน้า
+          // กรอบใบหน้า - ใช้ Container ทึบแสงเพื่อป้องกันการกระพริบ
           ScaleTransition(
             scale: _pulseAnimation,
             child: Container(
@@ -2016,19 +2004,17 @@ class _CapturePageState extends State<CapturePage>
         children: [
           Row(
             children: [
-              Expanded(child: _buildMetricItem('คุณภาพ', _faceQuality, '75%')),
-              Expanded(
-                  child: _buildMetricItem('เสถียร', _faceStability, '73%')),
-              Expanded(child: _buildMetricItem('แสง', _lightingScore, '100%')),
+              Expanded(child: _buildMetricItem('คุณภาพ', _faceQuality)),
+              Expanded(child: _buildMetricItem('เสถียร', _faceStability)),
+              Expanded(child: _buildMetricItem('แสง', _lightingScore)),
             ],
           ),
           const SizedBox(height: 12),
           Row(
             children: [
-              Expanded(
-                  child: _buildMetricItem('คมชัด', _sharpnessScore, '50%')),
-              Expanded(child: _buildMetricItem('มุม', _poseScore, '99%')),
-              Expanded(child: _buildMetricItem('สมมาตร', _faceSymmetry, '98%')),
+              Expanded(child: _buildMetricItem('คมชัด', _sharpnessScore)),
+              Expanded(child: _buildMetricItem('มุม', _poseScore)),
+              Expanded(child: _buildMetricItem('สมมาตร', _faceSymmetry)),
             ],
           ),
         ],
@@ -2036,7 +2022,7 @@ class _CapturePageState extends State<CapturePage>
     );
   }
 
-  Widget _buildMetricItem(String label, double value, String target) {
+  Widget _buildMetricItem(String label, double value) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2154,25 +2140,32 @@ class _CapturePageState extends State<CapturePage>
 
   Widget _buildProcessingOverlay() {
     return Container(
-      color: Colors.black.withOpacity(0.8),
+      color: Colors.black.withOpacity(0.7), // ลดความทึบลงเพื่อให้เห็นพื้นหลัง
       child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const CircularProgressIndicator(color: Colors.white),
-            const SizedBox(height: 20),
-            Text(
-              _isCapturing ? '📸 กำลังถ่ายรูป...' : '💾 กำลังบันทึก...',
-              style: const TextStyle(color: Colors.white, fontSize: 16),
-            ),
-            if (_bestFaces.isNotEmpty && _isSaving) ...[
-              const SizedBox(height: 8),
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.8),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const CircularProgressIndicator(color: Colors.white),
+              const SizedBox(height: 20),
               Text(
-                'ใช้ใบหน้าที่ดีที่สุด ${_bestFaces.length} รูป',
-                style: const TextStyle(color: Colors.white70, fontSize: 12),
+                _isCapturing ? '📸 กำลังถ่ายรูป...' : '💾 กำลังบันทึก...',
+                style: const TextStyle(color: Colors.white, fontSize: 16),
               ),
+              if (_bestFaces.isNotEmpty && _isSaving) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'ใช้ใบหน้าที่ดีที่สุด ${_bestFaces.length} รูป',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
