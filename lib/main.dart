@@ -2,7 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-
+import 'package:ready/page/missed_personal.dart';
 import 'package:workmanager/workmanager.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -63,73 +63,29 @@ final Map<String, bool> _isMissedCheckedTodayByUser = {};
 // ✅ Cache สำหรับข้อมูลผู้ใช้ (จาก users collection)
 final Map<String, Map<String, dynamic>> _userDataCache = {};
 
-// 🔥 IMPORTANT: REMOVED Timer for missed count - iOS doesn't support background timers
-// Use WorkManager + push notifications instead
-// Timer? _missedCheckTimer; // REMOVED - Won't work on iOS in background
+// Timer สำหรับตรวจสอบ missed count (ตอนแอปทำงาน)
+Timer? _missedCheckTimer;
 
 // สถานะการทำงาน
 bool _isMissedSystemRunning = false;
 DateTime? _lastFullCheckTime;
 
-// ✅ FIX: Global reference for navigation key to handle notification taps
-final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
-
 // ==================== FIREBASE MESSAGING BACKGROUND HANDLER ====================
 
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  // ✅ FIX: Initialize Firebase properly in background isolate
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  print("📨 [Background] Message: ${message.messageId}");
+  print("📨 [Background] Title: ${message.notification?.title}");
+  print("📨 [Background] Body: ${message.notification?.body}");
 
-  print("📨 [Background] Message received at: ${DateTime.now()}");
-  print("📨 [Background] Message ID: ${message.messageId}");
-  print("📨 [Background] From: ${message.from}");
-  print("📨 [Background] Data: ${message.data}");
-
-  // ✅ FIX: Handle both notification and data-only messages
-  if (message.notification != null) {
-    print("📨 [Background] Title: ${message.notification?.title}");
-    print("📨 [Background] Body: ${message.notification?.body}");
-
-    // Show notification when app is in background/terminated
-    await _showLocalNotification(
-      id: DateTime.now().millisecond,
-      title: message.notification?.title ?? 'การแจ้งเตือน',
-      body: message.notification?.body ?? '',
-      payload: message.data['type'] ?? message.data.toString(),
-    );
-  } else {
-    // Handle silent/data-only push
-    print("📨 [Background] Silent push received");
-    await _handleSilentPush(message.data);
-  }
-}
-
-// ✅ FIX: New function to handle silent pushes
-Future<void> _handleSilentPush(Map<String, dynamic> data) async {
-  print("🔇 Processing silent push: $data");
-
-  final pushType = data['type'];
-
-  switch (pushType) {
-    case 'missed_check':
-      print("🔍 Running missed count check from silent push");
-      await _checkAllUsersMissedCount(isBackground: true);
-      break;
-
-    case 'daily_summary':
-      print("📊 Running daily summary from silent push");
-      await _sendDailyMissedSummary();
-      break;
-
-    case 'checkin_update':
-      print("⏰ Updating check-in notifications from silent push");
-      await _checkAndScheduleNotifications();
-      break;
-
-    default:
-      print("⚠️ Unknown silent push type: $pushType");
-  }
+  // แสดง notification เมื่อได้รับ message ตอนแอปปิด
+  await _showLocalNotification(
+    id: DateTime.now().millisecond,
+    title: message.notification?.title ?? 'การแจ้งเตือน',
+    body: message.notification?.body ?? '',
+    payload: message.data.toString(),
+  );
 }
 
 // ==================== WORKMANAGER CALLBACK ====================
@@ -220,11 +176,8 @@ Future<void> main() async {
     await _loadInitialData();
     print('✅ Initial data loaded');
 
-    // 🔥 IMPORTANT: Don't start timer on iOS - use WorkManager + push notifications instead
-    // _initializeMissedCountSystem(); // REMOVED - Won't work on iOS in background
-
-    // ✅ FIX: Start missed count system using periodic check
-    _startMissedCountSystem();
+    // เริ่มระบบ Missed Count
+    _initializeMissedCountSystem();
     print('✅ Missed Count System initialized');
 
     // ตรวจสอบและตั้งเวลาการแจ้งเตือนครั้งแรก
@@ -253,7 +206,7 @@ Future<void> main() async {
 /// ตั้งค่า Notification ทั้งหมด
 Future<void> _setupNotifications() async {
   try {
-    // ✅ FIX: Enhanced iOS permission request
+    // ขอสิทธิ์การแจ้งเตือน (สำหรับ iOS)
     final messaging = FirebaseMessaging.instance;
     NotificationSettings settings = await messaging.requestPermission(
       alert: true,
@@ -265,25 +218,11 @@ Future<void> _setupNotifications() async {
       criticalAlert: true,
     );
 
-    print('📱 iOS Notification permission: ${settings.authorizationStatus}');
+    print('📱 Notification permission: ${settings.authorizationStatus}');
 
     if (settings.authorizationStatus != AuthorizationStatus.authorized) {
       print('⚠️ Notification permission not granted');
-    } else {
-      print('✅ Notification permission granted');
-
-      // ✅ FIX: Register for APNs token on iOS
-      String? apnsToken = await messaging.getAPNSToken();
-      print('📱 APNs Token: $apnsToken');
     }
-
-    // ✅ FIX: Configure iOS notification presentation options
-    await FirebaseMessaging.instance
-        .setForegroundNotificationPresentationOptions(
-      alert: true,
-      badge: true,
-      sound: true,
-    );
 
     // ตั้งค่า Local Notifications
     const AndroidInitializationSettings androidSettings =
@@ -295,9 +234,6 @@ Future<void> _setupNotifications() async {
       requestBadgePermission: true,
       requestSoundPermission: true,
       onDidReceiveLocalNotification: _onDidReceiveLocalNotification,
-      defaultPresentAlert: true,
-      defaultPresentBadge: true,
-      defaultPresentSound: true,
     );
 
     const InitializationSettings initSettings = InitializationSettings(
@@ -340,54 +276,30 @@ Future<void> _setupNotifications() async {
 void _onDidReceiveLocalNotification(
     int id, String? title, String? body, String? payload) async {
   print('📱 iOS Local Notification: $id - $title');
-
-  // ✅ FIX: Show in-app dialog for iOS when app is in foreground
-  // You can add a dialog here if needed
 }
 
 /// จัดการเมื่อผู้ใช้แตะ notification
 void _handleNotificationTap(String? payload) {
   print('📲 Notification payload: $payload');
-
-  // ✅ FIX: Navigate based on payload
-  if (payload != null && navigatorKey.currentContext != null) {
-    if (payload.contains('missed')) {
-      // Navigate to missed page
-      navigatorKey.currentState?.pushNamed('/missed_personal');
-    } else if (payload.contains('checkin')) {
-      // Navigate to checkin page
-      navigatorKey.currentState?.pushNamed('/home_personal');
-    }
-  }
 }
 
 /// ✅ ตั้งค่า Firebase Messaging (ลบการบันทึก FCM tokens)
 Future<void> _setupFirebaseMessaging() async {
   try {
-    // ✅ FIX: Set background message handler BEFORE anything else
+    // Set background message handler
     FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
-    // ✅ FIX: Handle foreground messages with proper presentation
+    // Handle foreground messages
     FirebaseMessaging.onMessage.listen((RemoteMessage message) {
-      print('📨 [Foreground] Message received at: ${DateTime.now()}');
-      print('📨 [Foreground] Message ID: ${message.messageId}');
+      print('📨 [Foreground] Message: ${message.messageId}');
       print('📨 [Foreground] Title: ${message.notification?.title}');
-      print('📨 [Foreground] Data: ${message.data}');
 
-      // ✅ FIX: Show local notification when app is in foreground
       _showLocalNotification(
         id: DateTime.now().millisecond,
         title: message.notification?.title ?? 'การแจ้งเตือน',
         body: message.notification?.body ?? '',
-        payload: message.data['type'] ?? message.data.toString(),
+        payload: message.data.toString(),
       );
-    });
-
-    // ✅ FIX: Handle when app is opened from background/terminated state
-    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
-      print('📨 [Opened] App opened from notification');
-      print('📨 [Opened] Data: ${message.data}');
-      _handleNotificationTap(message.data['type'] ?? message.data.toString());
     });
 
     // Handle when app is opened from terminated state
@@ -395,21 +307,8 @@ Future<void> _setupFirebaseMessaging() async {
         await FirebaseMessaging.instance.getInitialMessage();
     if (initialMessage != null) {
       print('📨 [Terminated] App opened from terminated state');
-      print('📨 [Terminated] Data: ${initialMessage.data}');
-      _handleNotificationTap(
-          initialMessage.data['type'] ?? initialMessage.data.toString());
+      _handleNotificationTap(initialMessage.data.toString());
     }
-
-    // ✅ FIX: Get FCM token for debugging
-    String? token = await FirebaseMessaging.instance.getToken();
-    print('📱 FCM Token: $token');
-
-    // ✅ FIX: Subscribe to topics for different notification types
-    await FirebaseMessaging.instance.subscribeToTopic('missed_count_updates');
-    await FirebaseMessaging.instance.subscribeToTopic('checkin_updates');
-    await FirebaseMessaging.instance.subscribeToTopic('daily_summary');
-
-    print('✅ Subscribed to notification topics');
   } catch (e, stackTrace) {
     print('❌ Error setting up Firebase Messaging: $e');
     await _logSystemError(
@@ -417,7 +316,7 @@ Future<void> _setupFirebaseMessaging() async {
   }
 }
 
-/// ตั้งค่า WorkManager (ตรวจสอบทุก 15 นาทีสำหรับ iOS)
+/// ตั้งค่า WorkManager (ตรวจสอบทุก 5 นาที)
 Future<void> _setupWorkManager() async {
   try {
     await Workmanager().initialize(
@@ -428,14 +327,12 @@ Future<void> _setupWorkManager() async {
     // ยกเลิกงานเก่าทั้งหมด
     await Workmanager().cancelAll();
 
-    // ✅ FIX: Adjust frequencies for iOS constraints
-    // iOS only allows periodic tasks with minimum 15 minutes interval
+    // ตั้งค่างานแจ้งเตือนเวลาเช็คชื่อ (ทุกวัน)
     await Workmanager().registerPeriodicTask(
-      'missed_check_task',
-      'missed_check_task',
-      frequency: const Duration(
-          minutes: 15), // ✅ FIX: Changed from 5 to 15 minutes for iOS
-      initialDelay: const Duration(seconds: 30),
+      'checkin_notification_task',
+      'checkin_notification_task',
+      frequency: const Duration(hours: 24),
+      initialDelay: const Duration(seconds: 10),
       constraints: Constraints(
         networkType: NetworkType.connected,
         requiresBatteryNotLow: false,
@@ -443,7 +340,19 @@ Future<void> _setupWorkManager() async {
         requiresDeviceIdle: false,
         requiresStorageNotLow: true,
       ),
-      // ✅ FIX: Remove existingWorkPolicy - not available in registerPeriodicTask
+    );
+
+    // ตั้งค่างานตรวจสอบ missed count (ทุก 5 นาที)
+    await Workmanager().registerPeriodicTask(
+      'missed_check_task',
+      'missed_check_task',
+      frequency: const Duration(minutes: 5),
+      initialDelay: const Duration(seconds: 30),
+      constraints: Constraints(
+        networkType: NetworkType.connected,
+        requiresBatteryNotLow: false,
+        requiresCharging: false,
+      ),
     );
 
     // ตั้งค่างานสรุป missed count รายวัน (ทุกวันเวลา 20:00 น.)
@@ -460,19 +369,18 @@ Future<void> _setupWorkManager() async {
       initialDelay = tomorrow20.difference(now);
     }
 
-    await Workmanager().registerOneOffTask(
+    await Workmanager().registerPeriodicTask(
       'daily_missed_summary',
       'daily_missed_summary',
+      frequency: const Duration(hours: 24),
       initialDelay: initialDelay,
       constraints: Constraints(
         networkType: NetworkType.connected,
       ),
-      // ✅ FIX: Remove existingWorkPolicy - not available in registerOneOffTask
     );
 
-    print('✅ WorkManager initialized');
-    print('   ✅ Missed check task: ทุก 15 นาที (iOS compatible)');
-    print('   ✅ Daily summary: scheduled for 20:00');
+    print('✅ WorkManager initialized with all tasks');
+    print('   ✅ Missed check task: ทุก 5 นาที');
   } catch (e, stackTrace) {
     print('❌ Error setting up WorkManager: $e');
     await _logSystemError(
@@ -778,32 +686,29 @@ Future<void> _loadSpecialClasses() async {
 
 // ==================== MISSED COUNT SYSTEM ====================
 
-/// ✅ FIX: เริ่มระบบ Missed Count โดยใช้ WorkManager และ Silent Push แทน Timer
-void _startMissedCountSystem() {
+/// เริ่มระบบ Missed Count (ตรวจสอบทุก 5 นาที)
+void _initializeMissedCountSystem() {
   print('\n🚀 ===== เริ่มระบบ Missed Count =====');
 
   _isMissedSystemRunning = true;
   _lastFullCheckTime = DateTime.now();
 
-  // ✅ FIX: No Timer here - iOS doesn't support background timers
-  // We rely on WorkManager (every 15 minutes) and silent pushes from server
+  _missedCheckTimer = Timer.periodic(const Duration(minutes: 5), (timer) {
+    print('\n⏰ [Timer] Running missed count check (ทุก 5 นาที)...');
+    _checkAllUsersMissedCount(isBackground: false);
+  });
 
-  // Initial check after 5 seconds
   Future.delayed(const Duration(seconds: 5), () {
     print('\n🔍 [Initial] First missed count check...');
     _checkAllUsersMissedCount(isBackground: false);
   });
 
-  print('✅ ระบบ Missed Count พร้อมทำงาน (ใช้ WorkManager + Silent Push)');
-  print('   - WorkManager: ตรวจสอบทุก 15 นาที');
-  print('   - Silent Push: ตรวจสอบเมื่อได้รับ push จาก server');
+  print('✅ ระบบ Missed Count พร้อมทำงาน (ตรวจสอบทุก 5 นาที)');
   print('🔚 ===== จบการเริ่มระบบ =====\n');
 }
 
 /// ตรวจสอบ Missed Count สำหรับผู้ใช้ที่ active = true ทุกคน
 Future<void> _checkAllUsersMissedCount({bool isBackground = false}) async {
-  // ✅ FIX: Remove the isRunning check that prevented re-entrancy
-  // Use a different approach to prevent concurrent runs
   if (_isMissedSystemRunning && !isBackground) {
     print('⚠️ ระบบกำลังทำงานอยู่ ข้ามการทำงานนี้');
     return;
@@ -813,7 +718,7 @@ Future<void> _checkAllUsersMissedCount({bool isBackground = false}) async {
 
   try {
     final mode = isBackground ? 'Background' : 'Foreground';
-    print('\n🔍 ===== [$mode] เริ่มตรวจสอบ Missed Count =====');
+    print('\n🔍 ===== [$mode] เริ่มตรวจสอบ Missed Count (ทุก 5 นาที) =====');
     print('📅 วันที่: ${DateFormat('yyyy-MM-dd').format(DateTime.now())}');
     print('⏰ เวลา: ${DateFormat('HH:mm:ss').format(DateTime.now())}');
 
@@ -886,6 +791,7 @@ Future<void> _checkAllUsersMissedCount({bool isBackground = false}) async {
   }
 }
 
+/// โหลดข้อมูลผู้ใช้จาก users collection
 /// โหลดข้อมูลผู้ใช้จาก users collection
 Future<Map<String, dynamic>> _loadUserData(String userId) async {
   try {
@@ -1232,6 +1138,7 @@ Future<TimeOfDay?> _getTodayEndTime() async {
 }
 
 /// เพิ่ม missed count ให้ผู้ใช้
+/// เพิ่ม missed count ให้ผู้ใช้
 Future<void> _incrementMissedCount(String userId, DateTime date,
     Map<String, dynamic> userData, Map<String, dynamic> userInfo) async {
   try {
@@ -1314,6 +1221,7 @@ Future<void> _sendMissedSummaryNotification(int totalMissed) async {
 }
 
 /// ส่งสรุป missed count รายวัน (เรียกโดย WorkManager)
+/// ส่งสรุป missed count รายวัน (เรียกโดย WorkManager)
 Future<void> _sendDailyMissedSummary() async {
   try {
     final firestore = FirebaseFirestore.instance;
@@ -1367,13 +1275,11 @@ Future<void> _showLocalNotification({
       fullScreenIntent: false,
     );
 
-    // ✅ FIX: Enhanced iOS notification settings
     const DarwinNotificationDetails iosDetails = DarwinNotificationDetails(
       presentAlert: true,
       presentBadge: true,
       presentSound: true,
       interruptionLevel: InterruptionLevel.timeSensitive,
-      badgeNumber: 1,
     );
 
     const NotificationDetails details = NotificationDetails(
@@ -1389,7 +1295,7 @@ Future<void> _showLocalNotification({
       payload: payload,
     );
 
-    print('✅ Local notification shown: $id - $title');
+    print('✅ Local notification shown: $id');
   } catch (e) {
     print('❌ Error showing local notification: $e');
   }
@@ -1648,8 +1554,6 @@ class FaceApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Face Recognition App',
-      navigatorKey:
-          navigatorKey, // ✅ FIX: Add navigator key for notification handling
       theme: ThemeData(
         primarySwatch: Colors.deepPurple,
         fontFamily: 'Roboto',
@@ -1681,7 +1585,6 @@ class FaceApp extends StatelessWidget {
         '/screen': (context) => ScreenPage(),
         '/new_password': (context) => NewPasswordPage(),
         '/account_personal': (context) => const AccountPersonalPage(),
-        // ✅ Add missed page route
       },
     );
   }
