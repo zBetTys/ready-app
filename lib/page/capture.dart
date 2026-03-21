@@ -12,7 +12,6 @@ import 'package:intl/intl.dart';
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:flutter/services.dart';
-import 'dart:convert';
 
 class CapturePage extends StatefulWidget {
   const CapturePage({super.key});
@@ -64,19 +63,17 @@ class _CapturePageState extends State<CapturePage>
   // ================ INTELLIGENT ENHANCEMENTS ================
   static const bool ENABLE_ADAPTIVE_THRESHOLDS = true;
   static const bool ENABLE_QUALITY_BOOST = true;
-  static const bool ENABLE_SMART_GUIDANCE = true;
   static const double MIN_ACCEPTABLE_QUALITY = 0.55;
 
   // ================ OPTIMIZATIONS ================
   static const ResolutionPreset CAMERA_RESOLUTION = ResolutionPreset.medium;
   static const int FRAME_SKIP = 2;
-  static const int MIN_PROCESS_INTERVAL_MS = 200;
+  static const int MIN_PROCESS_INTERVAL_MS = 150;
   static const int IOS_THREADS = 2;
   static const int ANDROID_THREADS = 4;
   static const bool USE_FAST_MODE = true;
 
   // ================ UI CONSTANTS ================
-  static const double FACE_FRAME_RATIO = 0.65;
   static const double METRICS_BAR_HEIGHT = 4.0;
   static const double CORNER_SIZE = 30.0;
   static const double CORNER_THICKNESS = 4.0;
@@ -88,7 +85,7 @@ class _CapturePageState extends State<CapturePage>
   Face? _currentFace;
   List<Face> _faceHistory = [];
   
-  // ================ Real-time Stream Variables ================
+  // ================ Real-time Stream ================
   bool _isStreaming = false;
   bool _isProcessing = false;
   int _frameCounter = 0;
@@ -163,7 +160,6 @@ class _CapturePageState extends State<CapturePage>
   double _screenWidth = 720.0;
   double _screenHeight = 1280.0;
   bool _isSmallScreen = false;
-  late Size _cameraPreviewSize;
 
   @override
   void initState() {
@@ -270,10 +266,6 @@ class _CapturePageState extends State<CapturePage>
         }
       }
 
-      final size = MediaQuery.of(context).size;
-      final cameraRatio = _cameraController!.value.aspectRatio;
-      _cameraPreviewSize = Size(size.width, size.width / cameraRatio);
-
       print('✅ กล้องพร้อม');
     } catch (e) {
       print('❌ Camera error: $e');
@@ -374,14 +366,8 @@ class _CapturePageState extends State<CapturePage>
         ),
       );
 
-      final outputShape = _faceModel!.getOutputTensor(0).shape;
-      int outputSize = 1;
-      for (var dim in outputShape) {
-        outputSize *= dim;
-      }
-
-      final outputBuffer = List<double>.filled(outputSize, 0.0);
-      final output = outputBuffer.reshape(outputShape);
+      final outputBuffer = List<double>.filled(_actualOutputDimension, 0.0);
+      final output = outputBuffer.reshape([1, _actualOutputDimension]);
 
       _faceModel!.run(dummyInput, output);
       print('✅ โมเดลทำงานได้ปกติ');
@@ -442,24 +428,19 @@ class _CapturePageState extends State<CapturePage>
   // ================ CONVERT CAMERA IMAGE TO INPUT IMAGE ================
   Future<InputImage?> _convertCameraImageToInputImage(CameraImage cameraImage) async {
     try {
-      if (cameraImage.format.group == ImageFormatGroup.yuv420) {
-        final imageBytes = _concatenatePlanes(cameraImage.planes);
-        
-        final inputImageData = InputImageMetadata(
-          size: Size(cameraImage.width.toDouble(), cameraImage.height.toDouble()),
-          rotation: _getImageRotation(),
-          format: InputImageFormat.yuv420,
-          bytesPerRow: cameraImage.planes[0].bytesPerRow,
-        );
-        
-        return InputImage.fromBytes(
-          bytes: imageBytes,
-          metadata: inputImageData,
-        );
-      } else {
-        print('⚠️ Unsupported image format: ${cameraImage.format.group}');
-        return null;
-      }
+      final imageBytes = _concatenatePlanes(cameraImage.planes);
+      
+      final inputImageData = InputImageMetadata(
+        size: Size(cameraImage.width.toDouble(), cameraImage.height.toDouble()),
+        rotation: _getImageRotation(),
+        format: InputImageFormat.yuv420,
+        bytesPerRow: cameraImage.planes[0].bytesPerRow,
+      );
+      
+      return InputImage.fromBytes(
+        bytes: imageBytes,
+        metadata: inputImageData,
+      );
     } catch (e) {
       print('❌ Error converting camera image: $e');
       return null;
@@ -543,7 +524,7 @@ class _CapturePageState extends State<CapturePage>
         
         if (quality >= currentThreshold &&
             stability >= MIN_FACE_STABILITY &&
-            _livenessPassed) {
+            livenessResult) {
           setState(() {
             _stableFrameCount++;
             _consecutiveLowQuality = 0;
@@ -586,7 +567,7 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ================ CAPTURE FROM STREAM (NO TAKEPICTURE!) ================
+  // ================ CAPTURE FROM STREAM ================
   Future<void> _captureFromStream() async {
     if (_isCapturing || _captureComplete) return;
     if (_currentFace == null) return;
@@ -602,13 +583,11 @@ class _CapturePageState extends State<CapturePage>
     });
     
     try {
-      // แปลง CameraImage เป็น img.Image
       final img.Image? originalImage = await _cameraImageToImage(_latestCameraImage!);
       if (originalImage == null) {
         throw Exception('ไม่สามารถแปลงภาพได้');
       }
       
-      // Crop ใบหน้า
       final img.Image? processedImage = await _cropAndPreprocessImage(originalImage, _currentFace!);
       
       if (processedImage == null) {
@@ -735,13 +714,9 @@ class _CapturePageState extends State<CapturePage>
     }
   }
   
-  // แปลง CameraImage เป็น img.Image
+  // ================ CONVERT YUV420 TO IMAGE ================
   Future<img.Image?> _cameraImageToImage(CameraImage cameraImage) async {
     try {
-      if (cameraImage.format.group != ImageFormatGroup.yuv420) {
-        return null;
-      }
-      
       final int width = cameraImage.width;
       final int height = cameraImage.height;
       
@@ -756,13 +731,17 @@ class _CapturePageState extends State<CapturePage>
           final int yIndex = y * yPlane.bytesPerRow + x;
           final int uvIndex = (y ~/ 2) * uPlane.bytesPerRow + (x ~/ 2);
           
+          if (yIndex >= yPlane.bytes.length || uvIndex >= uPlane.bytes.length) {
+            continue;
+          }
+          
           final int Y = yPlane.bytes[yIndex] & 0xFF;
           final int U = uPlane.bytes[uvIndex] & 0xFF;
           final int V = vPlane.bytes[uvIndex] & 0xFF;
           
-          int R = (Y + (1.370705 * (V - 128))).round();
-          int G = (Y - (0.698001 * (V - 128)) - (0.337633 * (U - 128))).round();
-          int B = (Y + (1.732446 * (U - 128))).round();
+          int R = (Y + 1.402 * (V - 128)).round();
+          int G = (Y - 0.344136 * (U - 128) - 0.714136 * (V - 128)).round();
+          int B = (Y + 1.772 * (U - 128)).round();
           
           R = R.clamp(0, 255);
           G = G.clamp(0, 255);
@@ -774,32 +753,32 @@ class _CapturePageState extends State<CapturePage>
       
       return image;
     } catch (e) {
-      print('❌ Error converting camera image: $e');
+      print('❌ Error converting YUV to image: $e');
       return null;
     }
   }
   
-  // Crop ใบหน้าจากภาพ (แทน _cropAndPreprocessFace)
+  // ================ CROP FACE FROM IMAGE ================
   Future<img.Image?> _cropAndPreprocessImage(img.Image image, Face face) async {
     try {
       final bbox = face.boundingBox;
       
-      final paddingX = (bbox.width * FACE_PADDING_RATIO).toInt();
-      final paddingY = (bbox.height * FACE_PADDING_RATIO).toInt();
+      int left = (bbox.left - bbox.width * FACE_PADDING_RATIO).toInt();
+      int top = (bbox.top - bbox.height * FACE_PADDING_RATIO).toInt();
+      int right = (bbox.right + bbox.width * FACE_PADDING_RATIO).toInt();
+      int bottom = (bbox.bottom + bbox.height * FACE_PADDING_RATIO).toInt();
       
-      int left = max(0, bbox.left.toInt() - paddingX);
-      int top = max(0, bbox.top.toInt() - paddingY);
-      int width = min(image.width - left, bbox.width.toInt() + paddingX * 2);
-      int height = min(image.height - top, bbox.height.toInt() + paddingY * 2);
-      
-      if (width <= 0 || height <= 0) return null;
+      left = left.clamp(0, image.width - 1);
+      top = top.clamp(0, image.height - 1);
+      right = right.clamp(left + 1, image.width);
+      bottom = bottom.clamp(top + 1, image.height);
       
       final croppedImage = img.copyCrop(
         image,
         x: left,
         y: top,
-        width: width,
-        height: height,
+        width: right - left,
+        height: bottom - top,
       );
       
       final resizedImage = img.copyResize(
@@ -1103,50 +1082,16 @@ class _CapturePageState extends State<CapturePage>
 
     try {
       final input = _prepareInput(faceImage);
-      final outputShape = _faceModel!.getOutputTensor(0).shape;
-
-      int outputSize = 1;
-      for (var dim in outputShape) {
-        outputSize *= dim;
-      }
-
-      final outputBuffer = List<double>.filled(outputSize, 0.0);
-      final output = outputBuffer.reshape(outputShape);
+      final outputBuffer = List<double>.filled(_actualOutputDimension, 0.0);
+      final output = outputBuffer.reshape([1, _actualOutputDimension]);
 
       _faceModel!.run(input, output);
-
-      List<double> result = [];
-
-      if (outputShape.length == 2) {
-        result = List<double>.from(output[0]);
-      } else if (outputShape.length == 1) {
-        result = List<double>.from(output);
-      } else {
-        result = _flattenOutput(output);
-      }
-
-      return result;
+      
+      return List<double>.from(output[0]);
     } catch (e) {
       print('❌ Error extracting embedding: $e');
       rethrow;
     }
-  }
-
-  List<double> _flattenOutput(dynamic output) {
-    List<double> result = [];
-
-    void flatten(dynamic item) {
-      if (item is List) {
-        for (var subItem in item) {
-          flatten(subItem);
-        }
-      } else if (item is double) {
-        result.add(item);
-      }
-    }
-
-    flatten(output);
-    return result;
   }
 
   List<List<List<List<double>>>> _prepareInput(img.Image image) {
@@ -1274,7 +1219,7 @@ class _CapturePageState extends State<CapturePage>
     return normalized;
   }
 
-  // ================ DIALOGS (เหมือนเดิม) ================
+  // ================ DIALOGS ================
   void _showInsufficientConsistencyDialog() {
     if (!mounted) return;
 
@@ -1631,7 +1576,7 @@ class _CapturePageState extends State<CapturePage>
     return Colors.red;
   }
 
-  // ================ BUILD UI (เหมือนเดิม) ================
+  // ================ BUILD UI ================
   @override
   Widget build(BuildContext context) {
     return Scaffold(
