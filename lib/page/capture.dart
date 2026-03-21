@@ -67,8 +67,8 @@ class _CapturePageState extends State<CapturePage>
 
   // ================ OPTIMIZATIONS ================
   static const ResolutionPreset CAMERA_RESOLUTION = ResolutionPreset.medium;
-  static const int FRAME_SKIP = 2;
-  static const int MIN_PROCESS_INTERVAL_MS = 150;
+  static const int FRAME_SKIP = 1;
+  static const int MIN_PROCESS_INTERVAL_MS = 100;
   static const int IOS_THREADS = 2;
   static const int ANDROID_THREADS = 4;
   static const bool USE_FAST_MODE = true;
@@ -567,6 +567,96 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
+  // ================ CONVERT YUV420 TO RGB IMAGE ================
+  Future<img.Image?> _cameraImageToImage(CameraImage cameraImage) async {
+    try {
+      final int width = cameraImage.width;
+      final int height = cameraImage.height;
+      
+      final yPlane = cameraImage.planes[0];
+      final uPlane = cameraImage.planes[1];
+      final vPlane = cameraImage.planes[2];
+      
+      final image = img.Image(width: width, height: height);
+      
+      final yRowStride = yPlane.bytesPerRow;
+      final uvRowStride = uPlane.bytesPerRow;
+      
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final yIndex = y * yRowStride + x;
+          final uvX = x ~/ 2;
+          final uvY = y ~/ 2;
+          final uvIndex = uvY * uvRowStride + uvX;
+          
+          if (yIndex >= yPlane.bytes.length || uvIndex >= uPlane.bytes.length) {
+            continue;
+          }
+          
+          final int Y = yPlane.bytes[yIndex] & 0xFF;
+          final int U = uPlane.bytes[uvIndex] & 0xFF;
+          final int V = vPlane.bytes[uvIndex] & 0xFF;
+          
+          // YUV to RGB conversion (ITU-R BT.601)
+          int R = (Y + 1.402 * (V - 128)).round();
+          int G = (Y - 0.344 * (U - 128) - 0.714 * (V - 128)).round();
+          int B = (Y + 1.772 * (U - 128)).round();
+          
+          R = R.clamp(0, 255);
+          G = G.clamp(0, 255);
+          B = B.clamp(0, 255);
+          
+          image.setPixelRgb(x, y, R, G, B);
+        }
+      }
+      
+      return image;
+    } catch (e) {
+      print('❌ Error converting YUV to image: $e');
+      return null;
+    }
+  }
+  
+  // ================ CROP FACE FROM IMAGE ================
+  Future<img.Image?> _cropAndPreprocessImage(img.Image image, Face face) async {
+    try {
+      final bbox = face.boundingBox;
+      
+      final paddingX = (bbox.width * FACE_PADDING_RATIO).toInt();
+      final paddingY = (bbox.height * FACE_PADDING_RATIO).toInt();
+      
+      int left = (bbox.left - paddingX).toInt();
+      int top = (bbox.top - paddingY).toInt();
+      int right = (bbox.right + paddingX).toInt();
+      int bottom = (bbox.bottom + paddingY).toInt();
+      
+      left = left.clamp(0, image.width - 1);
+      top = top.clamp(0, image.height - 1);
+      right = right.clamp(left + 1, image.width);
+      bottom = bottom.clamp(top + 1, image.height);
+      
+      final croppedImage = img.copyCrop(
+        image,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+      );
+      
+      final resizedImage = img.copyResize(
+        croppedImage,
+        width: FACE_CROP_SIZE,
+        height: FACE_CROP_SIZE,
+        interpolation: img.Interpolation.linear,
+      );
+      
+      return resizedImage;
+    } catch (e) {
+      print('❌ Error cropping face: $e');
+      return null;
+    }
+  }
+
   // ================ CAPTURE FROM STREAM ================
   Future<void> _captureFromStream() async {
     if (_isCapturing || _captureComplete) return;
@@ -711,87 +801,6 @@ class _CapturePageState extends State<CapturePage>
         _instructionMessage = 'ลองใหม่';
         _stableFrameCount = 0;
       });
-    }
-  }
-  
-  // ================ CONVERT YUV420 TO IMAGE ================
-  Future<img.Image?> _cameraImageToImage(CameraImage cameraImage) async {
-    try {
-      final int width = cameraImage.width;
-      final int height = cameraImage.height;
-      
-      final yPlane = cameraImage.planes[0];
-      final uPlane = cameraImage.planes[1];
-      final vPlane = cameraImage.planes[2];
-      
-      final image = img.Image(width: width, height: height);
-      
-      for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-          final int yIndex = y * yPlane.bytesPerRow + x;
-          final int uvIndex = (y ~/ 2) * uPlane.bytesPerRow + (x ~/ 2);
-          
-          if (yIndex >= yPlane.bytes.length || uvIndex >= uPlane.bytes.length) {
-            continue;
-          }
-          
-          final int Y = yPlane.bytes[yIndex] & 0xFF;
-          final int U = uPlane.bytes[uvIndex] & 0xFF;
-          final int V = vPlane.bytes[uvIndex] & 0xFF;
-          
-          int R = (Y + 1.402 * (V - 128)).round();
-          int G = (Y - 0.344136 * (U - 128) - 0.714136 * (V - 128)).round();
-          int B = (Y + 1.772 * (U - 128)).round();
-          
-          R = R.clamp(0, 255);
-          G = G.clamp(0, 255);
-          B = B.clamp(0, 255);
-          
-          image.setPixelRgb(x, y, R, G, B);
-        }
-      }
-      
-      return image;
-    } catch (e) {
-      print('❌ Error converting YUV to image: $e');
-      return null;
-    }
-  }
-  
-  // ================ CROP FACE FROM IMAGE ================
-  Future<img.Image?> _cropAndPreprocessImage(img.Image image, Face face) async {
-    try {
-      final bbox = face.boundingBox;
-      
-      int left = (bbox.left - bbox.width * FACE_PADDING_RATIO).toInt();
-      int top = (bbox.top - bbox.height * FACE_PADDING_RATIO).toInt();
-      int right = (bbox.right + bbox.width * FACE_PADDING_RATIO).toInt();
-      int bottom = (bbox.bottom + bbox.height * FACE_PADDING_RATIO).toInt();
-      
-      left = left.clamp(0, image.width - 1);
-      top = top.clamp(0, image.height - 1);
-      right = right.clamp(left + 1, image.width);
-      bottom = bottom.clamp(top + 1, image.height);
-      
-      final croppedImage = img.copyCrop(
-        image,
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
-      );
-      
-      final resizedImage = img.copyResize(
-        croppedImage,
-        width: FACE_CROP_SIZE,
-        height: FACE_CROP_SIZE,
-        interpolation: img.Interpolation.linear,
-      );
-      
-      return resizedImage;
-    } catch (e) {
-      print('❌ Error cropping face: $e');
-      return null;
     }
   }
 
