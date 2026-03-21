@@ -67,9 +67,8 @@ class _CapturePageState extends State<CapturePage>
   static const bool ENABLE_SMART_GUIDANCE = true;
   static const double MIN_ACCEPTABLE_QUALITY = 0.55;
 
-  // ================ OPTIMIZATIONS ================
-  static const ResolutionPreset CAMERA_RESOLUTION =
-      ResolutionPreset.medium; // ใช้ medium เพื่อคุณภาพดีพอ
+  // ================ REAL-TIME OPTIMIZATIONS ================
+  static const ResolutionPreset CAMERA_RESOLUTION = ResolutionPreset.medium;
   static const int FRAME_SKIP = 2; // ข้าม frame เพื่อลดภาระ
   static const int MIN_PROCESS_INTERVAL_MS = 200; // 200ms ต่อการประมวลผล
   static const int IOS_THREADS = 2;
@@ -95,6 +94,7 @@ class _CapturePageState extends State<CapturePage>
   int _frameCounter = 0;
   DateTime? _lastProcessTime;
   CameraImage? _latestFrame; // เก็บ frame ล่าสุดสำหรับ capture
+  InputImage? _latestInputImage; // เก็บ InputImage ล่าสุด
 
   // ================ MobileFaceNet Model ================
   Interpreter? _faceModel;
@@ -257,7 +257,7 @@ class _CapturePageState extends State<CapturePage>
         frontCamera,
         CAMERA_RESOLUTION,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420,
+        imageFormatGroup: ImageFormatGroup.yuv420, // ใช้ YUV420 สำหรับ real-time
       );
 
       await _cameraController!.initialize();
@@ -406,12 +406,14 @@ class _CapturePageState extends State<CapturePage>
     _lastProcessTime = DateTime.now();
     
     _cameraController!.startImageStream((CameraImage image) async {
-      // เก็บ frame ล่าสุดไว้ใช้ตอน capture
+      // เก็บ frame ล่าสุด
       _latestFrame = image;
       _frameCounter++;
       
+      // ข้าม frame เพื่อลดภาระ
       if (_frameCounter % FRAME_SKIP != 0) return;
       
+      // ตรวจสอบสถานะ
       if (!_isCameraReady ||
           _isCapturing ||
           _isSaving ||
@@ -420,6 +422,7 @@ class _CapturePageState extends State<CapturePage>
         return;
       }
       
+      // ควบคุมความถี่ในการประมวลผล
       final now = DateTime.now();
       if (_lastProcessTime != null) {
         final elapsed = now.difference(_lastProcessTime!);
@@ -458,20 +461,6 @@ class _CapturePageState extends State<CapturePage>
           bytes: imageBytes,
           metadata: inputImageData,
         );
-      } else if (cameraImage.format.group == ImageFormatGroup.bgra8888) {
-        final imageBytes = _convertBGRAtoRGB(cameraImage.planes.first.bytes);
-        
-        final inputImageData = InputImageMetadata(
-          size: Size(cameraImage.width.toDouble(), cameraImage.height.toDouble()),
-          rotation: _getImageRotation(),
-          format: InputImageFormat.bgra8888,
-          bytesPerRow: cameraImage.planes.first.bytesPerRow,
-        );
-        
-        return InputImage.fromBytes(
-          bytes: imageBytes,
-          metadata: inputImageData,
-        );
       } else {
         print('⚠️ Unsupported image format: ${cameraImage.format.group}');
         return null;
@@ -490,23 +479,6 @@ class _CapturePageState extends State<CapturePage>
     return allBytes.done().buffer.asUint8List();
   }
 
-  Uint8List _convertBGRAtoRGB(Uint8List bgraBytes) {
-    final int length = bgraBytes.length ~/ 4;
-    final Uint8List rgbBytes = Uint8List(length * 3);
-    
-    for (int i = 0; i < length; i++) {
-      final int b = bgraBytes[i * 4];
-      final int g = bgraBytes[i * 4 + 1];
-      final int r = bgraBytes[i * 4 + 2];
-      
-      rgbBytes[i * 3] = r;
-      rgbBytes[i * 3 + 1] = g;
-      rgbBytes[i * 3 + 2] = b;
-    }
-    
-    return rgbBytes;
-  }
-
   InputImageRotation _getImageRotation() {
     if (_isIos) {
       return InputImageRotation.rotation90deg;
@@ -521,9 +493,14 @@ class _CapturePageState extends State<CapturePage>
     _isProcessing = true;
     
     try {
+      // แปลงเป็น InputImage สำหรับ ML Kit
       final inputImage = await _convertCameraImageToInputImage(cameraImage);
       if (inputImage == null) return;
       
+      // เก็บ InputImage ล่าสุดไว้ใช้ตอน capture
+      _latestInputImage = inputImage;
+      
+      // ตรวจจับใบหน้า
       List<Face> faces = [];
       try {
         faces = await _faceDetector!.processImage(inputImage);
@@ -533,7 +510,7 @@ class _CapturePageState extends State<CapturePage>
       }
       
       if (faces.isNotEmpty) {
-        await _processFaces(faces);
+        await _processFaces(faces, cameraImage);
       } else {
         setState(() {
           _currentFace = null;
@@ -549,7 +526,7 @@ class _CapturePageState extends State<CapturePage>
   }
 
   // ================ PROCESS FACES ================
-  Future<void> _processFaces(List<Face> faces) async {
+  Future<void> _processFaces(List<Face> faces, CameraImage cameraImage) async {
     final face = faces.first;
     
     setState(() {
@@ -602,8 +579,8 @@ class _CapturePageState extends State<CapturePage>
       if (_stableFrameCount >= REQUIRED_STABLE_FRAMES &&
           !_isCapturing &&
           _enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-        // ใช้ภาพจาก stream โดยไม่ต้อง takePicture()
-        await _captureFromStream();
+        // ใช้ frame ปัจจุบันสร้าง embedding
+        await _captureFromStream(cameraImage, face);
       }
     } else {
       setState(() {
@@ -620,13 +597,8 @@ class _CapturePageState extends State<CapturePage>
   }
 
   // ================ CAPTURE FROM STREAM (NO TAKEPICTURE!) ================
-  Future<void> _captureFromStream() async {
+  Future<void> _captureFromStream(CameraImage cameraImage, Face face) async {
     if (_isCapturing || _captureComplete) return;
-    if (_currentFace == null) return;
-    if (_latestFrame == null) {
-      print('⚠️ No frame available for capture');
-      return;
-    }
     
     setState(() {
       _isCapturing = true;
@@ -635,20 +607,14 @@ class _CapturePageState extends State<CapturePage>
     });
     
     try {
-      // แปลง frame ล่าสุดเป็น InputImage
-      final inputImage = await _convertCameraImageToInputImage(_latestFrame!);
-      if (inputImage == null) {
-        throw Exception('ไม่สามารถแปลงภาพได้');
-      }
-      
-      // แปลงเป็น img.Image สำหรับ crop
-      final img.Image? originalImage = await _cameraImageToImage(_latestFrame!);
+      // แปลง CameraImage เป็น img.Image สำหรับ crop
+      final img.Image? originalImage = await _cameraImageToImage(cameraImage);
       if (originalImage == null) {
         throw Exception('ไม่สามารถแปลงภาพได้');
       }
       
       // Crop เฉพาะใบหน้า
-      final img.Image? croppedFace = await _cropFaceFromImage(originalImage, _currentFace!);
+      final img.Image? croppedFace = await _cropFaceFromImage(originalImage, face);
       if (croppedFace == null) {
         throw Exception('ไม่พบใบหน้าในภาพ');
       }
@@ -684,9 +650,9 @@ class _CapturePageState extends State<CapturePage>
         'total_quality': totalQualityScore,
         'embedding_quality': embeddingQuality,
         'angles': {
-          'yaw': _currentFace!.headEulerAngleY ?? 0.0,
-          'pitch': _currentFace!.headEulerAngleX ?? 0.0,
-          'roll': _currentFace!.headEulerAngleZ ?? 0.0,
+          'yaw': face.headEulerAngleY ?? 0.0,
+          'pitch': face.headEulerAngleX ?? 0.0,
+          'roll': face.headEulerAngleZ ?? 0.0,
         },
         'timestamp': DateTime.now().toIso8601String(),
         'dimension': normalizedEmbedding.length,
@@ -778,43 +744,42 @@ class _CapturePageState extends State<CapturePage>
   // แปลง CameraImage เป็น img.Image
   Future<img.Image?> _cameraImageToImage(CameraImage cameraImage) async {
     try {
-      if (cameraImage.format.group == ImageFormatGroup.yuv420) {
-        // แปลง YUV420 เป็น RGB
-        final int width = cameraImage.width;
-        final int height = cameraImage.height;
-        
-        final yPlane = cameraImage.planes[0];
-        final uPlane = cameraImage.planes[1];
-        final vPlane = cameraImage.planes[2];
-        
-        final image = img.Image(width: width, height: height);
-        
-        for (int y = 0; y < height; y++) {
-          for (int x = 0; x < width; x++) {
-            final int yIndex = y * yPlane.bytesPerRow + x;
-            final int uvIndex = (y ~/ 2) * uPlane.bytesPerRow + (x ~/ 2);
-            
-            final int Y = yPlane.bytes[yIndex] & 0xFF;
-            final int U = uPlane.bytes[uvIndex] & 0xFF;
-            final int V = vPlane.bytes[uvIndex] & 0xFF;
-            
-            int R = (Y + (1.370705 * (V - 128))).round();
-            int G = (Y - (0.698001 * (V - 128)) - (0.337633 * (U - 128))).round();
-            int B = (Y + (1.732446 * (U - 128))).round();
-            
-            R = R.clamp(0, 255);
-            G = G.clamp(0, 255);
-            B = B.clamp(0, 255);
-            
-            image.setPixelRgb(x, y, R, G, B);
-          }
-        }
-        
-        return image;
-      } else {
+      if (cameraImage.format.group != ImageFormatGroup.yuv420) {
         print('⚠️ Unsupported format for image conversion');
         return null;
       }
+      
+      final int width = cameraImage.width;
+      final int height = cameraImage.height;
+      
+      final yPlane = cameraImage.planes[0];
+      final uPlane = cameraImage.planes[1];
+      final vPlane = cameraImage.planes[2];
+      
+      final image = img.Image(width: width, height: height);
+      
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final int yIndex = y * yPlane.bytesPerRow + x;
+          final int uvIndex = (y ~/ 2) * uPlane.bytesPerRow + (x ~/ 2);
+          
+          final int Y = yPlane.bytes[yIndex] & 0xFF;
+          final int U = uPlane.bytes[uvIndex] & 0xFF;
+          final int V = vPlane.bytes[uvIndex] & 0xFF;
+          
+          int R = (Y + (1.370705 * (V - 128))).round();
+          int G = (Y - (0.698001 * (V - 128)) - (0.337633 * (U - 128))).round();
+          int B = (Y + (1.732446 * (U - 128))).round();
+          
+          R = R.clamp(0, 255);
+          G = G.clamp(0, 255);
+          B = B.clamp(0, 255);
+          
+          image.setPixelRgb(x, y, R, G, B);
+        }
+      }
+      
+      return image;
     } catch (e) {
       print('❌ Error converting camera image: $e');
       return null;
