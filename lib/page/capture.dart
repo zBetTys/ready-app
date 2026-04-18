@@ -64,12 +64,12 @@ class _CapturePageState extends State<CapturePage>
   static const bool ENABLE_QUALITY_BOOST = true;
   static const double MIN_ACCEPTABLE_QUALITY = 0.55;
 
-  // ================ ANDROID OPTIMIZATIONS (NO WHITE FLASH) ================
+  // ================ CAMERA & DETECTION OPTIMIZATIONS ================
   static const ResolutionPreset CAMERA_RESOLUTION = ResolutionPreset.medium;
   static const int ANDROID_THREADS = 4;
+  static const int IOS_THREADS = 2;
   static const int FRAME_SKIP = 0;
-  static const int MIN_PROCESS_INTERVAL_MS = 80;
-  static const bool USE_FAST_MODE = false;
+  static const int MIN_PROCESS_INTERVAL_MS = 80; // ~12 FPS
 
   // ================ UI CONSTANTS ================
   static const double METRICS_BAR_HEIGHT = 4.0;
@@ -255,7 +255,7 @@ class _CapturePageState extends State<CapturePage>
 
       await _cameraController!.initialize();
 
-      // ปิด flash เพื่อป้องกันจอกระพริบ
+      // ปิด flash และตั้งค่ากล้อง
       try {
         await _cameraController!.setExposureMode(ExposureMode.auto);
         await _cameraController!.setFocusMode(FocusMode.auto);
@@ -273,16 +273,12 @@ class _CapturePageState extends State<CapturePage>
 
   Future<void> _initializeFaceDetector() async {
     try {
-      final performanceMode = USE_FAST_MODE
-          ? FaceDetectorMode.fast
-          : FaceDetectorMode.accurate;
-
       final options = FaceDetectorOptions(
         enableLandmarks: true,
         enableClassification: true,
         enableTracking: true,
         minFaceSize: 0.15,
-        performanceMode: performanceMode,
+        performanceMode: FaceDetectorMode.accurate,
       );
 
       _faceDetector = FaceDetector(options: options);
@@ -311,7 +307,7 @@ class _CapturePageState extends State<CapturePage>
         throw Exception('ไม่พบไฟล์โมเดล');
       }
 
-      final threads = _isIos ? 2 : ANDROID_THREADS;
+      final threads = _isIos ? IOS_THREADS : ANDROID_THREADS;
 
       final interpreterOptions = InterpreterOptions()
         ..threads = threads
@@ -427,8 +423,8 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ================ CONVERT CAMERA IMAGE TO INPUT IMAGE ================
-  InputImage? _cameraImageToInputImage(CameraImage image) {
+  // ================ CREATE INPUT IMAGE FOR FACE DETECTION ================
+  InputImage? _createInputImage(CameraImage image) {
     try {
       final WriteBuffer buffer = WriteBuffer();
       
@@ -447,13 +443,13 @@ class _CapturePageState extends State<CapturePage>
       
       return InputImage.fromBytes(bytes: bytes, metadata: metadata);
     } catch (e) {
-      print('❌ Error converting to InputImage: $e');
+      print('❌ Error creating InputImage: $e');
       return null;
     }
   }
 
-  // ================ CONVERT YUV420 TO RGB IMAGE ================
-  img.Image? _yuv420ToRgbImage(CameraImage cameraImage) {
+  // ================ CONVERT YUV420 TO RGB ================
+  img.Image? _yuv420ToRgb(CameraImage cameraImage) {
     try {
       final int width = cameraImage.width;
       final int height = cameraImage.height;
@@ -502,7 +498,7 @@ class _CapturePageState extends State<CapturePage>
   }
   
   // ================ CROP FACE FROM IMAGE ================
-  img.Image? _cropAndPreprocessImage(img.Image image, Face face) {
+  img.Image? _cropFace(img.Image image, Face face) {
     try {
       final bbox = face.boundingBox;
       
@@ -519,12 +515,9 @@ class _CapturePageState extends State<CapturePage>
       right = right.clamp(left + 1, image.width);
       bottom = bottom.clamp(top + 1, image.height);
       
-      if (right <= left || bottom <= top) {
-        print('❌ Invalid crop dimensions');
-        return null;
-      }
+      if (right <= left || bottom <= top) return null;
       
-      final croppedImage = img.copyCrop(
+      final cropped = img.copyCrop(
         image,
         x: left,
         y: top,
@@ -532,19 +525,14 @@ class _CapturePageState extends State<CapturePage>
         height: bottom - top,
       );
       
-      if (croppedImage == null) {
-        print('❌ Failed to crop image');
-        return null;
-      }
+      if (cropped == null) return null;
       
-      final resizedImage = img.copyResize(
-        croppedImage,
+      return img.copyResize(
+        cropped,
         width: FACE_CROP_SIZE,
         height: FACE_CROP_SIZE,
         interpolation: img.Interpolation.linear,
       );
-      
-      return resizedImage;
     } catch (e) {
       print('❌ Error cropping face: $e');
       return null;
@@ -557,7 +545,7 @@ class _CapturePageState extends State<CapturePage>
     _isProcessing = true;
     
     try {
-      final inputImage = _cameraImageToInputImage(cameraImage);
+      final inputImage = _createInputImage(cameraImage);
       if (inputImage == null) return;
       
       List<Face> faces = [];
@@ -624,7 +612,7 @@ class _CapturePageState extends State<CapturePage>
           if (_stableFrameCount >= REQUIRED_STABLE_FRAMES &&
               !_isCapturing &&
               _enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-            final rgbImage = _yuv420ToRgbImage(cameraImage);
+            final rgbImage = _yuv420ToRgb(cameraImage);
             if (rgbImage != null) {
               await _captureFromImage(rgbImage, face);
             }
@@ -655,7 +643,7 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ================ CAPTURE FROM IMAGE ================
+  // ================ CAPTURE FROM IMAGE (NO WHITE FLASH) ================
   Future<void> _captureFromImage(img.Image image, Face face) async {
     if (_isCapturing || _captureComplete) return;
     
@@ -666,13 +654,13 @@ class _CapturePageState extends State<CapturePage>
     });
     
     try {
-      final img.Image? processedImage = _cropAndPreprocessImage(image, face);
+      final img.Image? croppedFace = _cropFace(image, face);
       
-      if (processedImage == null) {
+      if (croppedFace == null) {
         throw Exception('ประมวลผลใบหน้าไม่สำเร็จ');
       }
       
-      img.Image finalImage = processedImage;
+      img.Image finalImage = croppedFace;
       if (ENABLE_QUALITY_BOOST && _faceQuality < 0.65) {
         finalImage = _enhanceImageQuality(finalImage);
       }
@@ -1688,7 +1676,7 @@ class _CapturePageState extends State<CapturePage>
                 ),
                 Text(
                   _modelLoaded
-                      ? 'MobileFaceNet (Android)'
+                      ? 'MobileFaceNet${_isIos ? " (iOS)" : " (Android)"}'
                       : 'กำลังเตรียม...',
                   style: const TextStyle(color: Colors.white60, fontSize: 11),
                 ),
