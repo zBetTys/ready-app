@@ -1,5 +1,3 @@
-// lib/pages/login.dart
-
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -12,6 +10,7 @@ import '../page/home_personal.dart';
 import '../page/pdpa.dart';
 import '../page/hat.dart';
 
+/// เป็น StatefulWidget เพราะมีการเปลี่ยนแปลงข้อมูล เช่น การโหลด, การแสดงผล
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
 
@@ -21,78 +20,152 @@ class LoginPage extends StatefulWidget {
 
 class _LoginPageState extends State<LoginPage>
     with SingleTickerProviderStateMixin {
-  // Controllers
+  ///ควบคุม
+
+  /// ตัวควบคุมช่องกรอกอีเมล
   final TextEditingController _emailController = TextEditingController();
+
+  /// ตัวควบคุมช่องกรอกรหัสผ่าน
   final TextEditingController _passwordController = TextEditingController();
+
+  /// แสดงสถานะกำลังโหลด (true = กำลังโหลด, false = ไม่ได้โหลด)
   bool _isLoading = false;
+
+  /// แสดง/ซ่อนรหัสผ่าน (true = ซ่อน, false = แสดง)
   bool _obscurePassword = true;
+
+  /// จดจำการเข้าสู่ระบบ (true = จดจำ, false = ไม่จดจำ)
   bool _rememberMe = false;
+
+  /// กำลังทำการล็อกอินอัตโนมัติ (ใช้สำหรับตอนเปิดแอปครั้งแรก)
   bool _autoLoginInProgress = false;
 
-  // Animation
+  /// ข้อความประกาศ
+  String _announcementText = '';
+  bool _isLoadingAnnouncement = true;
+
+  // แอนิเมชัน (Animation)
+
+  /// ต่าง ๆ
   late AnimationController _animationController;
+
+  /// ขยาย/หด
   late Animation<double> _scaleAnimation;
+
+  /// ค่อยปรากฏ Fade
   late Animation<double> _fadeAnimation;
 
-  // Firebase instances
+  /// Firebase Authentication - ใช้สำหรับยืนยันตัวตนผู้ใช้
   final _auth = FirebaseAuth.instance;
+
+  /// Firebase Firestore - ใช้สำหรับเก็บข้อมูลผู้ใช้
   final _firestore = FirebaseFirestore.instance;
 
-  // ใช้โทนสีเหมือนหน้า PDPA
   final Color _primaryColor = const Color(0xFF6A1B9A);
+
   final Color _backgroundColor = const Color(0xFFF5F5F5);
+
+  /// Card
   final Color _cardColor = Colors.white;
 
+  /// ทำงานเมื่อสร้าง Widget ครั้งแรก
   @override
   void initState() {
     super.initState();
-    _initializeAnimations();
-    _checkAutoLogin();
+    _initializeAnimations(); // เแอนิเมชัน
+    _checkAutoLogin(); // ตรวจสอบการล็อกอินอัตโนมัติ
+    _loadAnnouncement(); // โหลดข้อความประกาศ
   }
 
+  /// ตั้งค่าแอนิเมชันต่าง ๆ
   void _initializeAnimations() {
+    // สร้างตัวควบคุมแอนิเมชัน ทำงาน 800 มิลลิวินาที
     _animationController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 800),
     );
 
+    // แอนิเมชันขยายจาก 0.9 -> 1.0 (เหมือนดีดออก)
     _scaleAnimation = Tween<double>(begin: 0.9, end: 1.0).animate(
       CurvedAnimation(parent: _animationController, curve: Curves.easeOutBack),
     );
 
+    // แอนิเมชันค่อย ๆ ปรากฏ จากโปร่งใส -> ทึบ
     _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(parent: _animationController, curve: Curves.easeIn),
     );
 
+    // เริ่มเล่นแอนิเมชัน
     _animationController.forward();
   }
 
+  /// โหลดข้อความประกาศจาก Firestore
+  Future<void> _loadAnnouncement() async {
+    try {
+      final doc = await _firestore
+          .collection('system_settings')
+          .doc('checkin_time')
+          .get();
+
+      if (doc.exists) {
+        final data = doc.data();
+        final announcement = data?['announcementDetail'] ?? '';
+
+        setState(() {
+          _announcementText = announcement;
+          _isLoadingAnnouncement = false;
+        });
+
+        print(
+            '📢 โหลดข้อความประกาศ: ${announcement.isNotEmpty ? announcement : 'ไม่มีประกาศ'}');
+      } else {
+        setState(() {
+          _isLoadingAnnouncement = false;
+        });
+      }
+    } catch (e) {
+      print('❌ Error loading announcement: $e');
+      setState(() {
+        _isLoadingAnnouncement = false;
+      });
+    }
+  }
+
+  /// ทำงานเมื่อ Widget ถูกทำลาย (ล้างหน่วยความจำ)
   @override
   void dispose() {
-    _animationController.dispose();
-    _emailController.dispose();
-    _passwordController.dispose();
+    _animationController.dispose(); // ล้างแอนิเมชัน
+    _emailController.dispose(); // ล้างตัวควบคุมอีเมล
+    _passwordController.dispose(); // ล้างตัวควบคุมรหัสผ่าน
     super.dispose();
   }
 
-  // ตรวจสอบและทำ Auto-Login
+  // ==================== ระบบล็อกอินอัตโนมัติ (Auto-Login) ====================
+
+  /// ตรวจสอบว่ามีการบันทึกข้อมูลล็อกอินไว้หรือไม่
   Future<void> _checkAutoLogin() async {
     try {
+      // อ่านข้อมูลจาก SharedPreferences (หน่วยความจำของเครื่อง)
       final prefs = await SharedPreferences.getInstance();
-      final savedRememberMe = prefs.getBool('remember_me') ?? false;
-      final savedEmail = prefs.getString('saved_email');
-      final savedPassword = prefs.getString('saved_password');
+      final savedRememberMe =
+          prefs.getBool('remember_me') ?? false; // ค่าจดจำหรือไม่
+      final savedEmail = prefs.getString('saved_email'); // อีเมลที่บันทึก
+      final savedPassword =
+          prefs.getString('saved_password'); // รหัสผ่านที่บันทึก
 
+      // ถ้ามีการจดจำ และมีอีเมล+รหัสผ่าน ให้ทำการล็อกอินอัตโนมัติ
       if (savedRememberMe && savedEmail != null && savedPassword != null) {
         setState(() {
-          _emailController.text = savedEmail;
+          _emailController.text = savedEmail; // ใส่ข้อมูลลงในช่อง
           _passwordController.text = savedPassword;
-          _rememberMe = true;
-          _autoLoginInProgress = true;
+          _rememberMe = true; // เปลี่ยนสถานะจดจำ
+          _autoLoginInProgress = true; // เริ่มกระบวนการล็อกอินอัตโนมัติ
         });
 
-        await Future.delayed(const Duration(milliseconds: 800));
-        await _autoLogin(savedEmail, savedPassword);
+        await Future.delayed(
+            const Duration(milliseconds: 800)); // รอ 0.8 วินาที
+        await _autoLogin(
+            savedEmail, savedPassword); // เรียกฟังก์ชันล็อกอินอัตโนมัติ
       }
     } catch (e) {
       print('Error checking auto login: $e');
@@ -100,10 +173,10 @@ class _LoginPageState extends State<LoginPage>
     }
   }
 
-  // ฟังก์ชัน Auto-Login
+  /// ฟังก์ชันล็อกอินอัตโนมัติ
   Future<void> _autoLogin(String email, String password) async {
     if (_autoLoginInProgress && mounted) {
-      // แสดง loading indicator สำหรับ Auto-Login
+      // แสดง SnackBar แจ้งเตือนกำลังล็อกอิน
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Row(
@@ -130,14 +203,17 @@ class _LoginPageState extends State<LoginPage>
       );
 
       try {
+        // เรียก Firebase Authentication เพื่อล็อกอิน
         final userCredential = await _auth.signInWithEmailAndPassword(
           email: email,
           password: password,
         );
 
-        final user = userCredential.user!;
+        final user = userCredential.user!; // ดึงข้อมูลผู้ใช้
+        // ตรวจสอบและนำทางไปยังหน้าเหมาะสม
         await _checkCollectionAndNavigate(user.uid, email, true);
       } on FirebaseAuthException catch (e) {
+        // จัดการกรณีเกิดข้อผิดพลาดจาก Firebase
         if (mounted) {
           setState(() => _autoLoginInProgress = false);
           ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -162,30 +238,45 @@ class _LoginPageState extends State<LoginPage>
     }
   }
 
-  // ✅ ฟังก์ชันตรวจสอบว่าเป็น Student หรือไม่
+  // ==================== ฟังก์ชันตรวจสอบ Role (บทบาทผู้ใช้) ====================
+
+  /// ตรวจสอบว่าเป็นนักศึกษา (Student) หรือไม่
+  /// ดูจากฟิลด์ 'role' ใน Firestore ว่ามีค่าเป็น 'student' หรือไม่
   bool _isStudent(Map<String, dynamic> userData) {
     final role = userData['role']?.toString().toLowerCase() ?? '';
     return role == 'student';
   }
 
-  // ✅ ฟังก์ชันตรวจสอบ PDPA Consent (เฉพาะ Student)
+  /// ตรวจสอบว่าเป็นแอดมิน (Admin) หรือไม่
+  /// ดูจากฟิลด์ 'role' == 'admin' หรือ 'isAdmin' == true
+  bool _isAdmin(Map<String, dynamic> userData) {
+    final role = userData['role']?.toString().toLowerCase() ?? '';
+    final isAdminFlag = userData['isAdmin'] == true;
+    return role == 'admin' || isAdminFlag;
+  }
+
+  // ==================== ระบบตรวจสอบ PDPA และ Face Profile ====================
+
+  /// ตรวจสอบว่านักศึกษายอมรับ PDPA หรือยัง
+  /// เฉพาะนักศึกษาเท่านั้นที่ต้องตรวจสอบ บุคลากรและแอดมินไม่ต้อง
   Future<bool> _checkPDPAConsent(
       String userId, Map<String, dynamic> userData) async {
     try {
-      // ตรวจสอบว่าเป็น Student หรือไม่
+      // ถ้าไม่ใช่นักศึกษา ให้ผ่านเลย (ไม่ต้องตรวจสอบ)
       if (!_isStudent(userData)) {
         print('👤 ไม่ใช่นักศึกษา ไม่ต้องตรวจสอบ PDPA');
-        return true; // ไม่ใช่นักศึกษา ให้ผ่านเลย
+        return true;
       }
 
       print('🔍 ตรวจสอบ PDPA Consent สำหรับนักศึกษา: $userId');
 
+      // ดึงข้อมูลผู้ใช้จาก Firestore
       final userDoc = await _firestore.collection('users').doc(userId).get();
 
       if (userDoc.exists) {
         final data = userDoc.data() as Map<String, dynamic>;
 
-        // ตรวจสอบฟิลด์ pdpaConsent
+        // ตรวจสอบฟิลด์ pdpaConsent ว่ามีค่า true หรือไม่
         final hasPDPA =
             data.containsKey('pdpaConsent') && data['pdpaConsent'] == true;
 
@@ -203,17 +294,18 @@ class _LoginPageState extends State<LoginPage>
     }
   }
 
-  // ✅ ฟังก์ชันตรวจสอบว่ามี Face Profile หรือไม่ (ปรับปรุง)
+  /// ตรวจสอบว่านักศึกษามีการลงทะเบียนใบหน้า (Face Profile) หรือยัง
+  /// ตรวจสอบใน subcollection 'face_profiles'
   Future<bool> _hasFaceProfile(String userId) async {
     try {
       print('🔍 ตรวจสอบ Face Profile สำหรับ: $userId');
 
-      // ตรวจสอบใน face_profiles subcollection
+      // ตรวจสอบใน collection users > userId > face_profiles
       final faceProfilesSnapshot = await _firestore
           .collection('users')
           .doc(userId)
           .collection('face_profiles')
-          .limit(1)
+          .limit(1) // แค่เอาอันแรกก็พอ ว่า有没有
           .get();
 
       final hasFaceProfile = faceProfilesSnapshot.docs.isNotEmpty;
@@ -228,7 +320,12 @@ class _LoginPageState extends State<LoginPage>
     }
   }
 
-  // ✅ ฟังก์ชันนำทางตาม PDPA Consent และ Face Profile (ปรับปรุง)
+  /// นำทางผู้ใช้ตามเงื่อนไข PDPA และ Face Profile
+  /// สำหรับ Admin/Personal: ไปหน้า Home เลย
+  /// สำหรับ Student:
+  ///   - ยังไม่ยอมรับ PDPA -> ไปหน้า PDPA
+  ///   - ยอมรับ PDPA แล้ว แต่ยังไม่มี Face -> ไปหน้า Hat (ลงทะเบียนใบหน้า)
+  ///   - มีครบแล้ว -> ไปหน้า Home
   Future<void> _navigateBasedOnPDPA({
     required String userId,
     required String email,
@@ -239,12 +336,12 @@ class _LoginPageState extends State<LoginPage>
     // ตรวจสอบว่าเป็น Student หรือไม่
     final isStudent = _isStudent(userData);
 
-    // ถ้าเป็น Student ให้ตรวจสอบ PDPA
+    // ========== กรณีเป็น Student: ต้องตรวจสอบ PDPA และ Face ==========
     if (isStudent) {
       final hasPDPA = await _checkPDPAConsent(userId, userData);
 
+      // กรณียังไม่ยอมรับ PDPA
       if (!hasPDPA) {
-        // ✅ ยังไม่ยินยอม PDPA -> ไปหน้า PDPA
         print('➡️ นักศึกษายังไม่ยินยอม PDPA กำลังนำทางไปหน้า PDPA');
 
         ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -264,7 +361,7 @@ class _LoginPageState extends State<LoginPage>
         await Future.delayed(const Duration(milliseconds: 800));
 
         if (mounted) {
-          // ✅ ส่งข้อมูลผู้ใช้ไปยังหน้า PDPA
+          // ส่งข้อมูลผู้ใช้ไปยังหน้า PDPA
           Navigator.pushAndRemoveUntil(
             context,
             MaterialPageRoute(
@@ -285,19 +382,19 @@ class _LoginPageState extends State<LoginPage>
                 },
               ),
             ),
-            (route) => false,
+            (route) => false, // ล้างหน้าเดิมทั้งหมด
           );
         }
         return;
       }
 
-      // ✅ มี PDPA Consent แล้ว -> ตรวจสอบ Face Profile
+      // กรณียอมรับ PDPA แล้ว ตรวจสอบ Face Profile
       print('➡️ นักศึกษายินยอม PDPA แล้ว กำลังตรวจสอบ Face Profile');
 
       final hasFaceProfile = await _hasFaceProfile(userId);
 
+      // กรณียังไม่มี Face Profile
       if (!hasFaceProfile) {
-        // ✅ ถ้ายังไม่มี Face Profile -> ไปหน้า Hat
         print('➡️ นักศึกษายังไม่มี Face Profile กำลังนำทางไปหน้า Hat');
 
         ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -316,7 +413,7 @@ class _LoginPageState extends State<LoginPage>
         await Future.delayed(const Duration(milliseconds: 800));
 
         if (mounted) {
-          // ✅ ส่งข้อมูลผู้ใช้ไปยังหน้า Hat
+          // ส่งข้อมูลผู้ใช้ไปยังหน้า Hat (ลงทะเบียนใบหน้า)
           Navigator.pushAndRemoveUntil(
             context,
             MaterialPageRoute(
@@ -344,11 +441,11 @@ class _LoginPageState extends State<LoginPage>
         return;
       }
 
-      // ✅ มีทั้ง PDPA และ Face Profile แล้ว -> ไปหน้า Home
+      // กรณีมี Face Profile แล้ว
       print('➡️ นักศึกษามี Face Profile แล้ว กำลังนำทางไปหน้า Home');
     }
 
-    // ✅ ถ้าไม่ใช่นักศึกษา หรือนักศึกษาที่มี Face Profile แล้ว -> ไปหน้าตามปกติ
+    // ========== กรณี Admin หรือ Personal (หรือ Student ที่มี Face แล้ว) ==========
     print(
         '➡️ ${isStudent ? "นักศึกษามี Face Profile แล้ว" : "ไม่ใช่นักศึกษา"} กำลังนำทางไปหน้า Home');
 
@@ -359,6 +456,7 @@ class _LoginPageState extends State<LoginPage>
 
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
 
+    // แสดงข้อความต้อนรับตามบทบาท
     if (isAutoLogin) {
       _showSnackBar(
         content: Text("✅ เข้าสู่ระบบอัตโนมัติสำเร็จ: $email"),
@@ -378,7 +476,7 @@ class _LoginPageState extends State<LoginPage>
         );
       } else {
         _showSnackBar(
-          content: Text("ยินดีต้อนรับเจ้าหน้าที่: $email 👨‍💼"),
+          content: Text("ยินดีต้อนรับอาจารย์ที่ปรึกษา: $email 👨‍💼"),
           color: Colors.blue,
         );
       }
@@ -386,22 +484,27 @@ class _LoginPageState extends State<LoginPage>
 
     await Future.delayed(const Duration(milliseconds: 500));
 
+    // นำทางตามบทบาท
     if (mounted) {
       if (isAdmin) {
-        _navigateToAdminPage();
+        _navigateToAdminPage(); // ไปหน้า Admin
       } else if (isStudent) {
-        _navigateToHome();
+        _navigateToHome(); // ไปหน้า Student
       } else {
-        _navigateToPersonalPage();
+        _navigateToPersonalPage(); // ไปหน้า Personal (บุคลากร)
       }
     }
   }
 
-  // ฟังก์ชันล็อกอิน
+  // ==================== ฟังก์ชันล็อกอินหลัก ====================
+
+  /// ฟังก์ชันล็อกอินหลัก (เรียกเมื่อกดปุ่มเข้าสู่ระบบ)
   Future<void> _login() async {
+    // ดึงข้อมูลจากช่องกรอก และตัดช่องว่างหน้า-หลัง
     final email = _emailController.text.trim();
     final password = _passwordController.text.trim();
 
+    // ตรวจสอบว่ากรอกข้อมูลครบหรือไม่
     if (email.isEmpty || password.isEmpty) {
       _showErrorAnimation();
       _showSnackBar(
@@ -411,15 +514,16 @@ class _LoginPageState extends State<LoginPage>
       return;
     }
 
-    setState(() => _isLoading = true);
+    setState(() => _isLoading = true); // เริ่มโหลด
 
     try {
+      // เรียก Firebase Authentication เพื่อล็อกอิน
       final userCredential = await _auth.signInWithEmailAndPassword(
         email: email,
         password: password,
       );
 
-      final user = userCredential.user!;
+      final user = userCredential.user!; // ดึงข้อมูลผู้ใช้
 
       // บันทึกข้อมูลถ้าเลือก Remember Me
       if (_rememberMe) {
@@ -428,93 +532,82 @@ class _LoginPageState extends State<LoginPage>
         await _clearSavedCredentials();
       }
 
-      // ตรวจสอบและนำทางตาม collection
+      // ตรวจสอบและนำทางตาม collection (users, user_personal, user_Personnel)
       await _checkCollectionAndNavigate(user.uid, email, false);
     } on FirebaseAuthException catch (e) {
-      _handleAuthError(e);
+      _handleAuthError(e); // จัดการข้อผิดพลาดจาก Firebase
     } catch (e) {
-      _handleGeneralError(e);
+      _handleGeneralError(e); // จัดการข้อผิดพลาดทั่วไป
     } finally {
       if (mounted) {
-        setState(() => _isLoading = false);
+        setState(() => _isLoading = false); // สิ้นสุดการโหลด
       }
     }
   }
 
-  // ตรวจสอบ collection และนำทาง
+  /// ตรวจสอบ collection (ฐานข้อมูล) และนำทางไปยังหน้าเหมาะสม
+  /// ตรวจสอบ 3 collection: users, user_personal, user_Personnel
   Future<void> _checkCollectionAndNavigate(
     String userId,
     String email,
     bool isAutoLogin,
   ) async {
     try {
-      // ตรวจสอบว่าเป็น admin หรือไม่ (จาก email)
-      final bool isAdminEmail = email == 'tadadnarak@gmail.com';
-
-      // ตรวจสอบใน users collection ก่อน
+      // 1. ตรวจสอบใน users collection (สำหรับนักศึกษา)
       final userDoc = await _firestore.collection('users').doc(userId).get();
 
       if (userDoc.exists) {
         final userData = userDoc.data() as Map<String, dynamic>;
-        final isAdminFromData =
-            userData['role'] == 'admin' || userData['isAdmin'] == true;
+        final isAdminUser = _isAdmin(userData);
 
-        // ✅ ตรวจสอบ PDPA Consent และ Face Profile แล้วนำทาง (เฉพาะ Student)
+        // นำทางตาม PDPA และ Face Profile
         await _navigateBasedOnPDPA(
           userId: userId,
           email: email,
           userData: userData,
-          isAdmin: isAdminFromData || isAdminEmail,
+          isAdmin: isAdminUser,
           isAutoLogin: isAutoLogin,
         );
         return;
       }
 
-      // ตรวจสอบใน user_personal collection
+      // 2. ตรวจสอบใน user_personal collection (สำหรับบุคลากร)
       final personalDoc =
           await _firestore.collection('user_personal').doc(userId).get();
 
       if (personalDoc.exists) {
         final personalData = personalDoc.data() as Map<String, dynamic>;
-        final isAdminFromData =
-            personalData['role'] == 'admin' || personalData['isAdmin'] == true;
+        final isAdminUser = _isAdmin(personalData);
 
-        // ✅ สำหรับบุคลากร ไม่ต้องตรวจสอบ PDPA
+        // จัดการนำทางสำหรับบุคลากร
         await _handlePersonalNavigation(
           personalDoc,
           email,
           isAutoLogin,
-          isAdminFromData || isAdminEmail,
+          isAdminUser,
         );
         return;
       }
 
-      // ตรวจสอบใน user_Personnel collection
+      // 3. ตรวจสอบใน user_Personnel collection (สำหรับบุคลากรอีกที่)
       final personnelDoc =
           await _firestore.collection('user_Personnel').doc(userId).get();
 
       if (personnelDoc.exists) {
         final personnelData = personnelDoc.data() as Map<String, dynamic>;
-        final isAdminFromData = personnelData['role'] == 'admin' ||
-            personnelData['isAdmin'] == true;
+        final isAdminUser = _isAdmin(personnelData);
 
-        // ✅ สำหรับบุคลากร ไม่ต้องตรวจสอบ PDPA
+        // จัดการนำทางสำหรับบุคลากร
         await _handlePersonnelNavigation(
           personnelDoc,
           email,
           isAutoLogin,
-          isAdminFromData || isAdminEmail,
+          isAdminUser,
         );
         return;
       }
 
-      // ถ้าไม่พบใน collection ใดเลย แต่เป็น admin email ให้สร้าง account
-      if (isAdminEmail) {
-        await _createAdminUser(userId, email);
-        return;
-      }
-
-      // ถ้าไม่ใช่ admin และไม่พบใน collection ใดเลย
+      // ถ้าไม่พบใน collection ใดเลย
       _handleUserNotFound(userId, email);
     } catch (e) {
       print('❌ Error checking user collections: $e');
@@ -522,12 +615,12 @@ class _LoginPageState extends State<LoginPage>
         content: Text("เกิดข้อผิดพลาดในการตรวจสอบข้อมูล: $e"),
         color: Colors.red,
       );
-      await _auth.signOut();
+      await _auth.signOut(); // ออกจากระบบ
       setState(() => _autoLoginInProgress = false);
     }
   }
 
-  // จัดการ navigation สำหรับ user_personal collection
+  /// จัดการ navigation สำหรับ user_personal collection
   Future<void> _handlePersonalNavigation(
     DocumentSnapshot personalDoc,
     String email,
@@ -543,6 +636,7 @@ class _LoginPageState extends State<LoginPage>
 
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
 
+    // แสดงข้อความต้อนรับ
     if (isAutoLogin) {
       _showSnackBar(
         content: Text("✅ เข้าสู่ระบบอัตโนมัติสำเร็จ: $email"),
@@ -552,12 +646,12 @@ class _LoginPageState extends State<LoginPage>
     } else {
       if (isAdmin) {
         _showSnackBar(
-          content: Text("ยินดีต้อนรับ Admin (Personal): $email 👑"),
+          content: Text("ยินดีต้อนรับ Admin : $email 👑"),
           color: Colors.deepPurple,
         );
       } else {
         _showSnackBar(
-          content: Text("ยินดีต้อนรับเจ้าหน้าที่: $email 👨‍💼"),
+          content: Text("ยินดีต้อนรับอาจารย์ที่ปรึกษา: $email 👨‍💼"),
           color: Colors.blue,
         );
       }
@@ -565,6 +659,7 @@ class _LoginPageState extends State<LoginPage>
 
     await Future.delayed(const Duration(milliseconds: 500));
 
+    // นำทางตามบทบาท
     if (isAdmin) {
       _navigateToAdminPage();
     } else {
@@ -572,7 +667,7 @@ class _LoginPageState extends State<LoginPage>
     }
   }
 
-  // จัดการ navigation สำหรับ user_Personnel collection
+  /// จัดการ navigation สำหรับ user_Personnel collection
   Future<void> _handlePersonnelNavigation(
     DocumentSnapshot personnelDoc,
     String email,
@@ -588,6 +683,7 @@ class _LoginPageState extends State<LoginPage>
 
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
 
+    // แสดงข้อความต้อนรับ
     if (isAutoLogin) {
       _showSnackBar(
         content: Text("✅ เข้าสู่ระบบอัตโนมัติสำเร็จ: $email"),
@@ -597,12 +693,12 @@ class _LoginPageState extends State<LoginPage>
     } else {
       if (isAdmin) {
         _showSnackBar(
-          content: Text("ยินดีต้อนรับ Admin (Personnel): $email 👑"),
+          content: Text("ยินดีต้อนรับ Admin : $email 👑"),
           color: Colors.deepPurple,
         );
       } else {
         _showSnackBar(
-          content: Text("ยินดีต้อนรับเจ้าหน้าที่: $email 👨‍💼"),
+          content: Text("ยินดีต้อนรับอาจารย์ที่ปรึกษา: $email 👨‍💼"),
           color: Colors.blue,
         );
       }
@@ -610,6 +706,7 @@ class _LoginPageState extends State<LoginPage>
 
     await Future.delayed(const Duration(milliseconds: 500));
 
+    // นำทางตามบทบาท
     if (isAdmin) {
       _navigateToAdminPage();
     } else {
@@ -617,73 +714,9 @@ class _LoginPageState extends State<LoginPage>
     }
   }
 
-  // สร้างบัญชี admin ใหม่
-  Future<void> _createAdminUser(String userId, String email) async {
-    try {
-      // สร้างใน users collection พร้อมตั้งค่า PDPA Consent
-      await _firestore.collection('users').doc(userId).set({
-        'userId': userId,
-        'email': email,
-        'firstName': 'Admin',
-        'lastName': 'System',
-        'role': 'admin', // ✅ role = admin
-        'isAdmin': true,
-        'createdAt': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
-        'isActive': true,
-        'emailVerified': true,
-        'phoneNumber': '',
-        'department': 'System Administration',
-        'pdpaConsent': true,
-        'pdpaConsentDate': FieldValue.serverTimestamp(),
-        'pdpaVersion': '1.0',
-        'registrationComplete': true,
-      });
-
-      // สร้างใน user_personal collection
-      await _firestore.collection('user_personal').doc(userId).set({
-        'userId': userId,
-        'email': email,
-        'fullName': 'Admin System',
-        'role': 'admin',
-        'isAdmin': true,
-        'createdAt': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
-        'permissions': {
-          'manageUsers': true,
-          'manageCourses': true,
-          'viewReports': true,
-          'systemSettings': true,
-        },
-      });
-
-      if (!_autoLoginInProgress) {
-        _showSuccessAnimation();
-        await Future.delayed(const Duration(milliseconds: 500));
-      }
-
-      setState(() => _autoLoginInProgress = false);
-
-      _showSnackBar(
-        content: const Text("✅ สร้างบัญชี Admin ใหม่สำเร็จ!"),
-        color: Colors.green,
-      );
-
-      _navigateToAdminPage();
-    } catch (e) {
-      print('❌ Error creating admin user: $e');
-      await _auth.signOut();
-      setState(() => _autoLoginInProgress = false);
-      _showSnackBar(
-        content: Text("เกิดข้อผิดพลาดในการสร้างบัญชี Admin: $e"),
-        color: Colors.red,
-      );
-    }
-  }
-
-  // จัดการกรณีไม่พบผู้ใช้
+  /// จัดการกรณีไม่พบข้อมูลผู้ใช้ในระบบ
   Future<void> _handleUserNotFound(String userId, String email) async {
-    await _auth.signOut();
+    await _auth.signOut(); // ออกจากระบบ
 
     if (!_autoLoginInProgress) {
       _showErrorAnimation();
@@ -697,36 +730,41 @@ class _LoginPageState extends State<LoginPage>
     );
   }
 
-  // บันทึกข้อมูลล็อกอิน
+  // ==================== ระบบบันทึกข้อมูลล็อกอิน (SharedPreferences) ====================
+
+  /// บันทึกข้อมูลล็อกอิน (อีเมลและรหัสผ่าน) ลงในเครื่อง
   Future<void> _saveCredentials(String email, String password) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool('remember_me', true);
-      await prefs.setString('saved_email', email);
-      await prefs.setString('saved_password', password);
+      await prefs.setBool('remember_me', true); // บันทึกว่าจดจำ
+      await prefs.setString('saved_email', email); // บันทึกอีเมล
+      await prefs.setString('saved_password', password); // บันทึกรหัสผ่าน
     } catch (e) {
       print('❌ Error saving credentials: $e');
     }
   }
 
-  // ล้างข้อมูลที่บันทึกไว้
+  /// ล้างข้อมูลล็อกอินที่บันทึกไว้
   Future<void> _clearSavedCredentials() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool('remember_me', false);
-      await prefs.remove('saved_email');
-      await prefs.remove('saved_password');
+      await prefs.setBool('remember_me', false); // ยกเลิกการจดจำ
+      await prefs.remove('saved_email'); // ลบอีเมล
+      await prefs.remove('saved_password'); // ลบรหัสผ่าน
     } catch (e) {
       print('❌ Error clearing credentials: $e');
     }
   }
 
-  // จัดการข้อผิดพลาดการล็อกอิน
+  // ==================== การจัดการข้อผิดพลาด (Error Handling) ====================
+
+  /// จัดการข้อผิดพลาดจาก Firebase Authentication
   void _handleAuthError(FirebaseAuthException e) {
     setState(() => _autoLoginInProgress = false);
 
     String errorMessage = "เกิดข้อผิดพลาดในการเข้าสู่ระบบ";
 
+    // แปลงรหัสผิดพลาดเป็นภาษาไทย
     switch (e.code) {
       case 'user-not-found':
         errorMessage = "ไม่พบผู้ใช้ด้วยอีเมลนี้";
@@ -756,7 +794,7 @@ class _LoginPageState extends State<LoginPage>
     );
   }
 
-  // จัดการข้อผิดพลาดทั่วไป
+  /// จัดการข้อผิดพลาดทั่วไป
   void _handleGeneralError(dynamic e) {
     setState(() => _autoLoginInProgress = false);
 
@@ -767,10 +805,14 @@ class _LoginPageState extends State<LoginPage>
     );
   }
 
+  // ==================== แอนิเมชันและเอฟเฟกต์ ====================
+
+  /// แสดงแอนิเมชันเมื่อเกิดข้อผิดพลาด
   void _showErrorAnimation() {
     _animationController.forward(from: 0.7);
   }
 
+  /// แสดงแอนิเมชันเมื่อสำเร็จ
   void _showSuccessAnimation() {
     _animationController.repeat(reverse: true);
     Future.delayed(const Duration(milliseconds: 400), () {
@@ -779,16 +821,18 @@ class _LoginPageState extends State<LoginPage>
     });
   }
 
-  // ไปหน้า Home (สำหรับนักศึกษาที่มี Face Profile แล้ว)
+  // ==================== ฟังก์ชันนำทาง (Navigation) ====================
+
+  /// ไปหน้า Home (สำหรับนักศึกษาที่มี Face Profile แล้ว)
   void _navigateToHome() {
     Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (_) => const HomePage()),
-      (route) => false,
+      (route) => false, // ล้างหน้าเดิมทั้งหมด
     );
   }
 
-  // ไปหน้า HomeAdmin (สำหรับ admin)
+  /// ไปหน้า HomeAdmin (สำหรับแอดมิน)
   void _navigateToAdminPage() {
     Navigator.pushAndRemoveUntil(
       context,
@@ -797,7 +841,7 @@ class _LoginPageState extends State<LoginPage>
     );
   }
 
-  // ไปหน้า HomePersonal (สำหรับบุคลากร)
+  /// ไปหน้า HomePersonal (สำหรับบุคลากร)
   void _navigateToPersonalPage() {
     Navigator.pushAndRemoveUntil(
       context,
@@ -806,7 +850,9 @@ class _LoginPageState extends State<LoginPage>
     );
   }
 
-  // Helper function สำหรับแสดง SnackBar
+  // ==================== ฟังก์ชันแสดง SnackBar ====================
+
+  /// แสดง SnackBar แบบกำหนดเอง
   void _showSnackBar({
     required Widget content,
     required Color color,
@@ -817,22 +863,27 @@ class _LoginPageState extends State<LoginPage>
         content: content,
         backgroundColor: color,
         duration: duration,
-        behavior: SnackBarBehavior.floating,
+        behavior: SnackBarBehavior.floating, // ลอยอยู่ด้านบน
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         margin: const EdgeInsets.all(16),
       ),
     );
   }
 
+  // ==================== เมธอด build (การสร้าง UI) ====================
+
   @override
   Widget build(BuildContext context) {
+    // ถ้ากำลังล็อกอินอัตโนมัติ ให้แสดงหน้าจอโหลด
     if (_autoLoginInProgress) {
       return _buildAutoLoginScreen();
     }
 
+    // ไม่เช่นนั้นแสดงหน้าจอล็อกอินปกติ
     return _buildLoginScreen();
   }
 
+  /// สร้างหน้าจอขณะกำลังล็อกอินอัตโนมัติ
   Widget _buildAutoLoginScreen() {
     return Scaffold(
       backgroundColor: _backgroundColor,
@@ -848,6 +899,7 @@ class _LoginPageState extends State<LoginPage>
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
+              // โลโก้圆形
               Container(
                 width: 100,
                 height: 100,
@@ -897,6 +949,7 @@ class _LoginPageState extends State<LoginPage>
                 ),
               ),
               const SizedBox(height: 20),
+              // ตัวโหลด
               Container(
                 width: 200,
                 padding: const EdgeInsets.all(16),
@@ -950,6 +1003,7 @@ class _LoginPageState extends State<LoginPage>
     );
   }
 
+  /// สร้างหน้าจอล็อกอินปกติ
   Widget _buildLoginScreen() {
     return Scaffold(
       backgroundColor: _backgroundColor,
@@ -967,6 +1021,7 @@ class _LoginPageState extends State<LoginPage>
         ),
         child: Center(
           child: SingleChildScrollView(
+            // รองรับการเลื่อนเมื่อคีย์บอร์ดขึ้น
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 24),
               child: AnimatedBuilder(
@@ -974,7 +1029,7 @@ class _LoginPageState extends State<LoginPage>
                 builder: (context, child) {
                   return Column(
                     children: [
-                      // โลโก้
+                      // ========== โลโก้ ==========
                       ScaleTransition(
                         scale: _scaleAnimation,
                         child: FadeTransition(
@@ -1025,7 +1080,7 @@ class _LoginPageState extends State<LoginPage>
 
                       const SizedBox(height: 25),
 
-                      // หัวข้อ
+                      // ========== หัวข้อ ==========
                       FadeTransition(
                         opacity: _fadeAnimation,
                         child: Container(
@@ -1073,7 +1128,83 @@ class _LoginPageState extends State<LoginPage>
 
                       const SizedBox(height: 40),
 
-                      // ✅ ข้อความประกาศสำหรับนักศึกษา
+                      // ========== 🆕 ป้ายประกาศ (Announcement Banner) ==========
+                      if (!_isLoadingAnnouncement &&
+                          _announcementText.isNotEmpty)
+                        FadeTransition(
+                          opacity: _fadeAnimation,
+                          child: Container(
+                            margin: const EdgeInsets.only(bottom: 20),
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                colors: [
+                                  Colors.orange.withOpacity(0.15),
+                                  Colors.orange.withOpacity(0.08),
+                                ],
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                              ),
+                              borderRadius: BorderRadius.circular(16),
+                              border: Border.all(
+                                color: Colors.orange.withOpacity(0.5),
+                                width: 1.5,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.orange.withOpacity(0.1),
+                                  blurRadius: 8,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ],
+                            ),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.orange.withOpacity(0.2),
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Icon(
+                                    Icons.campaign_rounded,
+                                    color: Colors.orange.shade700,
+                                    size: 24,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        "📢 ประกาศ",
+                                        style: TextStyle(
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.orange.shade800,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        _announcementText,
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          color: Colors.grey.shade800,
+                                          height: 1.4,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+
+                      // ========== ข้อความแนะนำสำหรับนักศึกษา ==========
                       FadeTransition(
                         opacity: _fadeAnimation,
                         child: Container(
@@ -1164,7 +1295,7 @@ class _LoginPageState extends State<LoginPage>
                         ),
                       ),
 
-                      // ฟอร์มล็อกอิน
+                      // ========== ฟอร์มล็อกอิน ==========
                       ScaleTransition(
                         scale: _scaleAnimation,
                         child: FadeTransition(
@@ -1192,7 +1323,7 @@ class _LoginPageState extends State<LoginPage>
                                 padding: const EdgeInsets.all(24),
                                 child: Column(
                                   children: [
-                                    // อีเมล
+                                    // ช่องกรอกอีเมล
                                     TextField(
                                       controller: _emailController,
                                       keyboardType: TextInputType.emailAddress,
@@ -1207,32 +1338,27 @@ class _LoginPageState extends State<LoginPage>
                                           color: _primaryColor,
                                         ),
                                         border: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            12,
-                                          ),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
                                           borderSide: BorderSide(
-                                            color: _primaryColor.withOpacity(
-                                              0.3,
-                                            ),
+                                            color:
+                                                _primaryColor.withOpacity(0.3),
                                           ),
                                         ),
                                         focusedBorder: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            12,
-                                          ),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
                                           borderSide: BorderSide(
                                             color: _primaryColor,
                                             width: 2,
                                           ),
                                         ),
                                         enabledBorder: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            12,
-                                          ),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
                                           borderSide: BorderSide(
-                                            color: _primaryColor.withOpacity(
-                                              0.3,
-                                            ),
+                                            color:
+                                                _primaryColor.withOpacity(0.3),
                                           ),
                                         ),
                                         filled: true,
@@ -1242,7 +1368,7 @@ class _LoginPageState extends State<LoginPage>
 
                                     const SizedBox(height: 20),
 
-                                    // รหัสผ่าน
+                                    // ช่องกรอกรหัสผ่าน (มีปุ่มแสดง/ซ่อน)
                                     TextField(
                                       controller: _passwordController,
                                       obscureText: _obscurePassword,
@@ -1271,32 +1397,27 @@ class _LoginPageState extends State<LoginPage>
                                           },
                                         ),
                                         border: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            12,
-                                          ),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
                                           borderSide: BorderSide(
-                                            color: _primaryColor.withOpacity(
-                                              0.3,
-                                            ),
+                                            color:
+                                                _primaryColor.withOpacity(0.3),
                                           ),
                                         ),
                                         focusedBorder: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            12,
-                                          ),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
                                           borderSide: BorderSide(
                                             color: _primaryColor,
                                             width: 2,
                                           ),
                                         ),
                                         enabledBorder: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            12,
-                                          ),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
                                           borderSide: BorderSide(
-                                            color: _primaryColor.withOpacity(
-                                              0.3,
-                                            ),
+                                            color:
+                                                _primaryColor.withOpacity(0.3),
                                           ),
                                         ),
                                         filled: true,
@@ -1304,7 +1425,7 @@ class _LoginPageState extends State<LoginPage>
                                       ),
                                     ),
 
-                                    // Remember Me
+                                    // Remember Me (จดจำรหัสผ่าน)
                                     const SizedBox(height: 15),
                                     Row(
                                       children: [
@@ -1315,9 +1436,8 @@ class _LoginPageState extends State<LoginPage>
                                             color: _rememberMe
                                                 ? _primaryColor
                                                 : Colors.white,
-                                            borderRadius: BorderRadius.circular(
-                                              6,
-                                            ),
+                                            borderRadius:
+                                                BorderRadius.circular(6),
                                             border: Border.all(
                                               color: _rememberMe
                                                   ? _primaryColor
@@ -1357,7 +1477,7 @@ class _LoginPageState extends State<LoginPage>
 
                                     const SizedBox(height: 20),
 
-                                    // ปุ่มล็อกอิน
+                                    // ปุ่มเข้าสู่ระบบ
                                     Container(
                                       decoration: BoxDecoration(
                                         borderRadius: BorderRadius.circular(12),
@@ -1366,9 +1486,8 @@ class _LoginPageState extends State<LoginPage>
                                             : LinearGradient(
                                                 colors: [
                                                   _primaryColor,
-                                                  _primaryColor.withOpacity(
-                                                    0.8,
-                                                  ),
+                                                  _primaryColor
+                                                      .withOpacity(0.8),
                                                 ],
                                                 begin: Alignment.topLeft,
                                                 end: Alignment.bottomRight,
@@ -1387,9 +1506,8 @@ class _LoginPageState extends State<LoginPage>
                                       child: Material(
                                         color: Colors.transparent,
                                         child: InkWell(
-                                          borderRadius: BorderRadius.circular(
-                                            12,
-                                          ),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
                                           onTap: _isLoading ? null : _login,
                                           child: Container(
                                             width: double.infinity,
@@ -1443,10 +1561,9 @@ class _LoginPageState extends State<LoginPage>
                       ),
 
                       const SizedBox(height: 30),
-
                       const SizedBox(height: 20),
 
-                      // ลิงก์สมัครสมาชิก
+                      // ========== ลิงก์สมัครสมาชิก ==========
                       FadeTransition(
                         opacity: _fadeAnimation,
                         child: Container(
@@ -1506,7 +1623,7 @@ class _LoginPageState extends State<LoginPage>
 
                       const SizedBox(height: 15),
 
-                      // ลืมรหัสผ่าน
+                      // ========== ลิงก์ลืมรหัสผ่าน ==========
                       FadeTransition(
                         opacity: _fadeAnimation,
                         child: TextButton(
