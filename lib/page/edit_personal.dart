@@ -214,7 +214,7 @@ class _EditPersonalPageState extends State<EditPersonalPage>
     }
   }
 
-  // ✅ ฟังก์ชันเพิ่มบุคลากร - แก้ไขบัคเรียบร้อย
+// ✅ ฟังก์ชันเพิ่มบุคลากร - เวอร์ชันที่เสถียร ไม่หลุด login
   Future<void> _addPersonnel() async {
     // ตรวจสอบข้อมูลที่จำเป็น
     if (_emailController.text.isEmpty) {
@@ -248,83 +248,52 @@ class _EditPersonalPageState extends State<EditPersonalPage>
     setState(() => _isAddingPersonnel = true);
 
     try {
-      // 🔑 เก็บข้อมูลผู้ใช้ปัจจุบันก่อนดำเนินการ
-      final currentUser = _auth.currentUser;
-      final currentUserEmail = currentUser?.email;
-      final currentUserPassword = '12345678';
+      // 🔑 เก็บข้อมูล admin ปัจจุบัน
+      final adminUser = _auth.currentUser;
+      if (adminUser == null) {
+        _showErrorSnackBar('ไม่พบข้อมูลผู้ดูแลระบบ');
+        return;
+      }
 
-      print('Current user before: ${currentUser?.email}');
+      final adminEmail = adminUser.email;
+      final adminUid = adminUser.uid;
+
+      print('👑 Admin UID: $adminUid');
+      print('👑 Admin Email: $adminEmail');
 
       if (_editingPersonnelId == null) {
-        // ✅ เพิ่มบุคลากรใหม่
-        final UserCredential userCredential =
-            await _auth.createUserWithEmailAndPassword(
-          email: _emailController.text.trim(),
-          password: '12345678',
-        );
+        // ✅ สร้างบุคลากรใหม่ผ่าน Cloud Function
+        final HttpsCallable createUserFunction =
+            _functions.httpsCallable('createPersonnelUser');
 
-        final userId = userCredential.user!.uid;
-
-        print('Created new user: $userId');
-        print('Current user after creation: ${_auth.currentUser?.email}');
-
-        // ✅ บันทึกข้อมูลใน Firestore
-        await _firestore.collection('user_personal').doc(userId).set({
-          'userId': userId,
+        final result = await createUserFunction.call({
           'email': _emailController.text.trim(),
+          'password': '12345678',
           'firstName': _firstNameController.text.trim(),
           'lastName': _lastNameController.text.trim(),
           'educationLevel': _selectedEducationLevel!,
           'year': fullYear,
           'year_base': _selectedYear,
-          'room': _selectedRoom,
+          'room': _selectedRoom ?? '',
           'department': _selectedDepartment!,
-          'role': 'personnel',
-          'createdAt': FieldValue.serverTimestamp(),
-          'updatedAt': FieldValue.serverTimestamp(),
-          'createdBy': currentUser?.uid,
-          'createdByEmail': currentUser?.email,
+          'createdBy': adminUid,
+          'createdByEmail': adminEmail,
         });
 
-        // ส่งอีเมลยืนยัน
-        await userCredential.user!.sendEmailVerification();
+        print('📦 Cloud Function Result: ${result.data}');
 
-        print('Before sign out: ${_auth.currentUser?.email}');
-
-        // 🔑 ออกจากระบบผู้ใช้ใหม่
-        await _auth.signOut();
-
-        print('After sign out: ${_auth.currentUser}');
-
-        // 🔑 ล็อกอินกลับเข้าไปเป็นผู้ดูแลระบบ
-        if (currentUserEmail != null && currentUserPassword != null) {
-          await _auth.signInWithEmailAndPassword(
-            email: currentUserEmail,
-            password: currentUserPassword,
-          );
-          print('Signed back in as admin: ${_auth.currentUser?.email}');
+        if (result.data['success'] != true) {
+          throw Exception(result.data['message'] ?? 'Unknown error');
         }
 
-        // อัพเดท UI ทันที
-        final newPersonnel = {
-          'id': userId,
-          'email': _emailController.text.trim(),
-          'firstName': _firstNameController.text.trim(),
-          'lastName': _lastNameController.text.trim(),
-          'educationLevel': _selectedEducationLevel!,
-          'year': fullYear,
-          'department': _selectedDepartment!,
-          'role': 'personnel',
-          'createdAt': DateTime.now(),
-        };
+        final newUserId = result.data['uid'];
+
+        // ✅ รีโหลดข้อมูลใหม่ทั้งหมด (แทนที่จะ insert แบบ local)
+        await _loadPersonnel();
 
         if (mounted) {
-          setState(() {
-            _personnelList.insert(0, newPersonnel);
-          });
+          _showSuccessSnackBar('✅ เพิ่มบุคลากรสำเร็จ! (รหัสผ่าน: 12345678)');
         }
-
-        _showSuccessSnackBar('✅ เพิ่มบุคลากรสำเร็จ! (รหัสผ่าน: 12345678)');
       } else {
         // ✅ แก้ไขข้อมูลบุคลากร
         await _firestore
@@ -336,59 +305,26 @@ class _EditPersonalPageState extends State<EditPersonalPage>
           'educationLevel': _selectedEducationLevel!,
           'year': fullYear,
           'year_base': _selectedYear,
-          'room': _selectedRoom,
+          'room': _selectedRoom ?? '',
           'department': _selectedDepartment!,
           'updatedAt': FieldValue.serverTimestamp(),
-          'updatedBy': currentUser?.uid,
-          'updatedByEmail': currentUser?.email,
+          'updatedBy': adminUid,
+          'updatedByEmail': adminEmail,
         });
 
-        // อัพเดท UI ทันที
-        if (mounted) {
-          setState(() {
-            final index = _personnelList
-                .indexWhere((p) => p['id'] == _editingPersonnelId);
-            if (index != -1) {
-              _personnelList[index] = {
-                ..._personnelList[index],
-                'firstName': _firstNameController.text.trim(),
-                'lastName': _lastNameController.text.trim(),
-                'educationLevel': _selectedEducationLevel!,
-                'year': fullYear,
-                'department': _selectedDepartment!,
-              };
-            }
-          });
-        }
+        await _loadPersonnel();
 
-        _showSuccessSnackBar('✅ แก้ไขข้อมูลบุคลากรสำเร็จ');
+        if (mounted) {
+          _showSuccessSnackBar('✅ แก้ไขข้อมูลบุคลากรสำเร็จ');
+        }
       }
 
       _clearForm();
-    } on FirebaseAuthException catch (e) {
-      String errorMessage = 'เกิดข้อผิดพลาด';
-      if (e.code == 'email-already-in-use') {
-        errorMessage = 'อีเมลนี้มีอยู่ในระบบแล้ว';
-      } else if (e.code == 'invalid-email') {
-        errorMessage = 'รูปแบบอีเมลไม่ถูกต้อง';
-      }
-      _showErrorSnackBar(errorMessage);
-
-      // 🔑 ถ้าเกิดข้อผิดพลาด ให้ลองล็อกอินกลับเป็นผู้ดูแลระบบ
-      try {
-        if (_adminEmail != null && _adminPassword != null) {
-          await _auth.signInWithEmailAndPassword(
-            email: _adminEmail!,
-            password: _adminPassword!,
-          );
-          print('Signed back in as admin after error');
-        }
-      } catch (signInError) {
-        print('Error signing back in: $signInError');
-      }
     } catch (e) {
-      print('Error adding/editing personnel: $e');
-      _showErrorSnackBar('เกิดข้อผิดพลาด: ${e.toString()}');
+      print('❌ Error adding/editing personnel: $e');
+      if (mounted) {
+        _showErrorSnackBar('เกิดข้อผิดพลาด: ${e.toString()}');
+      }
     } finally {
       if (mounted) {
         setState(() => _isAddingPersonnel = false);
