@@ -38,6 +38,9 @@ class _EditCheckPageState extends State<EditCheckPage>
   DateTime? _selectedHolidayDate;
   List<Map<String, dynamic>> _holidays = [];
 
+  // ตัวแปรสำหรับประกาศ (เหลือช่องเดียว)
+  final TextEditingController _announcementController = TextEditingController();
+
   bool _isLoading = true;
   bool _isSaving = false;
   bool _isAdminVerified = false;
@@ -104,6 +107,7 @@ class _EditCheckPageState extends State<EditCheckPage>
     _animationController.dispose();
     _scrollController.dispose();
     _holidayNameController.dispose();
+    _announcementController.dispose();
     super.dispose();
   }
 
@@ -139,7 +143,7 @@ class _EditCheckPageState extends State<EditCheckPage>
 
   Future<void> _loadData() async {
     try {
-      // โหลดข้อมูลเวลาเช็คชื่อ
+      // โหลดข้อมูลเวลาเช็คชื่อและประกาศ
       final checkInDoc = await _firestore
           .collection('system_settings')
           .doc('checkin_time')
@@ -163,6 +167,9 @@ class _EditCheckPageState extends State<EditCheckPage>
               _disabledDays[i] = disabledDaysData[i] ?? false;
             }
           }
+
+          // โหลดข้อมูลประกาศ (ใช้ฟิลด์ announcementDetail)
+          _announcementController.text = data['announcementDetail'] ?? '';
         });
       }
 
@@ -223,13 +230,14 @@ class _EditCheckPageState extends State<EditCheckPage>
     setState(() => _isSaving = true);
 
     try {
-      // บันทึกการตั้งค่าเช็คชื่อ
+      // บันทึกการตั้งค่าเช็คชื่อและประกาศ
       await _firestore.collection('system_settings').doc('checkin_time').set({
         'checkInStartHour': _checkInStart!.hour,
         'checkInStartMinute': _checkInStart!.minute,
         'checkInEndHour': _checkInEnd!.hour,
         'checkInEndMinute': _checkInEnd!.minute,
         'disabledDays': _disabledDays,
+        'announcementDetail': _announcementController.text.trim(),
         'lastUpdated': FieldValue.serverTimestamp(),
         'updatedBy': _auth.currentUser?.uid,
         'updatedByEmail': _auth.currentUser?.email,
@@ -241,10 +249,11 @@ class _EditCheckPageState extends State<EditCheckPage>
         'adminEmail': _auth.currentUser?.email,
         'action': 'update_checkin_settings',
         'disabledDays': _getDisabledDayNames(),
+        'hasAnnouncement': _announcementController.text.isNotEmpty,
       });
 
       // แสดงข้อความสำเร็จ (ไม่ขึ้น error)
-      _showSuccessSnackBar('✅ บันทึกการตั้งค่าเช็คชื่อสำเร็จ');
+      _showSuccessSnackBar('✅ บันทึกการตั้งค่าเช็คชื่อและประกาศสำเร็จ');
 
       // โหลดข้อมูลใหม่เพื่ออัพเดท
       await _loadData();
@@ -275,8 +284,28 @@ class _EditCheckPageState extends State<EditCheckPage>
   }
 
   Future<void> _addHoliday() async {
-    if (_holidayNameController.text.isEmpty || _selectedHolidayDate == null) {
-      _showErrorSnackBar('❌ กรุณากรอกชื่อวันหยุดและเลือกวันที่');
+    // ตรวจสอบข้อมูล
+    if (_holidayNameController.text.trim().isEmpty) {
+      _showErrorSnackBar('❌ กรุณากรอกชื่อวันหยุด');
+      return;
+    }
+
+    if (_selectedHolidayDate == null) {
+      _showErrorSnackBar('❌ กรุณาเลือกวันที่');
+      return;
+    }
+
+    // ตรวจสอบซ้ำ
+    final isDuplicate = _holidays.any((holiday) {
+      final holidayDate = holiday['date'] as DateTime?;
+      if (holidayDate == null) return false;
+      return holidayDate.year == _selectedHolidayDate!.year &&
+          holidayDate.month == _selectedHolidayDate!.month &&
+          holidayDate.day == _selectedHolidayDate!.day;
+    });
+
+    if (isDuplicate) {
+      _showErrorSnackBar('❌ วันนี้มีวันหยุดอยู่แล้ว');
       return;
     }
 
@@ -286,7 +315,7 @@ class _EditCheckPageState extends State<EditCheckPage>
       // เพิ่มวันหยุด
       await _firestore.collection('holidays').add({
         'name': _holidayNameController.text.trim(),
-        'date': _selectedHolidayDate,
+        'date': Timestamp.fromDate(_selectedHolidayDate!),
         'createdAt': FieldValue.serverTimestamp(),
         'createdBy': _auth.currentUser?.uid,
         'createdByEmail': _auth.currentUser?.email,
@@ -308,18 +337,12 @@ class _EditCheckPageState extends State<EditCheckPage>
       // โหลดข้อมูลใหม่
       await _loadData();
 
-      // แสดงข้อความสำเร็จ (ไม่ขึ้น error)
+      // แสดงข้อความสำเร็จ
       _showSuccessSnackBar('✅ เพิ่มวันหยุดสำเร็จ');
     } on FirebaseException catch (e) {
-      if (e.code == 'permission-denied') {
-        // ถ้าไม่มีสิทธิ์บันทึก log แต่เพิ่มวันหยุดสำเร็จแล้ว
-        _holidayNameController.clear();
-        setState(() => _selectedHolidayDate = null);
-        await _loadData();
-        _showSuccessSnackBar('✅ เพิ่มวันหยุดสำเร็จ (แต่ไม่มีสิทธิ์บันทึก Log)');
-      } else {
-        _showErrorSnackBar('❌ เกิดข้อผิดพลาด: ${e.message}');
-      }
+      print('FirebaseException: ${e.code} - ${e.message}');
+      _showErrorSnackBar(
+          '❌ เกิดข้อผิดพลาด: ${e.message ?? 'ไม่สามารถเพิ่มวันหยุดได้'}');
     } catch (e) {
       print('Error adding holiday: $e');
       _showErrorSnackBar('❌ เกิดข้อผิดพลาด: ${e.toString()}');
@@ -741,6 +764,13 @@ class _EditCheckPageState extends State<EditCheckPage>
                           ),
                           const SizedBox(height: 25),
 
+                          // Announcement Section (เหลือช่องเดียว)
+                          SlideTransition(
+                            position: _slideAnimation,
+                            child: _buildAnnouncementSection(),
+                          ),
+                          const SizedBox(height: 25),
+
                           // Check-in Time Settings
                           SlideTransition(
                             position: _slideAnimation,
@@ -875,7 +905,7 @@ class _EditCheckPageState extends State<EditCheckPage>
           ),
           const SizedBox(height: 8),
           Text(
-            'ปรับแต่งเวลาการเช็คชื่อ และวันหยุดพิเศษ',
+            'ปรับแต่งเวลาการเช็คชื่อ ประกาศ และวันหยุดพิเศษ',
             style: TextStyle(
               fontSize: 14,
               color: Colors.grey[600],
@@ -908,6 +938,125 @@ class _EditCheckPageState extends State<EditCheckPage>
                     fontSize: 12,
                     color: Color(0xFF6A1B9A),
                     fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ส่วนของประกาศ (เหลือช่องเดียว)
+  Widget _buildAnnouncementSection() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(25),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.15),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+            spreadRadius: 0,
+          ),
+        ],
+        border: Border.all(color: const Color(0xFFF3E5F5), width: 2),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.blue.withOpacity(0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.campaign_rounded,
+                  color: Colors.blue,
+                  size: 26,
+                ),
+              ),
+              const SizedBox(width: 12),
+              const Text(
+                'ประกาศ',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.blue,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+
+          // ข้อความประกาศ (ช่องเดียว)
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'ข้อความประกาศ',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Colors.grey,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.grey[300]!),
+                  color: Colors.white,
+                ),
+                child: TextField(
+                  controller: _announcementController,
+                  style: const TextStyle(fontSize: 16),
+                  maxLines: 8,
+                  decoration: InputDecoration(
+                    hintText: 'ใส่ข้อความประกาศที่นี่...',
+                    hintStyle: TextStyle(color: Colors.grey[400]),
+                    border: InputBorder.none,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 15,
+                      vertical: 15,
+                    ),
+                    prefixIcon: Icon(Icons.description_rounded,
+                        color: Colors.blue, size: 22),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 15),
+
+          // คำแนะนำ
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.blue.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.blue.withOpacity(0.2)),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.info_rounded, color: Colors.blue, size: 20),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'ประกาศจะแสดงบนหน้าแรกของแอปพลิเคชัน',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.blue[800],
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ),
               ],
@@ -1455,7 +1604,7 @@ class _EditCheckPageState extends State<EditCheckPage>
                 ),
                 const SizedBox(height: 15),
 
-                // Date Picker
+                // Date Picker (แก้ไขให้ไม่มีสีแดง)
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -1479,7 +1628,7 @@ class _EditCheckPageState extends State<EditCheckPage>
                             return Theme(
                               data: ThemeData.light().copyWith(
                                 colorScheme: const ColorScheme.light(
-                                  primary: Colors.red,
+                                  primary: Color(0xFF6A1B9A),
                                   onPrimary: Colors.white,
                                   surface: Colors.white,
                                   onSurface: Colors.black,
@@ -1507,7 +1656,7 @@ class _EditCheckPageState extends State<EditCheckPage>
                         child: Row(
                           children: [
                             Icon(Icons.calendar_today_rounded,
-                                color: Colors.red, size: 22),
+                                color: const Color(0xFF6A1B9A), size: 22),
                             const SizedBox(width: 12),
                             Expanded(
                               child: Text(
@@ -1524,7 +1673,7 @@ class _EditCheckPageState extends State<EditCheckPage>
                               ),
                             ),
                             const Icon(Icons.arrow_drop_down_rounded,
-                                color: Colors.red),
+                                color: Color(0xFF6A1B9A)),
                           ],
                         ),
                       ),
@@ -1759,6 +1908,15 @@ class _EditCheckPageState extends State<EditCheckPage>
             label: 'วันหยุดพิเศษ',
             value: '${_holidays.length} วัน',
             color: Colors.red,
+          ),
+          const SizedBox(height: 12),
+          _buildStatRow(
+            icon: Icons.campaign_rounded,
+            label: 'สถานะประกาศ',
+            value: _announcementController.text.isNotEmpty
+                ? 'มีประกาศ'
+                : 'ไม่มีประกาศ',
+            color: Colors.blue,
           ),
           const SizedBox(height: 12),
           _buildStatRow(
