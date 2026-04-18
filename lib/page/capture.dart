@@ -67,9 +67,9 @@ class _CapturePageState extends State<CapturePage>
   // ================ ANDROID OPTIMIZATIONS ================
   static const ResolutionPreset CAMERA_RESOLUTION = ResolutionPreset.medium;
   static const int ANDROID_THREADS = 4;
-  static const int FRAME_SKIP = 1; // ประมวลผลทุกเฟรม
-  static const int MIN_PROCESS_INTERVAL_MS = 80; // ~12 FPS
-  static const bool USE_FAST_MODE = false; // ใช้ accurate mode เพื่อคุณภาพ
+  static const int FRAME_SKIP = 1;
+  static const int MIN_PROCESS_INTERVAL_MS = 80;
+  static const bool USE_FAST_MODE = false;
 
   // ================ UI CONSTANTS ================
   static const double METRICS_BAR_HEIGHT = 4.0;
@@ -158,10 +158,6 @@ class _CapturePageState extends State<CapturePage>
   double _screenWidth = 720.0;
   double _screenHeight = 1280.0;
   bool _isSmallScreen = false;
-
-  // ================ PERFORMANCE CACHING ================
-  img.Image? _cachedPreviewImage;
-  bool _previewNeedsUpdate = true;
 
   @override
   void initState() {
@@ -259,19 +255,17 @@ class _CapturePageState extends State<CapturePage>
 
       await _cameraController!.initialize();
 
-      // Android: ตั้งค่าให้ไม่มี flash effect
       if (!_isIos) {
         try {
           await _cameraController!.setExposureMode(ExposureMode.auto);
           await _cameraController!.setFocusMode(FocusMode.auto);
-          // ปิด flash โดยเด็ดขาด
           await _cameraController!.setFlashMode(FlashMode.off);
         } catch (e) {
           print('⚠️ Camera settings error: $e');
         }
       }
 
-      print('✅ กล้องพร้อม (Resolution: ${CAMERA_RESOLUTION.name})');
+      print('✅ กล้องพร้อม');
     } catch (e) {
       print('❌ Camera error: $e');
       rethrow;
@@ -280,7 +274,6 @@ class _CapturePageState extends State<CapturePage>
 
   Future<void> _initializeFaceDetector() async {
     try {
-      // Android ใช้ accurate mode เพื่อคุณภาพที่ดีขึ้น
       final performanceMode = USE_FAST_MODE
           ? FaceDetectorMode.fast
           : FaceDetectorMode.accurate;
@@ -294,7 +287,7 @@ class _CapturePageState extends State<CapturePage>
       );
 
       _faceDetector = FaceDetector(options: options);
-      print('✅ Face Detector พร้อม (Mode: ${USE_FAST_MODE ? "Fast" : "Accurate"})');
+      print('✅ Face Detector พร้อม');
     } catch (e) {
       print('❌ Face detector error: $e');
       rethrow;
@@ -319,7 +312,6 @@ class _CapturePageState extends State<CapturePage>
         throw Exception('ไม่พบไฟล์โมเดล');
       }
 
-      // Android ใช้ 4 threads + NNAPI
       final threads = _isIos ? 2 : ANDROID_THREADS;
 
       final interpreterOptions = InterpreterOptions()
@@ -436,7 +428,7 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ================ CONVERT YUV420 TO RGB (OPTIMIZED) ================
+  // ================ CONVERT YUV420 TO RGB ================
   img.Image? _yuv420ToImage(CameraImage cameraImage) {
     try {
       final int width = cameraImage.width;
@@ -466,7 +458,6 @@ class _CapturePageState extends State<CapturePage>
           final int U = uPlane.bytes[uvIndex] & 0xFF;
           final int V = vPlane.bytes[uvIndex] & 0xFF;
           
-          // YUV to RGB conversion (ITU-R BT.601)
           int R = (Y + 1.402 * (V - 128)).round();
           int G = (Y - 0.344 * (U - 128) - 0.714 * (V - 128)).round();
           int B = (Y + 1.772 * (U - 128)).round();
@@ -486,8 +477,8 @@ class _CapturePageState extends State<CapturePage>
     }
   }
   
-  // ================ CROP FACE FROM IMAGE (OPTIMIZED) ================
-  img.Image? _cropAndPreprocessImage(img.Image image, Face face) async {
+  // ================ CROP FACE FROM IMAGE (FIXED) ================
+  img.Image? _cropAndPreprocessImage(img.Image image, Face face) {
     try {
       final bbox = face.boundingBox;
       
@@ -504,6 +495,11 @@ class _CapturePageState extends State<CapturePage>
       right = right.clamp(left + 1, image.width);
       bottom = bottom.clamp(top + 1, image.height);
       
+      if (right <= left || bottom <= top) {
+        print('❌ Invalid crop dimensions');
+        return null;
+      }
+      
       final croppedImage = img.copyCrop(
         image,
         x: left,
@@ -511,6 +507,11 @@ class _CapturePageState extends State<CapturePage>
         width: right - left,
         height: bottom - top,
       );
+      
+      if (croppedImage == null) {
+        print('❌ Failed to crop image');
+        return null;
+      }
       
       final resizedImage = img.copyResize(
         croppedImage,
@@ -526,22 +527,42 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
+  // ================ CREATE INPUT IMAGE FOR FACE DETECTION ================
+  InputImage? _createInputImageFromYUV(CameraImage cameraImage) {
+    try {
+      final imageBytes = _concatenatePlanes(cameraImage.planes);
+      
+      final inputImageData = InputImageMetadata(
+        size: Size(cameraImage.width.toDouble(), cameraImage.height.toDouble()),
+        rotation: InputImageRotation.rotation270deg,
+        format: InputImageFormat.yuv420,
+        bytesPerRow: cameraImage.planes[0].bytesPerRow,
+      );
+      
+      return InputImage.fromBytes(
+        bytes: imageBytes,
+        metadata: inputImageData,
+      );
+    } catch (e) {
+      print('❌ Error creating InputImage: $e');
+      return null;
+    }
+  }
+
+  Uint8List _concatenatePlanes(List<Plane> planes) {
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final Plane plane in planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    return allBytes.done().buffer.asUint8List();
+  }
+
   // ================ PROCESS CAMERA IMAGE ================
   Future<void> _processCameraImage(CameraImage cameraImage) async {
     if (_isProcessing) return;
     _isProcessing = true;
     
     try {
-      // แปลง YUV เป็น RGB
-      final originalImage = _yuv420ToImage(cameraImage);
-      if (originalImage == null) return;
-      
-      // ตรวจจับใบหน้า (ใช้ bounding box จาก ML Kit โดยตรง)
-      // เราต้องการเฉพาะ bounding box เท่านั้น ไม่ต้องใช้ภาพ RGB ในการตรวจจับอีก
-      // แต่ ML Kit ต้องการ InputImage ซึ่งต้องสร้างจาก bytes
-      // เพื่อประสิทธิภาพ เราใช้ face detection โดยตรงจาก ML Kit
-      
-      // สร้าง InputImage จาก YUV bytes โดยตรง
       final inputImage = _createInputImageFromYUV(cameraImage);
       if (inputImage == null) return;
       
@@ -606,8 +627,10 @@ class _CapturePageState extends State<CapturePage>
           if (_stableFrameCount >= REQUIRED_STABLE_FRAMES &&
               !_isCapturing &&
               _enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-            // ใช้ภาพที่แปลงแล้วในการ capture
-            await _captureFromImage(originalImage, face);
+            final originalImage = _yuv420ToImage(cameraImage);
+            if (originalImage != null) {
+              await _captureFromImage(originalImage, face);
+            }
           }
         } else {
           setState(() {
@@ -635,37 +658,7 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // สร้าง InputImage จาก YUV bytes โดยตรง (ไม่ต้องแปลงเป็น RGB)
-  InputImage? _createInputImageFromYUV(CameraImage cameraImage) {
-    try {
-      final imageBytes = _concatenatePlanes(cameraImage.planes);
-      
-      final inputImageData = InputImageMetadata(
-        size: Size(cameraImage.width.toDouble(), cameraImage.height.toDouble()),
-        rotation: InputImageRotation.rotation270deg, // Android
-        format: InputImageFormat.yuv420,
-        bytesPerRow: cameraImage.planes[0].bytesPerRow,
-      );
-      
-      return InputImage.fromBytes(
-        bytes: imageBytes,
-        metadata: inputImageData,
-      );
-    } catch (e) {
-      print('❌ Error creating InputImage: $e');
-      return null;
-    }
-  }
-
-  Uint8List _concatenatePlanes(List<Plane> planes) {
-    final WriteBuffer allBytes = WriteBuffer();
-    for (final Plane plane in planes) {
-      allBytes.putUint8List(plane.bytes);
-    }
-    return allBytes.done().buffer.asUint8List();
-  }
-
-  // ================ CAPTURE FROM IMAGE (NO FLASH) ================
+  // ================ CAPTURE FROM IMAGE ================
   Future<void> _captureFromImage(img.Image image, Face face) async {
     if (_isCapturing || _captureComplete) return;
     
@@ -676,7 +669,7 @@ class _CapturePageState extends State<CapturePage>
     });
     
     try {
-      final img.Image? processedImage = await _cropAndPreprocessImage(image, face);
+      final img.Image? processedImage = _cropAndPreprocessImage(image, face);
       
       if (processedImage == null) {
         throw Exception('ประมวลผลใบหน้าไม่สำเร็จ');
@@ -1067,18 +1060,18 @@ class _CapturePageState extends State<CapturePage>
 
   // ================ IMAGE ENHANCEMENT ================
   img.Image _enhanceImageQuality(img.Image image) {
-    final sharpened = img.copyResize(image,
+    final enhanced = img.copyResize(image,
         width: image.width,
         height: image.height,
         interpolation: img.Interpolation.linear);
 
-    for (var pixel in sharpened) {
+    for (var pixel in enhanced) {
       pixel.r = (pixel.r * 1.1).clamp(0, 255).toInt();
       pixel.g = (pixel.g * 1.1).clamp(0, 255).toInt();
       pixel.b = (pixel.b * 1.1).clamp(0, 255).toInt();
     }
 
-    return sharpened;
+    return enhanced;
   }
 
   // ================ EXTRACT EMBEDDING ================
@@ -1591,7 +1584,6 @@ class _CapturePageState extends State<CapturePage>
       body: SafeArea(
         child: Stack(
           children: [
-            // Camera Preview - ไม่มี flash effect
             if (_isCameraReady && _cameraController != null)
               Positioned.fill(
                 child: CameraPreview(_cameraController!),
@@ -1599,7 +1591,6 @@ class _CapturePageState extends State<CapturePage>
             else
               _buildLoadingView(),
 
-            // Overlay UI
             Positioned.fill(
               child: Container(
                 decoration: BoxDecoration(
@@ -1629,7 +1620,6 @@ class _CapturePageState extends State<CapturePage>
               ),
             ),
 
-            // Processing Overlays - ไม่มี white flash
             if (_isCapturing || _isSaving) _buildProcessingOverlay(),
             if (_showGuide) _buildSuccessGuide(),
             if (_successController.isAnimating) _buildSuccessAnimation(),
