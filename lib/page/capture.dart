@@ -1,1945 +1,1836 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'dart:async';
-import 'dart:io';
-import 'dart:math';
-import 'dart:typed_data';
+import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
-import 'package:camera/camera.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
-import 'package:uuid/uuid.dart';
-import 'package:image/image.dart' as img;
-import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:flutter/services.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:ready/page/missed_personal.dart';
+import 'package:workmanager/workmanager.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'package:timezone/data/latest.dart' as tz_data;
+import 'package:ready/page/Checkin_Match.dart';
+import 'package:ready/page/Hat.dart';
+import 'package:ready/page/Hat_2.dart';
+import 'package:ready/page/Home.dart';
+import 'package:ready/page/Home_admin.dart';
+import 'package:ready/page/Level_Up.dart';
+import 'package:ready/page/Time.dart';
+import 'package:ready/page/account.dart';
+import 'package:ready/page/capture.dart';
+import 'package:ready/page/edit_personal.dart';
+import 'package:ready/page/edit_student.dart';
+import 'package:ready/page/home_personal.dart';
+import 'package:ready/page/new_password.dart';
+import 'package:ready/page/pdpa.dart';
+import 'package:ready/page/register.dart';
+import 'package:ready/page/edit_check.dart';
+import 'package:ready/page/reset_Pass.dart';
+import 'package:ready/page/system/screen.dart';
+import 'firebase_options.dart';
+import 'page/login.dart';
+import 'package:ready/page/account_personal.dart';
+import 'package:intl/intl.dart';
 
-class CapturePage extends StatefulWidget {
-  const CapturePage({super.key});
+// ==================== GLOBAL VARIABLES ====================
 
-  @override
-  State<CapturePage> createState() => _CapturePageState();
+// Notifications
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+    FlutterLocalNotificationsPlugin();
+
+// Settings Listeners
+StreamSubscription<DocumentSnapshot>? _checkinSettingsSubscription;
+StreamSubscription<QuerySnapshot>? _holidaysSubscription;
+StreamSubscription<QuerySnapshot>? _specialClassesSubscription;
+Map<String, dynamic>? _currentSettings;
+bool _isScheduling = false;
+
+// ==================== MISSED COUNT SYSTEM VARIABLES ====================
+
+// ข้อมูลการตั้งค่า
+TimeOfDay _checkInStart = const TimeOfDay(hour: 7, minute: 45);
+TimeOfDay _checkInEnd = const TimeOfDay(hour: 4, minute: 15);
+int _maxCheckInsPerDay = 1;
+List<bool> _disabledDays = List.filled(7, false);
+
+// ข้อมูลวันหยุดและชั้นเรียนพิเศษ
+List<Map<String, dynamic>> _holidays = [];
+List<Map<String, dynamic>> _specialClasses = [];
+
+// สถานะการตรวจสอบตาม user
+final Map<String, DateTime> _lastMissedCheckDateByUser = {};
+final Map<String, bool> _isMissedCheckedTodayByUser = {};
+
+// ✅ Cache สำหรับข้อมูลผู้ใช้ (จาก users collection)
+final Map<String, Map<String, dynamic>> _userDataCache = {};
+
+// Timer สำหรับตรวจสอบ missed count (ตอนแอปทำงาน)
+Timer? _missedCheckTimer;
+Timer? _iosBackgroundSimulatorTimer;
+
+// สถานะการทำงาน
+bool _isMissedSystemRunning = false;
+DateTime? _lastFullCheckTime;
+bool _isAppInForeground = true;
+
+// ==================== FIREBASE MESSAGING BACKGROUND HANDLER ====================
+
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  print("📨 [Background] Message: ${message.messageId}");
+
+  // จัดการ silent notification สำหรับ iOS
+  if (message.data['type'] == 'check_missed') {
+    print("🔍 [iOS Background] Checking missed count from push");
+    await _checkAllUsersMissedCount(isBackground: true);
+  }
+
+  // แสดง notification เมื่อได้รับ message ตอนแอปปิด
+  if (message.notification != null) {
+    await _showLocalNotification(
+      id: DateTime.now().millisecond,
+      title: message.notification?.title ?? 'การแจ้งเตือน',
+      body: message.notification?.body ?? '',
+      payload: message.data.toString(),
+    );
+  }
 }
 
-class _CapturePageState extends State<CapturePage>
-    with WidgetsBindingObserver, TickerProviderStateMixin {
-  // ================ MobileFaceNet Configuration ================
-  static const String MODEL_NAME = "mobilefacenet";
-  static const String MODEL_ASSET_PATH = "assets/models/mobilefacenet.tflite";
-  static const String EMBEDDING_VERSION = "v2.0-faceid";
-  static const int FACE_CROP_SIZE = 112;
-  static const double FACE_PADDING_RATIO = 0.25;
+// ==================== WORKMANAGER CALLBACK (Android Only) ====================
 
-  // ================ FACE ID THRESHOLDS ================
-  static const double MIN_FACE_QUALITY = 0.65;
-  static const double MIN_FACE_STABILITY = 0.70;
-  static const double MIN_EMBEDDING_QUALITY = 0.60;
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((task, inputData) async {
+    print("📱 [WorkManager] Task: $task");
 
-  static const double MAX_HEAD_YAW = 25.0;
-  static const double MAX_HEAD_PITCH = 20.0;
-  static const double MAX_HEAD_ROLL = 18.0;
+    // iOS ไม่ควรเข้า WorkManager
+    if (Platform.isIOS) {
+      print("📱 iOS: Skipping WorkManager task");
+      return Future.value(true);
+    }
 
-  static const double MIN_EYE_OPENNESS = 0.4;
-  static const int REQUIRED_STABLE_FRAMES = 2;
+    try {
+      await Firebase.initializeApp(
+          options: DefaultFirebaseOptions.currentPlatform);
 
-  static const double MIN_FACE_AREA_RATIO = 0.04;
-  static const double MAX_FACE_AREA_RATIO = 0.50;
-  static const double IDEAL_MIN_FACE_AREA = 0.08;
-  static const double IDEAL_MAX_FACE_AREA = 0.35;
+      switch (task) {
+        case 'checkin_notification_task':
+          print("📅 Running check-in notification task...");
+          await _checkAndScheduleNotifications();
+          break;
 
-  static const double MIN_EYE_ASYMMETRY = 0.005;
-  static const double MAX_SMILING_PROBABILITY = 0.7;
-  static const int REQUIRED_LIVENESS_CHECKS = 1;
+        case 'missed_check_task':
+          print("🔍 Running missed count check task...");
+          await _checkAllUsersMissedCount(isBackground: true);
+          break;
 
-  // ================ ENROLLMENT ================
-  static const int MIN_ENROLLMENT_EMBEDDINGS = 2;
-  static const double MIN_ENROLLMENT_CONSISTENCY = 0.75;
+        case 'daily_missed_summary':
+          print("📊 Running daily missed summary task...");
+          await _sendDailyMissedSummary();
+          break;
 
-  // ================ BEST FACE SELECTION ================
-  static const int MAX_CAPTURE_ATTEMPTS = 10;
-  static const double GOOD_FACE_THRESHOLD = 0.75;
-  static const double EXCELLENT_FACE_THRESHOLD = 0.85;
-  static const int MAX_BEST_FACES_STORAGE = 5;
+        default:
+          print("⚠️ Unknown task: $task");
+      }
+    } catch (e, stackTrace) {
+      print('❌ [WorkManager] Error: $e');
+      await _logSystemError(
+          'WorkManager Error', e.toString(), stackTrace.toString());
+    }
 
-  // ================ INTELLIGENT ENHANCEMENTS ================
-  static const bool ENABLE_ADAPTIVE_THRESHOLDS = true;
-  static const bool ENABLE_QUALITY_BOOST = true;
-  static const double MIN_ACCEPTABLE_QUALITY = 0.55;
+    return Future.value(true);
+  });
+}
 
-  // ================ CAMERA CONFIG ================
-  static const ResolutionPreset CAMERA_RESOLUTION = ResolutionPreset.medium;
-  static const int ANDROID_THREADS = 4;
-  static const int IOS_THREADS = 2;
-  static const int DETECTION_DELAY_MS = 500;
+// ==================== MAIN FUNCTION ====================
 
-  // ================ UI CONSTANTS ================
-  static const double METRICS_BAR_HEIGHT = 4.0;
-  static const double CORNER_SIZE = 30.0;
-  static const double CORNER_THICKNESS = 4.0;
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
 
-  // ================ Camera & Detection ================
-  CameraController? _cameraController;
-  bool _isCameraReady = false;
-  FaceDetector? _faceDetector;
-  Face? _currentFace;
-  List<Face> _faceHistory = [];
+  try {
+    print(
+        '\n🚀 ===== เริ่มต้นระบบ (Platform: ${Platform.operatingSystem}) =====');
 
-  // ================ MobileFaceNet Model ================
-  Interpreter? _faceModel;
-  bool _modelLoaded = false;
-  bool _modelLoading = false;
-  int _actualOutputDimension = 0;
+    // Initialize Firebase
+    await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform);
+    print('✅ Firebase initialized');
 
-  // ================ Quality Metrics ================
-  double _faceQuality = 0.0;
-  double _faceStability = 0.0;
-  int _stableFrameCount = 0;
-  bool _livenessPassed = false;
+    // Initialize timezone
+    tz_data.initializeTimeZones();
+    print('✅ Timezone initialized');
 
-  // ================ ENHANCED METRICS ================
-  double _lightingScore = 0.0;
-  double _sharpnessScore = 0.0;
-  double _poseScore = 0.0;
-  double _faceSymmetry = 0.0;
+    // Setup Notifications (Platform specific)
+    await _setupNotifications();
+    print('✅ Notifications setup completed');
 
-  // ================ INTELLIGENT TRACKING ================
-  List<double> _qualityHistory = [];
-  Map<String, String> _improvementTips = {};
-  String _currentGuidance = '';
-  double _adaptiveThreshold = 0.65;
-  int _consecutiveLowQuality = 0;
-  bool _isStruggling = false;
+    // Setup Firebase Messaging
+    await _setupFirebaseMessaging();
+    print('✅ Firebase Messaging setup completed');
 
-  // ================ PLATFORM ================
-  bool _isIos = false;
+    // ตั้งค่า Firestore Settings
+    FirebaseFirestore.instance.settings = const Settings(
+      persistenceEnabled: true,
+      cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
+    );
+    print('✅ Firestore settings configured');
 
-  // ================ BEST FACE STORAGE ================
-  List<Map<String, dynamic>> _allCapturedFaces = [];
-  List<Map<String, dynamic>> _bestFaces = [];
-  Map<String, dynamic>? _absoluteBestFace;
-  double _absoluteBestQuality = 0.0;
-  int _captureAttempts = 0;
-  bool _hasGoodFaces = false;
+    // ตั้งค่า Listener สำหรับข้อมูลที่เกี่ยวข้อง
+    await _setupAllListeners();
+    print('✅ All listeners setup completed');
 
-  // ================ ENROLLMENT ================
-  List<Map<String, dynamic>> _enrolledEmbeddings = [];
-  int _enrollmentCount = 0;
-  double _enrollmentConsistency = 0.0;
+    // Setup Background Tasks (แยกตาม Platform)
+    await _setupBackgroundTasks();
+    print('✅ Background tasks setup completed');
 
-  // ================ Capture State ================
-  bool _isCapturing = false;
-  bool _isSaving = false;
-  bool _captureComplete = false;
-  bool _showGuide = false;
-  bool _isRetryMode = false;
-  bool _isDetecting = false;
-  Timer? _detectionTimer;
+    // โหลดข้อมูลเริ่มต้น
+    await _loadInitialData();
+    print('✅ Initial data loaded');
 
-  // ================ Status Messages ================
-  String _statusMessage = 'กำลังเตรียมระบบ...';
-  String _instructionMessage = 'กรุณารอสักครู่';
-  String _detailMessage = '';
+    // เริ่มระบบ Missed Count (Platform aware)
+    _initializeMissedCountSystem();
+    print('✅ Missed Count System initialized');
 
-  // ================ Firebase ================
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-  final Uuid _uuid = const Uuid();
+    // ตรวจสอบและตั้งเวลาการแจ้งเตือนครั้งแรก
+    await _checkAndScheduleNotifications();
+    print('✅ Initial notifications scheduled');
 
-  // ================ UI Controllers ================
-  late AnimationController _pulseController;
-  late Animation<double> _pulseAnimation;
-  late AnimationController _successController;
+    // ตั้งค่า App Lifecycle Listener (สำคัญสำหรับ iOS)
+    _setupAppLifecycleListener();
+    print('✅ App lifecycle listener setup');
 
-  // ================ Screen Dimensions ================
-  double _screenWidth = 720.0;
-  double _screenHeight = 1280.0;
-  bool _isSmallScreen = false;
+    print('✅ ===== ระบบพร้อมทำงานบน ${Platform.operatingSystem} =====\n');
+  } catch (e, stackTrace) {
+    print('❌ [FATAL] Error initializing app: $e');
+    print('📚 Stack trace: $stackTrace');
+
+    try {
+      await _logSystemError(
+          'Main Initialization Error', e.toString(), stackTrace.toString());
+    } catch (logError) {
+      print('❌ Could not log error: $logError');
+    }
+  }
+
+  runApp(const FaceApp());
+}
+
+// ==================== SETUP FUNCTIONS ====================
+
+/// ตั้งค่า App Lifecycle Listener (จำเป็นสำหรับ iOS)
+void _setupAppLifecycleListener() {
+  WidgetsBinding.instance.addObserver(
+    AppLifecycleObserver(
+      onResume: () {
+        print('📱 App resumed to foreground');
+        _isAppInForeground = true;
+        // ตรวจสอบ missed count ทันทีเมื่อกลับเข้าแอป
+        _checkAllUsersMissedCount(isBackground: false);
+
+        // iOS: รีสตาร์ท background simulator เมื่อแอปกลับมา foreground
+        if (Platform.isIOS) {
+          _startIOSBackgroundSimulator();
+        }
+      },
+      onPause: () {
+        print('📱 App paused to background');
+        _isAppInForeground = false;
+
+        // iOS: หยุด background simulator ชั่วคราว
+        if (Platform.isIOS) {
+          _iosBackgroundSimulatorTimer?.cancel();
+        }
+      },
+    ),
+  );
+}
+
+/// App Lifecycle Observer
+class AppLifecycleObserver with WidgetsBindingObserver {
+  final VoidCallback onResume;
+  final VoidCallback onPause;
+
+  AppLifecycleObserver({required this.onResume, required this.onPause});
 
   @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        onResume();
+        break;
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.paused:
+        onPause();
+        break;
+      case AppLifecycleState.detached:
+        break;
+      case AppLifecycleState.hidden:
+        break;
+    }
+  }
+}
 
-    _isIos = Platform.isIOS;
-    print('📱 Platform: ${_isIos ? 'iOS' : 'Android'}');
+/// ตั้งค่า Notification ทั้งหมด (รองรับทั้ง iOS และ Android)
+Future<void> _setupNotifications() async {
+  try {
+    // ขอสิทธิ์การแจ้งเตือน (ปรับตาม Platform)
+    final messaging = FirebaseMessaging.instance;
 
-    _pulseController = AnimationController(
-      duration: const Duration(milliseconds: 1500),
-      vsync: this,
-    )..repeat(reverse: true);
+    NotificationSettings settings;
 
-    _pulseAnimation = Tween<double>(begin: 0.96, end: 1.0).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    if (Platform.isIOS) {
+      // iOS specific permissions
+      settings = await messaging.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+        provisional: true,
+        announcement: true,
+        carPlay: false,
+        criticalAlert: true,
+      );
+    } else {
+      // Android permissions
+      settings = await messaging.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+    }
+
+    print('📱 Notification permission: ${settings.authorizationStatus}');
+
+    // ตั้งค่า Local Notifications แยกตาม Platform
+    AndroidInitializationSettings androidSettings;
+    DarwinInitializationSettings iosSettings;
+
+    if (Platform.isAndroid) {
+      androidSettings =
+          const AndroidInitializationSettings('@mipmap/ic_launcher');
+    } else {
+      androidSettings =
+          const AndroidInitializationSettings('@mipmap/ic_launcher');
+    }
+
+    if (Platform.isIOS) {
+      iosSettings = DarwinInitializationSettings(
+        requestAlertPermission: true,
+        requestBadgePermission: true,
+        requestSoundPermission: true,
+        onDidReceiveLocalNotification: _onDidReceiveLocalNotification,
+        defaultPresentAlert: true,
+        defaultPresentBadge: true,
+        defaultPresentSound: true,
+      );
+    } else {
+      iosSettings = const DarwinInitializationSettings();
+    }
+
+    final InitializationSettings initSettings = InitializationSettings(
+      android: androidSettings,
+      iOS: iosSettings,
     );
 
-    _successController = AnimationController(
-      duration: const Duration(milliseconds: 800),
-      vsync: this,
-    );
-
-    _initializeSystem();
-  }
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    _screenWidth = MediaQuery.of(context).size.width;
-    _screenHeight = MediaQuery.of(context).size.height;
-    _isSmallScreen = _screenHeight < 700;
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _detectionTimer?.cancel();
-    _cameraController?.dispose();
-    _faceDetector?.close();
-    _faceModel?.close();
-    _pulseController.dispose();
-    _successController.dispose();
-    super.dispose();
-  }
-
-  // ================ SYSTEM INITIALIZATION ================
-  Future<void> _initializeSystem() async {
-    try {
-      print('🚀 เริ่มต้นระบบ Face ID...');
-
-      final currentUser = _auth.currentUser;
-      if (currentUser == null) {
-        _updateStatus('⚠️ กรุณาเข้าสู่ระบบ', '', '');
-        return;
-      }
-
-      await _initializeCamera();
-      await _initializeFaceDetector();
-      await _loadMobileFaceNetModel();
-
-      if (mounted) {
-        setState(() {
-          _isCameraReady = true;
-          _statusMessage =
-              _modelLoaded ? '🆔 พร้อมบันทึก Face ID' : '⚠️ โหลดโมเดลไม่สำเร็จ';
-        });
-      }
-
-      if (_modelLoaded) {
-        _startDetection();
-      }
-    } catch (e) {
-      print('❌ System error: $e');
-      _updateStatus('❌ เกิดข้อผิดพลาด', 'กรุณาเปิดแอปใหม่', '');
-    }
-  }
-
-  Future<void> _initializeCamera() async {
-    try {
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) throw Exception('ไม่พบกล้อง');
-
-      final frontCamera = cameras.firstWhere(
-        (camera) => camera.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
-      );
-
-      _cameraController = CameraController(
-        frontCamera,
-        CAMERA_RESOLUTION,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg,
-      );
-
-      await _cameraController!.initialize();
-
-      try {
-        await _cameraController!.setExposureMode(ExposureMode.auto);
-        await _cameraController!.setFocusMode(FocusMode.auto);
-        await _cameraController!.setFlashMode(FlashMode.off);
-      } catch (e) {
-        print('⚠️ Camera settings error: $e');
-      }
-
-      print('✅ กล้องพร้อม');
-    } catch (e) {
-      print('❌ Camera error: $e');
-      rethrow;
-    }
-  }
-
-  Future<void> _initializeFaceDetector() async {
-    try {
-      final options = FaceDetectorOptions(
-        enableLandmarks: true,
-        enableClassification: true,
-        enableTracking: true,
-        minFaceSize: 0.15,
-        performanceMode: FaceDetectorMode.accurate,
-      );
-
-      _faceDetector = FaceDetector(options: options);
-      print('✅ Face Detector พร้อม');
-    } catch (e) {
-      print('❌ Face detector error: $e');
-      rethrow;
-    }
-  }
-
-  Future<void> _loadMobileFaceNetModel() async {
-    if (_modelLoading) return;
-
-    setState(() {
-      _modelLoading = true;
-      _statusMessage = '🔄 กำลังโหลดโมเดล...';
-    });
-
-    try {
-      print('🔄 โหลดโมเดล MobileFaceNet...');
-
-      try {
-        await rootBundle.load(MODEL_ASSET_PATH);
-        print('✅ พบไฟล์โมเดล');
-      } catch (e) {
-        throw Exception('ไม่พบไฟล์โมเดล');
-      }
-
-      final threads = _isIos ? IOS_THREADS : ANDROID_THREADS;
-
-      final interpreterOptions = InterpreterOptions()
-        ..threads = threads
-        ..useNnApiForAndroid = true;
-
-      _faceModel = await Interpreter.fromAsset(
-        MODEL_ASSET_PATH,
-        options: interpreterOptions,
-      );
-
-      if (_faceModel == null) throw Exception('โมเดลเป็น null');
-
-      final outputTensor = _faceModel!.getOutputTensor(0);
-      final outputShape = outputTensor.shape;
-
-      int outputSize = 1;
-      for (var dim in outputShape) {
-        outputSize *= dim;
-      }
-      _actualOutputDimension = outputSize;
-
-      print('📊 Output Size: $_actualOutputDimension');
-      print('📊 Threads: $threads');
-
-      await _validateModelInference();
-      _modelLoaded = true;
-      print('✅ โหลดโมเดลสำเร็จ');
-    } catch (e) {
-      print('❌ โหลดโมเดลล้มเหลว: $e');
-      _modelLoaded = false;
-    } finally {
-      if (mounted) {
-        setState(() => _modelLoading = false);
-      }
-    }
-  }
-
-  Future<void> _validateModelInference() async {
-    if (_faceModel == null) return;
-
-    try {
-      final dummyInput = List.generate(
-        1,
-        (_) => List.generate(
-          FACE_CROP_SIZE,
-          (_) => List.generate(
-            FACE_CROP_SIZE,
-            (_) => List.filled(3, 0.0),
-          ),
-        ),
-      );
-
-      final outputBuffer = List<double>.filled(_actualOutputDimension, 0.0);
-      final output = outputBuffer.reshape([1, _actualOutputDimension]);
-
-      _faceModel!.run(dummyInput, output);
-      print('✅ โมเดลทำงานได้ปกติ');
-    } catch (e) {
-      print('❌ โมเดลทำงานผิดพลาด: $e');
-      rethrow;
-    }
-  }
-
-  // ================ DETECTION LOOP (ถ่ายรูปทีละครั้ง ไม่มีจอกระพริบ) ================
-  void _startDetection() {
-    _detectionTimer?.cancel();
-    _detectionTimer = Timer.periodic(
-      const Duration(milliseconds: DETECTION_DELAY_MS),
-      (timer) async {
-        if (_isDetecting || _isCapturing || _isSaving || _captureComplete) {
-          return;
-        }
-        if (_cameraController == null || !_cameraController!.value.isInitialized) {
-          return;
-        }
-        _isDetecting = true;
-        await _detectFace();
-        _isDetecting = false;
+    await flutterLocalNotificationsPlugin.initialize(
+      initSettings,
+      onDidReceiveNotificationResponse: (details) {
+        print('🔔 Notification tapped: ${details.payload}');
+        _handleNotificationTap(details.payload);
       },
     );
-  }
 
-  Future<void> _detectFace() async {
-    try {
-      // ถ่ายรูป (แต่ไม่มี animation ให้เห็น)
-      final XFile imageFile = await _cameraController!.takePicture();
-      
-      // ตรวจจับใบหน้า
-      final inputImage = InputImage.fromFilePath(imageFile.path);
-      final List<Face> faces = await _faceDetector!.processImage(inputImage);
-      
-      // ลบไฟล์ทิ้ง
-      await File(imageFile.path).delete();
-      
-      if (faces.isNotEmpty) {
-        final face = faces.first;
-        
-        setState(() {
-          _currentFace = face;
-        });
-        
-        _faceHistory.add(face);
-        if (_faceHistory.length > 3) _faceHistory.removeAt(0);
-        
-        final quality = _calculateIntelligentFaceQuality(face);
-        final stability = _calculateFaceStability();
-        final lighting = _calculateLightingScore(face);
-        final sharpness = _calculateSharpnessScore(face);
-        final pose = _calculatePoseScore(face);
-        final symmetry = _calculateFaceSymmetry(face);
-        final livenessResult = _checkLiveness(face);
-        
-        _qualityHistory.add(quality);
-        if (_qualityHistory.length > 10) _qualityHistory.removeAt(0);
-        
-        _analyzeAndImproveQuality();
-        
-        setState(() {
-          _faceQuality = quality;
-          _faceStability = stability;
-          _lightingScore = lighting;
-          _sharpnessScore = sharpness;
-          _poseScore = pose;
-          _faceSymmetry = symmetry;
-          _livenessPassed = livenessResult;
-          
-          if (ENABLE_ADAPTIVE_THRESHOLDS) {
-            _adaptiveThreshold = _calculateAdaptiveThreshold();
-          }
-        });
-        
-        _updateIntelligentFaceStatus();
-        
-        final currentThreshold =
-            ENABLE_ADAPTIVE_THRESHOLDS ? _adaptiveThreshold : MIN_FACE_QUALITY;
-        
-        if (quality >= currentThreshold &&
-            stability >= MIN_FACE_STABILITY &&
-            livenessResult) {
-          setState(() {
-            _stableFrameCount++;
-            _consecutiveLowQuality = 0;
-          });
-          
-          if (_stableFrameCount >= REQUIRED_STABLE_FRAMES &&
-              !_isCapturing &&
-              _enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-            await _captureFaceID(imageFile, face);
-          }
-        } else {
-          setState(() {
-            _stableFrameCount = 0;
-            if (quality < MIN_ACCEPTABLE_QUALITY) {
-              _consecutiveLowQuality++;
-            } else {
-              _consecutiveLowQuality = 0;
-            }
-          });
-        }
-        
-        _isStruggling = _consecutiveLowQuality > 5;
-      } else {
-        setState(() {
-          _currentFace = null;
-          _stableFrameCount = 0;
-        });
-        _updateStatus('👤 ไม่พบใบหน้า', 'วางใบหน้าในกรอบ', '');
-      }
-    } catch (e) {
-      print('Detection error: $e');
+    // สร้าง Notification Channel (Android only)
+    if (Platform.isAndroid) {
+      const AndroidNotificationChannel channel = AndroidNotificationChannel(
+        'checkin_channel',
+        'การแจ้งเตือนการเช็คชื่อ',
+        description: 'การแจ้งเตือนเกี่ยวกับเวลาเช็คชื่อและ missed count',
+        importance: Importance.high,
+        playSound: true,
+        enableVibration: true,
+        showBadge: true,
+      );
+
+      await flutterLocalNotificationsPlugin
+          .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>()
+          ?.createNotificationChannel(channel);
+      print('✅ Android notification channel created');
     }
+
+    print('✅ Notifications setup completed for ${Platform.operatingSystem}');
+  } catch (e, stackTrace) {
+    print('❌ Error setting up notifications: $e');
+    await _logSystemError(
+        'Setup Notifications Error', e.toString(), stackTrace.toString());
   }
+}
 
-  // ================ CAPTURE FACE ID ================
-  Future<void> _captureFaceID(XFile imageFile, Face face) async {
-    if (_isCapturing || _captureComplete) return;
+/// จัดการ iOS local notification (เมื่อแอปเปิดอยู่)
+void _onDidReceiveLocalNotification(
+    int id, String? title, String? body, String? payload) async {
+  print('📱 iOS Local Notification: $id - $title');
 
-    setState(() {
-      _isCapturing = true;
-      _captureAttempts++;
-      _statusMessage = '📸 กำลังประมวลผล (ครั้งที่ $_captureAttempts)...';
+  // แสดง in-app notification เมื่อแอป foreground
+  if (_isAppInForeground) {
+    // สามารถแสดง Snackbar หรือ Dialog ได้ที่นี่
+    // แต่ต้องมี BuildContext ซึ่งไม่สามารถใช้ตรงนี้ได้
+    // แนะนำให้ใช้ event bus หรือ stream แทน
+  }
+}
+
+/// จัดการเมื่อผู้ใช้แตะ notification
+void _handleNotificationTap(String? payload) {
+  print('📲 Notification tapped: $payload');
+
+  // สามารถนำทางไปยังหน้าต่างๆ ตาม payload ได้
+  // ต้องใช้ navigator key หรือ method channel
+}
+
+/// ตั้งค่า Firebase Messaging (รองรับทั้ง iOS และ Android)
+Future<void> _setupFirebaseMessaging() async {
+  try {
+    // Set background message handler
+    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+    // iOS: ตั้งค่า foreground presentation options
+    if (Platform.isIOS) {
+      await FirebaseMessaging.instance
+          .setForegroundNotificationPresentationOptions(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+    }
+
+    // Handle foreground messages
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      print('📨 [Foreground] Message: ${message.messageId}');
+
+      // จัดการ silent notification สำหรับ iOS
+      if (message.data['type'] == 'check_missed') {
+        print("🔍 [iOS Foreground] Checking missed count from push");
+        _checkAllUsersMissedCount(isBackground: false);
+      }
+
+      // แสดง notification เฉพาะเมื่อมี content
+      if (message.notification != null) {
+        _showLocalNotification(
+          id: DateTime.now().millisecond,
+          title: message.notification?.title ?? 'การแจ้งเตือน',
+          body: message.notification?.body ?? '',
+          payload: message.data.toString(),
+        );
+      }
     });
 
-    try {
-      img.Image? processedImage = await _cropAndPreprocessFace(imageFile.path, face);
-
-      if (ENABLE_QUALITY_BOOST &&
-          _faceQuality < 0.65 &&
-          processedImage != null) {
-        processedImage = _enhanceImageQuality(processedImage);
+    // Handle when app is opened from terminated state
+    RemoteMessage? initialMessage =
+        await FirebaseMessaging.instance.getInitialMessage();
+    if (initialMessage != null) {
+      print('📨 [Terminated] App opened from terminated state');
+      if (initialMessage.data['type'] == 'check_missed') {
+        _checkAllUsersMissedCount(isBackground: false);
       }
-
-      if (processedImage == null) {
-        throw Exception('ประมวลผลใบหน้าไม่สำเร็จ');
-      }
-
-      final embedding = await _extractEmbedding(processedImage);
-      final embeddingQuality = _evaluateEmbeddingQuality(embedding);
-      final normalizedEmbedding = _l2Normalize(embedding);
-
-      final totalQualityScore = (_faceQuality * 0.3 +
-              _faceStability * 0.2 +
-              _lightingScore * 0.15 +
-              _sharpnessScore * 0.15 +
-              _poseScore * 0.1 +
-              _faceSymmetry * 0.1)
-          .clamp(0.0, 1.0);
-
-      final embeddingData = {
-        'embedding': normalizedEmbedding,
-        'raw_embedding': embedding,
-        'quality': _faceQuality,
-        'stability': _faceStability,
-        'lighting': _lightingScore,
-        'sharpness': _sharpnessScore,
-        'pose': _poseScore,
-        'symmetry': _faceSymmetry,
-        'total_quality': totalQualityScore,
-        'embedding_quality': embeddingQuality,
-        'angles': {
-          'yaw': face.headEulerAngleY ?? 0.0,
-          'pitch': face.headEulerAngleX ?? 0.0,
-          'roll': face.headEulerAngleZ ?? 0.0,
-        },
-        'timestamp': DateTime.now().toIso8601String(),
-        'dimension': normalizedEmbedding.length,
-        'capture_attempt': _captureAttempts,
-        'is_best': false,
-      };
-
-      _allCapturedFaces.add(embeddingData);
-
-      final qualityThreshold = ENABLE_ADAPTIVE_THRESHOLDS
-          ? max(GOOD_FACE_THRESHOLD * 0.9, _adaptiveThreshold)
-          : GOOD_FACE_THRESHOLD;
-
-      if (totalQualityScore >= qualityThreshold) {
-        _enrolledEmbeddings.add(embeddingData);
-
-        _bestFaces.add(embeddingData);
-        _bestFaces.sort((a, b) => (b['total_quality'] as double)
-            .compareTo(a['total_quality'] as double));
-        if (_bestFaces.length > MAX_BEST_FACES_STORAGE) {
-          _bestFaces.removeLast();
-        }
-
-        if (totalQualityScore > _absoluteBestQuality) {
-          _absoluteBestQuality = totalQualityScore;
-          _absoluteBestFace = embeddingData;
-          _hasGoodFaces = true;
-
-          print('✨ พบใบหน้าที่ดีขึ้น: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
-        }
-
-        setState(() {
-          _enrollmentCount++;
-          _hasGoodFaces = true;
-          _statusMessage = '✅ ได้ใบหน้าคุณภาพ ${(totalQualityScore * 100).toInt()}%';
-          _isCapturing = false;
-          _stableFrameCount = 0;
-        });
-
-        _showCaptureSuccess();
-
-        print('📊 คุณภาพรวม: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
-        print('📊 จำนวนใบหน้าที่ดี: $_enrollmentCount/${_bestFaces.length}');
-
-        if (_enrollmentCount >= MIN_ENROLLMENT_EMBEDDINGS) {
-          _enrollmentConsistency = _calculateConsistency();
-
-          if (_enrollmentConsistency >= MIN_ENROLLMENT_CONSISTENCY) {
-            await _saveFaceIDProfileWithBestFaces();
-          } else {
-            if (_enrollmentCount >= MIN_ENROLLMENT_EMBEDDINGS) {
-              _showInsufficientConsistencyDialog();
-            }
-          }
-        }
-      } else {
-        setState(() {
-          _statusMessage = '⚠️ คุณภาพ ${(totalQualityScore * 100).toInt()}% (ต้องการ ${(qualityThreshold * 100).toInt()}%)';
-          _instructionMessage = _currentGuidance.isNotEmpty
-              ? _currentGuidance
-              : 'พยายามต่อไป (ครั้งที่ $_captureAttempts/$MAX_CAPTURE_ATTEMPTS)';
-          _isCapturing = false;
-        });
-
-        print('⚠️ คุณภาพไม่พอ: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
-
-        if (_captureAttempts >= MAX_CAPTURE_ATTEMPTS &&
-            _enrolledEmbeddings.isNotEmpty) {
-          _offerToUseBestFaces();
-        }
-
-        if (_captureAttempts >= MAX_CAPTURE_ATTEMPTS &&
-            _enrolledEmbeddings.isEmpty) {
-          _offerToUseBestAvailable();
-        }
-      }
-
-      // ลบไฟล์
-      try {
-        final file = File(imageFile.path);
-        if (await file.exists()) {
-          await file.delete();
-        }
-      } catch (_) {}
-      
-    } catch (e) {
-      print('❌ Capture error: $e');
-      setState(() {
-        _isCapturing = false;
-        _statusMessage = '❌ ประมวลผลไม่สำเร็จ';
-        _instructionMessage = 'ลองใหม่';
-        _stableFrameCount = 0;
-      });
+      _handleNotificationTap(initialMessage.data.toString());
     }
+
+    // Subscribe to topics ที่จำเป็น
+    await FirebaseMessaging.instance.subscribeToTopic('all_users');
+    await FirebaseMessaging.instance.subscribeToTopic('missed_check_updates');
+
+    if (Platform.isIOS) {
+      await FirebaseMessaging.instance.subscribeToTopic('ios_missed_check');
+    }
+
+    // iOS: ขอ APNS token
+    if (Platform.isIOS) {
+      final apnsToken = await FirebaseMessaging.instance.getAPNSToken();
+      print('📱 iOS APNS Token: $apnsToken');
+    }
+  } catch (e, stackTrace) {
+    print('❌ Error setting up Firebase Messaging: $e');
+    await _logSystemError(
+        'Setup Firebase Messaging Error', e.toString(), stackTrace.toString());
   }
+}
 
-  // ================ FACE PROCESSING ================
-  Future<img.Image?> _cropAndPreprocessFace(String imagePath, Face face) async {
-    try {
-      final file = File(imagePath);
-      final imageBytes = await file.readAsBytes();
-      final originalImage = img.decodeImage(imageBytes);
-
-      if (originalImage == null) return null;
-
-      final bbox = face.boundingBox;
-
-      final paddingX = (bbox.width * FACE_PADDING_RATIO).toInt();
-      final paddingY = (bbox.height * FACE_PADDING_RATIO).toInt();
-
-      int left = max(0, bbox.left.toInt() - paddingX);
-      int top = max(0, bbox.top.toInt() - paddingY);
-      int width = min(originalImage.width - left, bbox.width.toInt() + paddingX * 2);
-      int height = min(originalImage.height - top, bbox.height.toInt() + paddingY * 2);
-
-      if (width <= 0 || height <= 0) return null;
-
-      final croppedImage = img.copyCrop(
-        originalImage,
-        x: left,
-        y: top,
-        width: width,
-        height: height,
-      );
-
-      final resizedImage = img.copyResize(
-        croppedImage,
-        width: FACE_CROP_SIZE,
-        height: FACE_CROP_SIZE,
-        interpolation: img.Interpolation.linear,
-      );
-
-      return resizedImage;
-    } catch (e) {
-      print('❌ Error cropping: $e');
-      return null;
-    }
+/// ตั้งค่า Background Tasks แยกตาม Platform
+Future<void> _setupBackgroundTasks() async {
+  if (Platform.isAndroid) {
+    await _setupAndroidWorkManager();
+  } else if (Platform.isIOS) {
+    await _setupIOSBackgroundTasks();
   }
+}
 
-  // ================ INTELLIGENT QUALITY IMPROVEMENT ================
-  double _calculateIntelligentFaceQuality(Face face) {
-    double score = 0.0;
-
-    final bbox = face.boundingBox;
-    final area = bbox.width * bbox.height;
-    final screenArea = _screenWidth * _screenHeight;
-    final areaRatio = area / screenArea;
-
-    double areaWeight = 0.3;
-    double centerWeight = 0.25;
-    double poseWeight = 0.25;
-    double eyeWeight = 0.2;
-
-    if (_consecutiveLowQuality > 3) {
-      areaWeight = 0.35;
-      centerWeight = 0.30;
-      poseWeight = 0.20;
-      eyeWeight = 0.15;
-    }
-
-    if (areaRatio >= IDEAL_MIN_FACE_AREA && areaRatio <= IDEAL_MAX_FACE_AREA) {
-      score += areaWeight;
-    } else if (areaRatio >= MIN_FACE_AREA_RATIO &&
-        areaRatio <= MAX_FACE_AREA_RATIO) {
-      score += areaWeight * 0.7;
-    } else {
-      score += areaWeight * 0.4;
-    }
-
-    final centerScore = _calculateCenterScore(bbox);
-    score += centerScore * centerWeight;
-
-    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
-    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
-    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
-
-    if (yaw <= MAX_HEAD_YAW &&
-        pitch <= MAX_HEAD_PITCH &&
-        roll <= MAX_HEAD_ROLL) {
-      score += poseWeight;
-    } else {
-      score += poseWeight * 0.6;
-    }
-
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-    final eyeScore = (leftEye + rightEye) / 2;
-
-    if (eyeScore >= MIN_EYE_OPENNESS) {
-      score += eyeWeight;
-    } else {
-      score += eyeScore * eyeWeight;
-    }
-
-    if (ENABLE_QUALITY_BOOST && _isStruggling) {
-      score = min(1.0, score * 1.1);
-    }
-
-    return score.clamp(0.0, 1.0);
-  }
-
-  double _calculateAdaptiveThreshold() {
-    if (_qualityHistory.isEmpty) return MIN_FACE_QUALITY;
-
-    final recentQuality = _qualityHistory.length > 5
-        ? _qualityHistory
-                .sublist(_qualityHistory.length - 5)
-                .reduce((a, b) => a + b) /
-            5
-        : _qualityHistory.reduce((a, b) => a + b) / _qualityHistory.length;
-
-    double adaptiveThreshold = recentQuality * 0.9;
-    return adaptiveThreshold.clamp(0.55, 0.75);
-  }
-
-  void _analyzeAndImproveQuality() {
-    _improvementTips.clear();
-
-    if (_faceQuality < 0.6) {
-      if (_poseScore < 0.5) {
-        _improvementTips['pose'] = 'หันมาตรงๆ';
-      }
-      if (_lightingScore < 0.5) {
-        _improvementTips['lighting'] = 'ปรับแสงให้สว่าง';
-      }
-      if (_sharpnessScore < 0.5) {
-        _improvementTips['sharpness'] = 'อยู่นิ่งๆ';
-      }
-      if (_faceSymmetry < 0.5) {
-        _improvementTips['symmetry'] = 'หันมาตรงๆ';
-      }
-    }
-
-    if (_improvementTips.isNotEmpty) {
-      _currentGuidance = _improvementTips.values.join(' • ');
-    } else {
-      _currentGuidance = '';
-    }
-  }
-
-  void _updateIntelligentFaceStatus() {
-    if (_currentFace == null) return;
-
-    final bbox = _currentFace!.boundingBox;
-    final area = bbox.width * bbox.height;
-    final screenArea = _screenWidth * _screenHeight;
-    final areaRatio = area / screenArea;
-
-    if (areaRatio > MAX_FACE_AREA_RATIO) {
-      _updateStatus('📱 ถอยหลัง', 'ใกล้เกินไป', '');
-      return;
-    } else if (areaRatio < MIN_FACE_AREA_RATIO) {
-      _updateStatus('📱 เข้ามาใกล้', 'ไกลเกินไป', '');
-      return;
-    }
-
-    final currentThreshold =
-        ENABLE_ADAPTIVE_THRESHOLDS ? _adaptiveThreshold : MIN_FACE_QUALITY;
-
-    if (_faceQuality < currentThreshold) {
-      if (_currentGuidance.isNotEmpty) {
-        _updateStatus('📸 ปรับปรุง', _currentGuidance,
-            'คุณภาพ ${(_faceQuality * 100).toInt()}%');
-      } else {
-        _updateStatus(
-            '📸 ปรับตำแหน่ง', 'คุณภาพ ${(_faceQuality * 100).toInt()}%', '');
-      }
-      return;
-    }
-
-    if (_faceStability < MIN_FACE_STABILITY) {
-      _updateStatus(
-          '🎯 อยู่นิ่งๆ', 'ความนิ่ง ${(_faceStability * 100).toInt()}%', '');
-      return;
-    }
-
-    if (!_livenessPassed) {
-      _updateStatus('🔄 ตรวจสอบ', 'กะพริบตาเล็กน้อย', '');
-      return;
-    }
-
-    if (_enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-      _updateStatus(
-        '✅ ใส่ใบหน้าคุณภาพดี (${(_faceQuality * 100).toInt()}%)',
-        'ถ่ายรูปที่ ${_enrollmentCount + 1}/$MIN_ENROLLMENT_EMBEDDINGS',
-        '',
-      );
-    }
-  }
-
-  // ================ FACE QUALITY ================
-  double _calculateCenterScore(Rect bbox) {
-    final faceCenter = Offset(
-      bbox.left + bbox.width / 2,
-      bbox.top + bbox.height / 2,
+/// ตั้งค่า WorkManager สำหรับ Android (ตรวจสอบทุก 15 นาที)
+Future<void> _setupAndroidWorkManager() async {
+  try {
+    await Workmanager().initialize(
+      callbackDispatcher,
+      isInDebugMode: true,
     );
-    final screenCenter = Offset(_screenWidth / 2, _screenHeight / 2);
 
-    final distance = (faceCenter - screenCenter).distance;
-    final maxDistance = _screenWidth * 0.3;
+    // ยกเลิกงานเก่าทั้งหมด
+    await Workmanager().cancelAll();
 
-    return max(0.0, 1.0 - (distance / maxDistance).clamp(0.0, 1.0));
-  }
-
-  double _calculateFaceStability() {
-    if (_faceHistory.length < 2) return 1.0;
-
-    double totalMovement = 0.0;
-    int comparisons = 0;
-
-    for (int i = 1; i < _faceHistory.length; i++) {
-      final prev = _faceHistory[i - 1];
-      final curr = _faceHistory[i];
-
-      final prevCenter = Offset(
-        prev.boundingBox.left + prev.boundingBox.width / 2,
-        prev.boundingBox.top + prev.boundingBox.height / 2,
-      );
-
-      final currCenter = Offset(
-        curr.boundingBox.left + curr.boundingBox.width / 2,
-        curr.boundingBox.top + curr.boundingBox.height / 2,
-      );
-
-      totalMovement += (currCenter - prevCenter).distance;
-      comparisons++;
-    }
-
-    if (comparisons == 0) return 1.0;
-
-    final avgMovement = totalMovement / comparisons;
-    return max(0.0, 1.0 - (avgMovement / 20.0)).clamp(0.0, 1.0);
-  }
-
-  double _calculateLightingScore(Face face) {
-    double leftCheek = 0.5;
-    double rightCheek = 0.5;
-
-    try {
-      final leftCheekLandmark = face.landmarks[FaceLandmarkType.leftCheek];
-      final rightCheekLandmark = face.landmarks[FaceLandmarkType.rightCheek];
-
-      if (leftCheekLandmark != null) {
-        leftCheek = 0.7 + (leftCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
-      }
-      if (rightCheekLandmark != null) {
-        rightCheek =
-            0.7 + (rightCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
-      }
-    } catch (_) {}
-
-    final avgBrightness = (leftCheek + rightCheek) / 2;
-    final symmetry = 1.0 - (leftCheek - rightCheek).abs();
-
-    return (avgBrightness * 0.5 + symmetry * 0.5).clamp(0.0, 1.0);
-  }
-
-  double _calculateSharpnessScore(Face face) {
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-
-    final eyeVariance = pow(leftEye - rightEye, 2).toDouble();
-    final sharpnessScore = min(1.0, eyeVariance * 10 + 0.5);
-
-    return sharpnessScore.clamp(0.0, 1.0);
-  }
-
-  double _calculatePoseScore(Face face) {
-    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
-    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
-    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
-
-    final yawScore = 1.0 / (1.0 + exp((yaw - MAX_HEAD_YAW) / 5.0));
-    final pitchScore = 1.0 / (1.0 + exp((pitch - MAX_HEAD_PITCH) / 4.0));
-    final rollScore = 1.0 / (1.0 + exp((roll - MAX_HEAD_ROLL) / 3.0));
-
-    return (yawScore + pitchScore + rollScore) / 3.0;
-  }
-
-  double _calculateFaceSymmetry(Face face) {
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-
-    final eyeSymmetry = 1.0 - (leftEye - rightEye).abs();
-
-    return eyeSymmetry.clamp(0.0, 1.0);
-  }
-
-  bool _checkLiveness(Face face) {
-    int passed = 0;
-
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-    final eyeAsymmetry = (leftEye - rightEye).abs();
-    if (eyeAsymmetry >= MIN_EYE_ASYMMETRY) passed++;
-
-    final smiling = face.smilingProbability ?? 0.0;
-    if (smiling <= MAX_SMILING_PROBABILITY) passed++;
-
-    return passed >= REQUIRED_LIVENESS_CHECKS;
-  }
-
-  // ================ IMAGE ENHANCEMENT ================
-  img.Image _enhanceImageQuality(img.Image image) {
-    final sharpened = img.copyResize(image,
-        width: image.width,
-        height: image.height,
-        interpolation: img.Interpolation.linear);
-
-    for (var pixel in sharpened) {
-      pixel.r = (pixel.r * 1.1).clamp(0, 255).toInt();
-      pixel.g = (pixel.g * 1.1).clamp(0, 255).toInt();
-      pixel.b = (pixel.b * 1.1).clamp(0, 255).toInt();
-    }
-
-    return sharpened;
-  }
-
-  // ================ EXTRACT EMBEDDING ================
-  Future<List<double>> _extractEmbedding(img.Image faceImage) async {
-    if (!_modelLoaded || _faceModel == null) {
-      throw Exception('โมเดลไม่พร้อม');
-    }
-
-    try {
-      final input = _prepareInput(faceImage);
-      final outputBuffer = List<double>.filled(_actualOutputDimension, 0.0);
-      final output = outputBuffer.reshape([1, _actualOutputDimension]);
-
-      _faceModel!.run(input, output);
-      
-      return List<double>.from(output[0]);
-    } catch (e) {
-      print('❌ Error extracting embedding: $e');
-      rethrow;
-    }
-  }
-
-  List<List<List<List<double>>>> _prepareInput(img.Image image) {
-    final input = List.generate(
-      1,
-      (_) => List.generate(
-        FACE_CROP_SIZE,
-        (_) => List.generate(
-          FACE_CROP_SIZE,
-          (_) => List.filled(3, 0.0),
-        ),
+    // ตั้งค่างานแจ้งเตือนเวลาเช็คชื่อ (ทุกวัน)
+    await Workmanager().registerPeriodicTask(
+      'checkin_notification_task',
+      'checkin_notification_task',
+      frequency: const Duration(hours: 24),
+      initialDelay: const Duration(seconds: 10),
+      constraints: Constraints(
+        networkType: NetworkType.connected,
+        requiresBatteryNotLow: false,
+        requiresCharging: false,
+        requiresDeviceIdle: false,
+        requiresStorageNotLow: true,
       ),
     );
 
-    final bytes = image.getBytes(order: img.ChannelOrder.rgb);
-    int byteIndex = 0;
+    // ตั้งค่างานตรวจสอบ missed count (ทุก 15 นาที)
+    await Workmanager().registerPeriodicTask(
+      'missed_check_task',
+      'missed_check_task',
+      frequency: const Duration(minutes: 15),
+      initialDelay: const Duration(seconds: 30),
+      constraints: Constraints(
+        networkType: NetworkType.connected,
+        requiresBatteryNotLow: false,
+        requiresCharging: false,
+      ),
+    );
 
-    for (int y = 0; y < FACE_CROP_SIZE; y++) {
-      for (int x = 0; x < FACE_CROP_SIZE; x++) {
-        if (byteIndex + 2 < bytes.length) {
-          final r = bytes[byteIndex].toDouble();
-          final g = bytes[byteIndex + 1].toDouble();
-          final b = bytes[byteIndex + 2].toDouble();
+    // ตั้งค่างานสรุป missed count รายวัน (ทุกวันเวลา 20:00 น.)
+    final now = DateTime.now();
+    final scheduledTime = DateTime(now.year, now.month, now.day, 20, 0);
+    Duration initialDelay;
 
-          input[0][y][x][0] = (r / 127.5) - 1.0;
-          input[0][y][x][1] = (g / 127.5) - 1.0;
-          input[0][y][x][2] = (b / 127.5) - 1.0;
+    if (scheduledTime.isAfter(now)) {
+      initialDelay = scheduledTime.difference(now);
+    } else {
+      final tomorrow = now.add(const Duration(days: 1));
+      final tomorrow20 =
+          DateTime(tomorrow.year, tomorrow.month, tomorrow.day, 20, 0);
+      initialDelay = tomorrow20.difference(now);
+    }
 
-          byteIndex += 3;
+    await Workmanager().registerPeriodicTask(
+      'daily_missed_summary',
+      'daily_missed_summary',
+      frequency: const Duration(hours: 24),
+      initialDelay: initialDelay,
+      constraints: Constraints(
+        networkType: NetworkType.connected,
+      ),
+    );
+
+    print('✅ Android WorkManager initialized with all tasks');
+    print('   ✅ Missed check task: ทุก 15 นาที');
+  } catch (e, stackTrace) {
+    print('❌ Error setting up WorkManager: $e');
+    await _logSystemError(
+        'Setup WorkManager Error', e.toString(), stackTrace.toString());
+  }
+}
+
+/// ตั้งค่า Background Tasks สำหรับ iOS (ใช้ push-based approach)
+Future<void> _setupIOSBackgroundTasks() async {
+  try {
+    print('📱 iOS: Setting up background tasks (push-based)');
+
+    // iOS ไม่สามารถใช้ WorkManager ได้ ใช้ push notifications แทน
+
+    // สร้าง local trigger สำหรับตรวจสอบเมื่อแอปทำงาน
+    _startIOSBackgroundSimulator();
+
+    // ตั้งค่า silent notification handling
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+      print('📱 [iOS] App opened from notification');
+      if (message.data['type'] == 'check_missed') {
+        _checkAllUsersMissedCount(isBackground: false);
+      }
+    });
+
+    print('✅ iOS background tasks configured (push-based)');
+  } catch (e) {
+    print('❌ Error setting up iOS background tasks: $e');
+  }
+}
+
+/// iOS: จำลอง background task เมื่อแอปทำงาน (จะหยุดเมื่อแอปปิด)
+void _startIOSBackgroundSimulator() {
+  _iosBackgroundSimulatorTimer?.cancel();
+
+  // ตรวจสอบทุก 15 นาที เฉพาะเมื่อแอปอยู่ foreground
+  _iosBackgroundSimulatorTimer =
+      Timer.periodic(const Duration(minutes: 15), (timer) {
+    if (_isAppInForeground) {
+      print('📱 [iOS Simulator] Checking missed count (app in foreground)');
+      _checkAllUsersMissedCount(isBackground: false);
+    } else {
+      print('📱 [iOS Simulator] App in background, skipping check');
+    }
+  });
+}
+
+// ==================== MISSED COUNT SYSTEM ====================
+
+/// เริ่มระบบ Missed Count (ปรับตาม Platform)
+void _initializeMissedCountSystem() {
+  print(
+      '\n🚀 ===== เริ่มระบบ Missed Count (${Platform.operatingSystem}) =====');
+
+  _isMissedSystemRunning = true;
+  _lastFullCheckTime = DateTime.now();
+
+  if (Platform.isAndroid) {
+    // Android: ใช้ Timer ตรวจสอบทุก 15 นาที เมื่อแอปทำงาน
+    _missedCheckTimer = Timer.periodic(const Duration(minutes: 15), (timer) {
+      print('\n⏰ [Android Timer] Running missed count check...');
+      _checkAllUsersMissedCount(isBackground: false);
+    });
+    print('✅ Android: ตรวจสอบทุก 15 นาที (เมื่อแอปทำงาน)');
+  } else if (Platform.isIOS) {
+    // iOS: ใช้ Timer ตรวจสอบทุก 15 นาที เฉพาะตอนแอปทำงาน
+    _missedCheckTimer = Timer.periodic(const Duration(minutes: 15), (timer) {
+      if (_isAppInForeground) {
+        print('\n⏰ [iOS Timer] Running missed count check (foreground)...');
+        _checkAllUsersMissedCount(isBackground: false);
+      }
+    });
+    print('✅ iOS: ตรวจสอบทุก 15 นาที (เมื่อแอปทำงาน) + Push triggers');
+  }
+
+  // ตรวจสอบครั้งแรกหลังจากเริ่มแอป 5 วินาที
+  Future.delayed(const Duration(seconds: 5), () {
+    print('\n🔍 [Initial] First missed count check...');
+    _checkAllUsersMissedCount(isBackground: false);
+  });
+
+  print('🔚 ===== จบการเริ่มระบบ =====\n');
+}
+
+/// ตรวจสอบ Missed Count สำหรับผู้ใช้ที่ active = true ทุกคน
+Future<void> _checkAllUsersMissedCount({bool isBackground = false}) async {
+  // ป้องกันการทำงานซ้ำ
+  if (_isMissedSystemRunning && !isBackground) {
+    print('⚠️ ระบบกำลังทำงานอยู่ ข้ามการทำงานนี้');
+    return;
+  }
+
+  _isMissedSystemRunning = true;
+
+  try {
+    final mode = isBackground ? 'Background' : 'Foreground';
+    final platform = Platform.operatingSystem;
+
+    print('\n🔍 ===== [$platform $mode] เริ่มตรวจสอบ Missed Count =====');
+    print('📅 วันที่: ${DateFormat('yyyy-MM-dd').format(DateTime.now())}');
+    print('⏰ เวลา: ${DateFormat('HH:mm:ss').format(DateTime.now())}');
+
+    final firestore = FirebaseFirestore.instance;
+
+    await _loadCheckinSettings();
+
+    final usersSnapshot = await firestore
+        .collection('users')
+        .where('active', isEqualTo: true)
+        .get();
+
+    print('👥 พบผู้ใช้ที่ active: ${usersSnapshot.docs.length} คน');
+
+    int missedCount = 0;
+    int processedCount = 0;
+    int errorCount = 0;
+    List<String> missedUserIds = [];
+
+    for (var userDoc in usersSnapshot.docs) {
+      final userId = userDoc.id;
+      final userData = userDoc.data();
+
+      processedCount++;
+
+      try {
+        final result = await _checkUserMissedCount(userId, userData);
+
+        if (result) {
+          missedCount++;
+          missedUserIds.add(userId);
+          print(
+              '   ✅ [${processedCount}/${usersSnapshot.docs.length}] พบการเพิ่ม missed count');
+        }
+
+        if (processedCount % 10 == 0) {
+          print(
+              '⏳ ดำเนินการไปแล้ว $processedCount/${usersSnapshot.docs.length} คน');
+        }
+
+        // หน่วงเวลาเล็กน้อยเพื่อไม่ให้เกิน rate limit
+        if (processedCount % 5 == 0) {
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+      } catch (e) {
+        errorCount++;
+        print('   ❌ Error processing user $userId: $e');
+      }
+    }
+
+    _lastFullCheckTime = DateTime.now();
+
+    print('\n📊 [$platform $mode] สรุปผลการตรวจสอบ:');
+    print('   - ตรวจสอบทั้งหมด: ${usersSnapshot.docs.length} คน');
+    print('   - พบการเพิ่ม missed count: $missedCount คน');
+    print('   - เกิดข้อผิดพลาด: $errorCount คน');
+
+    if (missedCount > 0) {
+      print('   - รายชื่อผู้ใช้ที่เพิ่ม missed: $missedUserIds');
+
+      // iOS: ส่ง silent notification เมื่อพบ missed count ใน background
+      if (isBackground && Platform.isIOS) {
+        await _sendSilentNotificationForIOS(missedCount);
+      }
+    }
+
+    print('🔚 ===== [$platform $mode] จบการตรวจสอบ =====\n');
+  } catch (e, stackTrace) {
+    print('❌ [FATAL] Error checking all users missed count: $e');
+    print('📚 Stack trace: $stackTrace');
+
+    await _logSystemError(
+        'Check All Users Missed Error', e.toString(), stackTrace.toString());
+  } finally {
+    _isMissedSystemRunning = false;
+  }
+}
+
+/// ส่ง silent notification สำหรับ iOS
+Future<void> _sendSilentNotificationForIOS(int missedCount) async {
+  try {
+    // ส่งผ่าน FCM topic สำหรับ iOS โดยเฉพาะ
+    await FirebaseMessaging.instance.sendMessage(
+      to: '/topics/ios_missed_check',
+      data: {
+        'type': 'missed_summary',
+        'count': missedCount.toString(),
+        'timestamp': DateTime.now().toIso8601String(),
+        'content-available': '1', // สำหรับ silent notification
+      },
+    );
+    print('📱 [iOS] Sent silent notification for $missedCount missed counts');
+  } catch (e) {
+    print('❌ Error sending silent notification: $e');
+  }
+}
+
+// ==================== NOTIFICATION FUNCTIONS (ปรับปรุงสำหรับ iOS) ====================
+
+/// แสดง Local Notification (รองรับทั้ง iOS และ Android)
+Future<void> _showLocalNotification({
+  required int id,
+  required String title,
+  required String body,
+  String? payload,
+}) async {
+  try {
+    NotificationDetails details;
+
+    if (Platform.isAndroid) {
+      const androidDetails = AndroidNotificationDetails(
+        'checkin_channel',
+        'การแจ้งเตือนการเช็คชื่อ',
+        channelDescription: 'การแจ้งเตือนเกี่ยวกับเวลาเช็คชื่อ',
+        importance: Importance.high,
+        priority: Priority.high,
+        color: Color(0xFF6A1B9A),
+        icon: '@mipmap/ic_launcher',
+        largeIcon: DrawableResourceAndroidBitmap('@mipmap/ic_launcher'),
+        styleInformation: DefaultStyleInformation(true, true),
+        enableVibration: true,
+        playSound: true,
+        visibility: NotificationVisibility.public,
+        ticker: 'checkin_ticker',
+        showWhen: true,
+        usesChronometer: false,
+        timeoutAfter: 5000,
+      );
+
+      details = const NotificationDetails(android: androidDetails);
+    } else {
+      const iosDetails = DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+        interruptionLevel: InterruptionLevel.timeSensitive,
+        threadIdentifier: 'checkin_notifications',
+      );
+
+      details = const NotificationDetails(iOS: iosDetails);
+    }
+
+    await flutterLocalNotificationsPlugin.show(
+      id,
+      title,
+      body,
+      details,
+      payload: payload,
+    );
+
+    print('✅ Local notification shown: $id');
+  } catch (e) {
+    print('❌ Error showing local notification: $e');
+  }
+}
+
+/// ตั้งเวลา notification จากข้อมูล (ปรับปรุงสำหรับ iOS)
+Future<void> _scheduleNotificationsFromData(Map<String, dynamic> data) async {
+  try {
+    final startHour = data['checkInStartHour'] ?? 7;
+    final startMinute = data['checkInStartMinute'] ?? 45;
+    final endHour = data['checkInEndHour'] ?? 4;
+    final endMinute = data['checkInEndMinute'] ?? 15;
+
+    print('⏰ Times from Firebase:');
+    print('   Start: $startHour:$startMinute');
+    print('   End: $endHour:$endMinute');
+
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+
+    DateTime startTime = DateTime(
+      today.year,
+      today.month,
+      today.day,
+      startHour,
+      startMinute,
+    );
+
+    DateTime endTime = DateTime(
+      today.year,
+      today.month,
+      today.day,
+      endHour,
+      endMinute,
+    );
+
+    if (endTime.isBefore(startTime)) {
+      endTime = endTime.add(const Duration(days: 1));
+      print('   ⏰ กรณีข้ามวัน: เวลาสิ้นสุด调整为 $endTime');
+    }
+
+    print('📅 Scheduled times for today:');
+    print('   Start: $startTime');
+    print('   End: $endTime');
+
+    await flutterLocalNotificationsPlugin.cancelAll();
+
+    int scheduledCount = 0;
+
+    // iOS: จำกัดการ schedule ไม่เกิน 64 notifications
+    final maxDate = DateTime.now().add(const Duration(days: 64));
+
+    bool canSchedule(DateTime time) {
+      if (Platform.isIOS && time.isAfter(maxDate)) {
+        print('⚠️ iOS: Cannot schedule beyond 64 days');
+        return false;
+      }
+      return time.isAfter(DateTime.now());
+    }
+
+    final beforeStartTime = startTime.subtract(const Duration(minutes: 10));
+    if (canSchedule(beforeStartTime)) {
+      await _scheduleNotification(
+        id: 1,
+        title: '📝 ใกล้ถึงเวลาเช็คชื่อ',
+        body:
+            'อีก 10 นาที ระบบจะเปิดให้เช็คชื่อ (เวลา ${_formatTimeInt(startHour, startMinute)})',
+        scheduledDate: beforeStartTime,
+      );
+      scheduledCount++;
+    }
+
+    if (canSchedule(startTime)) {
+      await _scheduleNotification(
+        id: 2,
+        title: '✅ ระบบพร้อมให้เช็คชื่อ',
+        body:
+            'คุณสามารถเช็คชื่อได้แล้ววันนี้ ถึงเวลา ${_formatTimeInt(endHour, endMinute)}',
+        scheduledDate: startTime,
+      );
+      scheduledCount++;
+    }
+
+    final beforeEndTime = endTime.subtract(const Duration(minutes: 10));
+    if (canSchedule(beforeEndTime)) {
+      await _scheduleNotification(
+        id: 3,
+        title: '⏰ ใกล้ถึงเวลาปิดระบบ',
+        body:
+            'อีก 10 นาที ระบบเช็คชื่อจะปิด (เวลา ${_formatTimeInt(endHour, endMinute)})',
+        scheduledDate: beforeEndTime,
+      );
+      scheduledCount++;
+    }
+
+    if (canSchedule(endTime)) {
+      await _scheduleNotification(
+        id: 4,
+        title: '🔒 ระบบปิดการเช็คชื่อ',
+        body:
+            'หมดเขตเช็คชื่อสำหรับวันนี้ พบกันใหม่พรุ่งนี้ เวลา ${_formatTimeInt(startHour, startMinute)}',
+        scheduledDate: endTime,
+      );
+      scheduledCount++;
+    }
+
+    print(
+        '✅ Scheduled $scheduledCount notifications for ${Platform.operatingSystem}');
+  } catch (e, stackTrace) {
+    print('❌ Error scheduling notifications: $e');
+    await _logSystemError(
+        'Schedule Notifications Error', e.toString(), stackTrace.toString());
+  }
+}
+
+/// จัดการการแจ้งเตือนตามเวลาที่กำหนด (รองรับทั้ง iOS และ Android)
+Future<void> _scheduleNotification({
+  required int id,
+  required String title,
+  required String body,
+  required DateTime scheduledDate,
+}) async {
+  try {
+    print('⏰ Scheduling notification $id at: $scheduledDate');
+
+    if (scheduledDate.isBefore(DateTime.now())) {
+      print('⚠️ Cannot schedule in the past!');
+      return;
+    }
+
+    final tz.TZDateTime scheduledTZDate = tz.TZDateTime.from(
+      scheduledDate,
+      tz.local,
+    );
+
+    NotificationDetails details;
+
+    if (Platform.isAndroid) {
+      const androidDetails = AndroidNotificationDetails(
+        'checkin_channel',
+        'การแจ้งเตือนการเช็คชื่อ',
+        channelDescription: 'การแจ้งเตือนเกี่ยวกับเวลาเช็คชื่อ',
+        importance: Importance.high,
+        priority: Priority.high,
+        color: Color(0xFF6A1B9A),
+        icon: '@mipmap/ic_launcher',
+        largeIcon: DrawableResourceAndroidBitmap('@mipmap/ic_launcher'),
+        styleInformation: DefaultStyleInformation(true, true),
+        enableVibration: true,
+        playSound: true,
+        visibility: NotificationVisibility.public,
+        ticker: 'checkin_ticker',
+        showWhen: true,
+        usesChronometer: false,
+      );
+
+      details = const NotificationDetails(android: androidDetails);
+    } else {
+      const iosDetails = DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+        interruptionLevel: InterruptionLevel.timeSensitive,
+        threadIdentifier: 'checkin_notifications',
+      );
+
+      details = const NotificationDetails(iOS: iosDetails);
+    }
+
+    await flutterLocalNotificationsPlugin.zonedSchedule(
+      id,
+      title,
+      body,
+      scheduledTZDate,
+      details,
+      androidScheduleMode:
+          Platform.isAndroid ? AndroidScheduleMode.exactAllowWhileIdle : null,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
+      matchDateTimeComponents: DateTimeComponents.time,
+      payload: 'checkin_notification_$id',
+    );
+  } catch (e) {
+    print('❌ Error scheduling notification: $e');
+  }
+}
+
+// ==================== ฟังก์ชันอื่นๆ ที่เหลือ (เหมือนเดิม) ====================
+
+/// ตั้งค่า Listeners ทั้งหมด
+Future<void> _setupAllListeners() async {
+  try {
+    _setupRealtimeCheckinListener();
+    _setupHolidaysListener();
+    _setupSpecialClassesListener();
+    print('✅ All listeners setup completed');
+  } catch (e) {
+    print('❌ Error setting up listeners: $e');
+  }
+}
+
+/// ตั้งค่า Real-time Listener สำหรับเวลาเช็คชื่อ
+void _setupRealtimeCheckinListener() {
+  try {
+    final firestore = FirebaseFirestore.instance;
+
+    _checkinSettingsSubscription?.cancel();
+
+    _checkinSettingsSubscription = firestore
+        .collection('system_settings')
+        .doc('checkin_time')
+        .snapshots()
+        .listen((snapshot) {
+      if (snapshot.exists) {
+        final newData = snapshot.data()!;
+
+        if (_currentSettings == null || _hasTimeChanged(newData)) {
+          print('🔄 [Real-time] Check-in time changed!');
+          _currentSettings = newData;
+          _handleCheckinTimeChange(newData);
+        }
+      }
+    }, onError: (error) {
+      print('❌ [Real-time] Error: $error');
+    });
+  } catch (e) {
+    print('❌ Error setting up checkin listener: $e');
+  }
+}
+
+/// ตรวจสอบว่าเวลามีการเปลี่ยนแปลงหรือไม่
+bool _hasTimeChanged(Map<String, dynamic> newData) {
+  if (_currentSettings == null) return true;
+
+  return _currentSettings!['checkInStartHour'] != newData['checkInStartHour'] ||
+      _currentSettings!['checkInStartMinute'] !=
+          newData['checkInStartMinute'] ||
+      _currentSettings!['checkInEndHour'] != newData['checkInEndHour'] ||
+      _currentSettings!['checkInEndMinute'] != newData['checkInEndMinute'] ||
+      _currentSettings!['maxCheckInsPerDay'] != newData['maxCheckInsPerDay'];
+}
+
+/// จัดการเมื่อเวลาเปลี่ยนแปลงแบบ Real-time
+Future<void> _handleCheckinTimeChange(Map<String, dynamic> newData) async {
+  if (_isScheduling) {
+    print('⏳ Already scheduling, skipping...');
+    return;
+  }
+
+  _isScheduling = true;
+
+  try {
+    print('⏰ New check-in times detected:');
+    print(
+        '   Start: ${newData['checkInStartHour']}:${newData['checkInStartMinute']}');
+    print(
+        '   End: ${newData['checkInEndHour']}:${newData['checkInEndMinute']}');
+
+    _checkInStart = TimeOfDay(
+      hour: newData['checkInStartHour'] ?? 7,
+      minute: newData['checkInStartMinute'] ?? 45,
+    );
+    _checkInEnd = TimeOfDay(
+      hour: newData['checkInEndHour'] ?? 4,
+      minute: newData['checkInEndMinute'] ?? 15,
+    );
+    _maxCheckInsPerDay = newData['maxCheckInsPerDay'] ?? 1;
+
+    final disabledDaysData = newData['disabledDays'] as List? ?? [];
+    for (int i = 0; i < _disabledDays.length; i++) {
+      if (i < disabledDaysData.length) {
+        _disabledDays[i] = disabledDaysData[i] == true;
+      }
+    }
+
+    await flutterLocalNotificationsPlugin.cancelAll();
+    print('🔄 Cancelled all old notifications');
+
+    await _scheduleNotificationsFromData(newData);
+
+    print('✅ Real-time update completed successfully');
+  } catch (e, stackTrace) {
+    print('❌ Error handling real-time update: $e');
+    await _logSystemError(
+        'Real-time Update Error', e.toString(), stackTrace.toString());
+  } finally {
+    _isScheduling = false;
+  }
+}
+
+/// ตั้งค่า Listener สำหรับวันหยุด
+void _setupHolidaysListener() {
+  try {
+    final firestore = FirebaseFirestore.instance;
+
+    _holidaysSubscription?.cancel();
+    _holidaysSubscription = firestore
+        .collection('holidays')
+        .orderBy('date', descending: false)
+        .snapshots()
+        .listen((snapshot) {
+      print('📅 [Real-time] Holidays updated: ${snapshot.docs.length} items');
+
+      _holidays = snapshot.docs.map((doc) {
+        final data = doc.data();
+        final date = data['date'];
+        DateTime? holidayDate;
+
+        if (date is Timestamp) {
+          holidayDate = date.toDate();
+        }
+
+        return {
+          'id': doc.id,
+          'name': data['name'] ?? '',
+          'date': holidayDate,
+          'created_at': data['created_at'],
+        };
+      }).toList();
+    }, onError: (error) {
+      print('❌ [Real-time] Holidays error: $error');
+    });
+  } catch (e) {
+    print('❌ Error setting up holidays listener: $e');
+  }
+}
+
+/// ตั้งค่า Listener สำหรับชั้นเรียนพิเศษ
+void _setupSpecialClassesListener() {
+  try {
+    final firestore = FirebaseFirestore.instance;
+
+    _specialClassesSubscription?.cancel();
+    _specialClassesSubscription = firestore
+        .collection('special_classes')
+        .orderBy('date', descending: false)
+        .snapshots()
+        .listen((snapshot) {
+      print(
+          '📚 [Real-time] Special classes updated: ${snapshot.docs.length} items');
+
+      _specialClasses = snapshot.docs.map((doc) {
+        final data = doc.data();
+        final date = data['date'];
+        DateTime? classDate;
+
+        if (date is Timestamp) {
+          classDate = date.toDate();
+        }
+
+        return {
+          'id': doc.id,
+          'name': data['name'] ?? '',
+          'date': classDate,
+          'startHour': data['startHour'] ?? 0,
+          'startMinute': data['startMinute'] ?? 0,
+          'endHour': data['endHour'] ?? 0,
+          'endMinute': data['endMinute'] ?? 0,
+          'description': data['description'] ?? '',
+        };
+      }).toList();
+    }, onError: (error) {
+      print('❌ [Real-time] Special classes error: $error');
+    });
+  } catch (e) {
+    print('❌ Error setting up special classes listener: $e');
+  }
+}
+
+/// โหลดข้อมูลเริ่มต้น
+Future<void> _loadInitialData() async {
+  try {
+    await _loadCheckinSettings();
+    await _loadHolidays();
+    await _loadSpecialClasses();
+    print('✅ Initial data loaded successfully');
+  } catch (e) {
+    print('❌ Error loading initial data: $e');
+  }
+}
+
+/// โหลดการตั้งค่าเช็คชื่อ
+Future<void> _loadCheckinSettings() async {
+  try {
+    final firestore = FirebaseFirestore.instance;
+    final settingsDoc =
+        await firestore.collection('system_settings').doc('checkin_time').get();
+
+    if (settingsDoc.exists) {
+      final data = settingsDoc.data()!;
+
+      _checkInStart = TimeOfDay(
+        hour: data['checkInStartHour'] ?? 7,
+        minute: data['checkInStartMinute'] ?? 45,
+      );
+      _checkInEnd = TimeOfDay(
+        hour: data['checkInEndHour'] ?? 4,
+        minute: data['checkInEndMinute'] ?? 15,
+      );
+      _maxCheckInsPerDay = data['maxCheckInsPerDay'] ?? 1;
+
+      final disabledDaysData = data['disabledDays'] as List? ?? [];
+      for (int i = 0; i < _disabledDays.length; i++) {
+        if (i < disabledDaysData.length) {
+          _disabledDays[i] = disabledDaysData[i] == true;
+        }
+      }
+
+      print('✅ Check-in settings loaded:');
+      print('   Start: ${_formatTime(_checkInStart)}');
+      print('   End: ${_formatTime(_checkInEnd)}');
+      print('   Max per day: $_maxCheckInsPerDay');
+      print('   Disabled days: $_disabledDays');
+    }
+  } catch (e) {
+    print('❌ Error loading check-in settings: $e');
+  }
+}
+
+/// โหลดวันหยุด
+Future<void> _loadHolidays() async {
+  try {
+    final firestore = FirebaseFirestore.instance;
+    final snapshot = await firestore
+        .collection('holidays')
+        .orderBy('date', descending: false)
+        .get();
+
+    _holidays = snapshot.docs.map((doc) {
+      final data = doc.data();
+      final date = data['date'];
+      DateTime? holidayDate;
+
+      if (date is Timestamp) {
+        holidayDate = date.toDate();
+      }
+
+      return {
+        'id': doc.id,
+        'name': data['name'] ?? '',
+        'date': holidayDate,
+      };
+    }).toList();
+
+    print('📅 Holidays loaded: ${_holidays.length} items');
+  } catch (e) {
+    print('❌ Error loading holidays: $e');
+  }
+}
+
+/// โหลดชั้นเรียนพิเศษ
+Future<void> _loadSpecialClasses() async {
+  try {
+    final firestore = FirebaseFirestore.instance;
+    final snapshot = await firestore
+        .collection('special_classes')
+        .orderBy('date', descending: false)
+        .get();
+
+    _specialClasses = snapshot.docs.map((doc) {
+      final data = doc.data();
+      final date = data['date'];
+      DateTime? classDate;
+
+      if (date is Timestamp) {
+        classDate = date.toDate();
+      }
+
+      return {
+        'id': doc.id,
+        'name': data['name'] ?? '',
+        'date': classDate,
+        'startHour': data['startHour'] ?? 0,
+        'startMinute': data['startMinute'] ?? 0,
+        'endHour': data['endHour'] ?? 0,
+        'endMinute': data['endMinute'] ?? 0,
+      };
+    }).toList();
+
+    print('📚 Special classes loaded: ${_specialClasses.length} items');
+  } catch (e) {
+    print('❌ Error loading special classes: $e');
+  }
+}
+
+/// โหลดข้อมูลผู้ใช้จาก users collection
+Future<Map<String, dynamic>> _loadUserData(String userId) async {
+  try {
+    if (_userDataCache.containsKey(userId)) {
+      return _userDataCache[userId]!;
+    }
+
+    final firestore = FirebaseFirestore.instance;
+    final userDoc = await firestore.collection('users').doc(userId).get();
+
+    Map<String, dynamic> result = {
+      'educationLevel': '',
+      'year': '',
+      'department': '',
+      'fullName': '',
+      'email': '',
+      'studentId': '',
+    };
+
+    if (userDoc.exists) {
+      final data = userDoc.data() as Map<String, dynamic>;
+
+      result = {
+        'educationLevel': _mapEducationLevel(
+            data['educationLevel']?.toString() ??
+                data['education_level']?.toString() ??
+                data['level']?.toString() ??
+                ''),
+        'year': data['year']?.toString() ?? '',
+        'department': data['department']?.toString() ??
+            data['major']?.toString() ??
+            data['branch']?.toString() ??
+            '',
+        'fullName':
+            '${data['firstName'] ?? ''} ${data['lastName'] ?? ''}'.trim(),
+        'email': data['email']?.toString() ?? '',
+        'studentId': data['studentId']?.toString() ??
+            data['student_id']?.toString() ??
+            data['id']?.toString() ??
+            data['userId']?.toString() ??
+            '',
+      };
+
+      print('   📥 โหลดข้อมูลจาก users: ${result['fullName']}');
+      print('      - studentId: ${result['studentId']}');
+    } else {
+      print('   ⚠️ ไม่พบข้อมูลผู้ใช้ใน users');
+    }
+
+    _userDataCache[userId] = result;
+    return result;
+  } catch (e) {
+    print('   ❌ Error loading user data: $e');
+    return {
+      'educationLevel': '',
+      'year': '',
+      'department': '',
+      'fullName': '',
+      'email': '',
+      'studentId': '',
+    };
+  }
+}
+
+/// แปลงระดับการศึกษาให้สั้นลง
+String _mapEducationLevel(String level) {
+  Map<String, String> eduMap = {
+    'ปริญญาตรี': 'ป.ตรี',
+    'ปริญญาโท': 'ป.โท',
+    'ปริญญาเอก': 'ป.เอก',
+    'ประกาศนียบัตรวิชาชีพ': 'ปวช.',
+    'ประกาศนียบัตรวิชาชีพชั้นสูง': 'ปวส.',
+    'มัธยมศึกษาตอนปลาย': 'ม.6',
+    'มัธยมศึกษาตอนต้น': 'ม.3',
+    'ประถมศึกษา': 'ป.6',
+  };
+
+  return eduMap[level] ?? level;
+}
+
+/// ตรวจสอบ missed count สำหรับผู้ใช้คนเดียว
+Future<bool> _checkUserMissedCount(
+    String userId, Map<String, dynamic> userData) async {
+  try {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final userEmail = userData['email'] ?? 'ไม่ระบุอีเมล';
+    final firstName = userData['firstName'] ?? '';
+    final lastName = userData['lastName'] ?? '';
+
+    final userInfo = await _loadUserData(userId);
+    final educationLevel = userInfo['educationLevel'] ?? '';
+    final year = userInfo['year'] ?? '';
+    final department = userInfo['department'] ?? '';
+
+    print('\n   👤 ตรวจสอบผู้ใช้: $firstName $lastName');
+    print('      📚 ข้อมูล: $educationLevel $year $department');
+
+    if (await _isTodayHolidayOrDisabled()) {
+      print('   🏖️ วันนี้เป็นวันหยุด/วันงดเช็คชื่อ');
+      _updateUserCheckStatus(userId, today);
+      return false;
+    }
+
+    final hasCheckInToday = await _hasCheckInForUser(userId, today);
+
+    if (hasCheckInToday) {
+      print('   ✅ ผู้ใช้เช็คชื่อวันนี้แล้ว');
+      _updateUserCheckStatus(userId, today);
+      return false;
+    }
+
+    final lastMissedDate = userData['last_missed_date']?.toDate() as DateTime?;
+    if (lastMissedDate != null &&
+        lastMissedDate.year == today.year &&
+        lastMissedDate.month == today.month &&
+        lastMissedDate.day == today.day) {
+      print('   ⏭️ เคยเพิ่ม missed count สำหรับวันนี้ไปแล้ว');
+      return false;
+    }
+
+    print('   ⚠️ ผู้ใช้ยังไม่ได้เช็คชื่อวันนี้');
+
+    final startTime = await _getTodayStartTime();
+    final endTime = await _getTodayEndTime();
+
+    if (startTime == null || endTime == null) {
+      print('   ❌ ไม่สามารถดึงเวลาได้');
+      return false;
+    }
+
+    print('   ⏰ เวลาเริ่ม: ${_formatTime(startTime)}');
+    print('   ⏰ เวลาสิ้นสุด: ${_formatTime(endTime)}');
+
+    final endDateTime = DateTime(
+      today.year,
+      today.month,
+      today.day,
+      endTime.hour,
+      endTime.minute,
+    );
+
+    DateTime checkTime;
+
+    if (endTime.hour < startTime.hour) {
+      final nextDay = today.add(const Duration(days: 1));
+      final adjustedEndDateTime = DateTime(
+        nextDay.year,
+        nextDay.month,
+        nextDay.day,
+        endTime.hour,
+        endTime.minute,
+      );
+      checkTime = adjustedEndDateTime.add(const Duration(minutes: 10));
+      print(
+          '   ⏰ กรณีข้ามวัน: ตรวจสอบเวลา ${_formatTime(endTime)} ของวันถัดไป +10 นาที');
+    } else {
+      checkTime = endDateTime.add(const Duration(minutes: 10));
+      print('   ⏰ กรณีปกติ: ตรวจสอบเวลา ${_formatTime(endTime)} +10 นาที');
+    }
+
+    print(
+        '   ⏰ เวลาที่ใช้ตรวจสอบ: ${DateFormat('yyyy-MM-dd HH:mm:ss').format(checkTime)}');
+
+    if (now.isAfter(checkTime)) {
+      print('   🔴 ถึงเวลาเพิ่ม missed out แล้ว!');
+      await _incrementMissedCount(userId, today, userData, userInfo);
+      return true;
+    } else {
+      final minutesLeft = checkTime.difference(now).inMinutes;
+      print('   🟡 ยังไม่ถึงเวลาเพิ่ม missed out (เหลือ $minutesLeft นาที)');
+      return false;
+    }
+  } catch (e) {
+    print('   ❌ Error checking user missed count: $e');
+    return false;
+  }
+}
+
+/// อัปเดตสถานะการตรวจสอบสำหรับผู้ใช้
+void _updateUserCheckStatus(String userId, DateTime today) {
+  _lastMissedCheckDateByUser[userId] = today;
+  _isMissedCheckedTodayByUser[userId] = true;
+}
+
+/// ตรวจสอบว่าวันนี้เป็นวันหยุดหรือวันงดเช็คชื่อหรือไม่
+Future<bool> _isTodayHolidayOrDisabled() async {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final todayWeekday = now.weekday;
+
+  int disabledDayIndex = todayWeekday == 7 ? 0 : todayWeekday;
+  if (_disabledDays.isNotEmpty &&
+      disabledDayIndex < _disabledDays.length &&
+      _disabledDays[disabledDayIndex]) {
+    print('   - เป็นวันงดเช็คชื่อ (disabled day)');
+    return true;
+  }
+
+  try {
+    final firestore = FirebaseFirestore.instance;
+    final holidayQuery = await firestore
+        .collection('holidays')
+        .where('date', isGreaterThanOrEqualTo: Timestamp.fromDate(today))
+        .where('date',
+            isLessThan: Timestamp.fromDate(today.add(const Duration(days: 1))))
+        .limit(1)
+        .get();
+
+    if (holidayQuery.docs.isNotEmpty) {
+      final holidayName = holidayQuery.docs.first.data()['name'] ?? 'ไม่ระบุ';
+      print('   - เป็นวันหยุด: $holidayName');
+      return true;
+    }
+  } catch (e) {
+    for (var holiday in _holidays) {
+      final holidayDate = holiday['date'];
+      if (holidayDate != null) {
+        final holidayDay = DateTime(
+          holidayDate.year,
+          holidayDate.month,
+          holidayDate.day,
+        );
+        if (today.isAtSameMomentAs(holidayDay)) {
+          print('   - เป็นวันหยุด (จาก cache): ${holiday['name']}');
+          return true;
         }
       }
     }
-
-    return input;
   }
 
-  // ================ EVALUATE EMBEDDING QUALITY ================
-  double _evaluateEmbeddingQuality(List<double> embedding) {
-    double norm = 0.0;
-    for (final v in embedding) norm += v * v;
-    norm = sqrt(norm);
+  return false;
+}
 
-    return 1.0 - (norm - 1.0).abs().clamp(0.0, 0.5);
+/// ตรวจสอบว่ามีการเช็คชื่อสำหรับผู้ใช้นี้หรือไม่
+Future<bool> _hasCheckInForUser(String userId, DateTime date) async {
+  try {
+    final firestore = FirebaseFirestore.instance;
+    final startOfDay = DateTime(date.year, date.month, date.day);
+    final endOfDay = DateTime(date.year, date.month, date.day + 1);
+
+    final querySnapshot = await firestore
+        .collection('checkins')
+        .where('userId', isEqualTo: userId)
+        .where('timestamp', isGreaterThanOrEqualTo: startOfDay)
+        .where('timestamp', isLessThan: endOfDay)
+        .limit(1)
+        .get();
+
+    return querySnapshot.docs.isNotEmpty;
+  } catch (e) {
+    print('Error checking check-in: $e');
+    return false;
   }
+}
 
-  // ================ CALCULATE CONSISTENCY ================
-  double _calculateConsistency() {
-    if (_enrolledEmbeddings.length < 2) return 1.0;
+/// ดึงเวลาเริ่มของวันนี้
+Future<TimeOfDay?> _getTodayStartTime() async {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final firestore = FirebaseFirestore.instance;
 
-    double totalSimilarity = 0.0;
-    int comparisons = 0;
+  try {
+    final specialQuery = await firestore
+        .collection('special_classes')
+        .where('date', isGreaterThanOrEqualTo: Timestamp.fromDate(today))
+        .where('date',
+            isLessThan: Timestamp.fromDate(today.add(const Duration(days: 1))))
+        .limit(1)
+        .get();
 
-    for (int i = 0; i < _enrolledEmbeddings.length; i++) {
-      for (int j = i + 1; j < _enrolledEmbeddings.length; j++) {
-        final emb1 = _enrolledEmbeddings[i]['embedding'] as List<double>;
-        final emb2 = _enrolledEmbeddings[j]['embedding'] as List<double>;
-
-        final similarity = _cosineSimilarity(emb1, emb2);
-        totalSimilarity += similarity;
-        comparisons++;
-      }
+    if (specialQuery.docs.isNotEmpty) {
+      final data = specialQuery.docs.first.data();
+      print('   📚 วันนี้เป็นชั้นเรียนพิเศษ');
+      return TimeOfDay(
+        hour: data['startHour'] ?? 0,
+        minute: data['startMinute'] ?? 0,
+      );
     }
-
-    return comparisons > 0 ? totalSimilarity / comparisons : 1.0;
-  }
-
-  // ================ CALCULATE MEAN EMBEDDING ================
-  List<double> _calculateMeanEmbedding() {
-    if (_enrolledEmbeddings.isEmpty) return [];
-
-    final facesToUse = _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
-
-    final firstEmb = facesToUse.first['embedding'] as List<double>;
-    final dimension = firstEmb.length;
-    final mean = List<double>.filled(dimension, 0.0);
-    double totalWeight = 0.0;
-
-    for (var emb in facesToUse) {
-      final vector = emb['embedding'] as List<double>;
-      final quality =
-          emb['total_quality'] as double? ?? emb['quality'] as double;
-      final weight = quality;
-
-      for (int i = 0; i < dimension; i++) {
-        mean[i] += vector[i] * weight;
-      }
-      totalWeight += weight;
-    }
-
-    for (int i = 0; i < dimension; i++) {
-      mean[i] /= totalWeight;
-    }
-
-    return _l2Normalize(mean);
-  }
-
-  // ================ UTILITY FUNCTIONS ================
-  double _cosineSimilarity(List<double> a, List<double> b) {
-    if (a.length != b.length) return 0.0;
-
-    double dot = 0.0, normA = 0.0, normB = 0.0;
-    for (int i = 0; i < a.length; i++) {
-      dot += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
-    }
-
-    if (normA < 1e-12 || normB < 1e-12) return 0.0;
-
-    final similarity = dot / (sqrt(normA) * sqrt(normB));
-    return ((similarity + 1) / 2).clamp(0.0, 1.0);
-  }
-
-  List<double> _l2Normalize(List<double> vector) {
-    double norm = 0.0;
-    for (final v in vector) norm += v * v;
-    norm = sqrt(norm);
-
-    if (norm < 1e-12) return vector;
-
-    final normalized = List<double>.filled(vector.length, 0.0);
-    for (int i = 0; i < vector.length; i++) {
-      normalized[i] = vector[i] / norm;
-    }
-    return normalized;
-  }
-
-  // ================ DIALOGS ================
-  void _showInsufficientConsistencyDialog() {
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('ความสอดคล้องไม่พอ'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('ใบหน้าที่ถ่ายมีความสอดคล้องกันไม่พอ'),
-              const SizedBox(height: 8),
-              Text('ความสอดคล้อง: ${(_enrollmentConsistency * 100).toInt()}%'),
-              Text('ต้องการ: ${(MIN_ENROLLMENT_CONSISTENCY * 100).toInt()}%'),
-              const SizedBox(height: 16),
-              Text(
-                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
-              Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
-              if (_bestFaces.isNotEmpty) ...[
-                const SizedBox(height: 16),
-                const Text('คุณสามารถใช้ใบหน้าที่ดีที่สุดที่มีอยู่'),
-              ],
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _resetAndTryAgain();
-              },
-              child: const Text('ถ่ายใหม่'),
-            ),
-            if (_bestFaces.isNotEmpty)
-              TextButton(
-                onPressed: () async {
-                  Navigator.pop(context);
-                  await _saveFaceIDProfileWithBestFaces();
-                },
-                child: const Text('ใช้ใบหน้าที่ดีที่สุด'),
-              ),
-          ],
+  } catch (e) {
+    for (var special in _specialClasses) {
+      final classDate = special['date'];
+      if (classDate != null) {
+        final classDay = DateTime(
+          classDate.year,
+          classDate.month,
+          classDate.day,
         );
-      },
-    );
-  }
-
-  void _offerToUseBestFaces() {
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('ใช้ใบหน้าที่ดีที่สุด?'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                  'ลองถ่ายหลายครั้งแล้ว แต่ยังไม่ได้คุณภาพตามที่ต้องการ'),
-              const SizedBox(height: 16),
-              Text(
-                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
-              Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
-              if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS) ...[
-                const SizedBox(height: 8),
-                const Text('✅ มีจำนวนเพียงพอสำหรับการบันทึก'),
-              ] else ...[
-                const SizedBox(height: 8),
-                Text(
-                    '⚠️ มีเพียง ${_bestFaces.length} รูป (ต้องการ $MIN_ENROLLMENT_EMBEDDINGS รูป)'),
-              ],
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _resetAndTryAgain();
-              },
-              child: const Text('ลองถ่ายใหม่'),
-            ),
-            if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS)
-              TextButton(
-                onPressed: () async {
-                  Navigator.pop(context);
-                  _enrolledEmbeddings = List.from(_bestFaces);
-                  _enrollmentCount = _bestFaces.length;
-                  _enrollmentConsistency = _calculateConsistency();
-                  await _saveFaceIDProfileWithBestFaces();
-                },
-                child: const Text('บันทึกด้วยใบหน้าที่ดีที่สุด'),
-              ),
-            if (_bestFaces.length < MIN_ENROLLMENT_EMBEDDINGS &&
-                _bestFaces.isNotEmpty)
-              TextButton(
-                onPressed: () {
-                  Navigator.pop(context);
-                  _continueCapturing();
-                },
-                child: const Text('ถ่ายเพิ่ม'),
-              ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _offerToUseBestAvailable() {
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('ไม่พบใบหน้าที่มีคุณภาพดี'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('ลองถ่ายหลายครั้งแล้ว แต่ยังไม่มีใบหน้าที่มีคุณภาพดี'),
-              const SizedBox(height: 16),
-              Text('จำนวนครั้งที่ลอง: $_captureAttempts ครั้ง'),
-              if (_allCapturedFaces.isNotEmpty) ...[
-                const SizedBox(height: 8),
-                Text(
-                    'ใบหน้าที่ดีที่สุดจากที่ลอง: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
-              ],
-              const SizedBox(height: 16),
-              const Text('คุณต้องการ:'),
-              const Text('1. ลองถ่ายใหม่'),
-              const Text('2. กลับไปหน้าแรก'),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _resetAndTryAgain();
-              },
-              child: const Text('ลองถ่ายใหม่'),
-            ),
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                Navigator.pushNamedAndRemoveUntil(
-                    context, '/home', (route) => false);
-              },
-              child: const Text('กลับหน้าแรก'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _resetAndTryAgain() {
-    setState(() {
-      _captureAttempts = 0;
-      _isRetryMode = true;
-      _statusMessage = '📸 ลองถ่ายใหม่';
-      _instructionMessage = 'วางใบหน้าในกรอบ';
-      _stableFrameCount = 0;
-      _consecutiveLowQuality = 0;
-      _isStruggling = false;
-    });
-  }
-
-  void _continueCapturing() {
-    setState(() {
-      _isRetryMode = false;
-      _statusMessage = '📸 ถ่ายเพิ่มเติม';
-      _instructionMessage =
-          'ถ่ายอีก ${MIN_ENROLLMENT_EMBEDDINGS - _enrollmentCount} รูป';
-      _stableFrameCount = 0;
-    });
-  }
-
-  // ================ SAVE TO FIREBASE ================
-  Future<void> _saveFaceIDProfileWithBestFaces() async {
-    setState(() {
-      _isSaving = true;
-      _statusMessage = '💾 กำลังบันทึก...';
-    });
-
-    try {
-      final user = _auth.currentUser;
-      if (user == null) throw Exception('ไม่พบผู้ใช้');
-
-      final faceProfileId = _uuid.v4();
-
-      final facesToUse =
-          _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
-      final meanEmbedding = _calculateMeanEmbedding();
-
-      double totalQuality = 0;
-      double totalStability = 0;
-      double totalLighting = 0;
-      double totalSharpness = 0;
-
-      for (var face in facesToUse) {
-        totalQuality += face['quality'] as double;
-        totalStability += face['stability'] as double;
-        totalLighting += face['lighting'] as double? ?? 0.5;
-        totalSharpness += face['sharpness'] as double? ?? 0.5;
-      }
-
-      final avgQuality = totalQuality / facesToUse.length;
-      final avgStability = totalStability / facesToUse.length;
-      final avgLighting = totalLighting / facesToUse.length;
-      final avgSharpness = totalSharpness / facesToUse.length;
-
-      final confidenceScore = (avgQuality * 0.4 +
-          avgStability * 0.3 +
-          avgLighting * 0.15 +
-          avgSharpness * 0.15);
-
-      print('✅ บันทึกด้วยใบหน้าที่ดีที่สุด ${facesToUse.length} รูป');
-      print(
-          '📊 คะแนนความมั่นใจ: ${(confidenceScore * 100).toStringAsFixed(1)}%');
-
-      final faceProfile = {
-        'profile_id': faceProfileId,
-        'user_id': user.uid,
-        'mean_embedding': meanEmbedding,
-        'embedding_dimension': meanEmbedding.length,
-        'embedding_version': EMBEDDING_VERSION,
-        'embedding_model': MODEL_NAME,
-        'enrollment_stats': {
-          'total_embeddings': facesToUse.length,
-          'total_attempts': _captureAttempts,
-          'best_quality': _absoluteBestQuality,
-          'consistency': _enrollmentConsistency,
-          'confidence': confidenceScore,
-          'average_quality': avgQuality,
-          'average_stability': avgStability,
-        },
-        'quality_metrics': {
-          'face_quality': avgQuality,
-          'stability': avgStability,
-          'lighting_score': avgLighting,
-          'sharpness_score': avgSharpness,
-          'confidence_score': confidenceScore,
-        },
-        'liveness_verified': true,
-        'capture_timestamp': DateTime.now().toIso8601String(),
-        'created_at': FieldValue.serverTimestamp(),
-        'status': 'active',
-        'thresholds': {
-          'verification': 0.75,
-          'identification': 0.78,
-        },
-      };
-
-      await _firestore
-          .collection('users')
-          .doc(user.uid)
-          .collection('face_profiles')
-          .doc(faceProfileId)
-          .set(faceProfile);
-
-      for (int i = 0; i < facesToUse.length; i++) {
-        final emb = facesToUse[i];
-        final embeddingId = _uuid.v4();
-
-        await _firestore
-            .collection('users')
-            .doc(user.uid)
-            .collection('face_embeddings')
-            .doc(embeddingId)
-            .set({
-          'embedding_id': embeddingId,
-          'profile_id': faceProfileId,
-          'user_id': user.uid,
-          'embedding_vector': emb['embedding'],
-          'quality_score': emb['quality'],
-          'stability_score': emb['stability'],
-          'lighting_score': emb['lighting'] ?? 0.5,
-          'sharpness_score': emb['sharpness'] ?? 0.5,
-          'total_quality': emb['total_quality'] ?? emb['quality'],
-          'angles': emb['angles'],
-          'capture_sequence': i + 1,
-          'capture_attempt': emb['capture_attempt'],
-          'dimension': emb['dimension'],
-          'created_at': FieldValue.serverTimestamp(),
-        });
-      }
-
-      await _firestore.collection('users').doc(user.uid).set({
-        'active': true,
-      }, SetOptions(merge: true));
-
-      if (mounted) {
-        setState(() {
-          _statusMessage = '✅ Face ID สำเร็จ!';
-          _instructionMessage =
-              'ความมั่นใจ ${(confidenceScore * 100).toInt()}%';
-          _isSaving = false;
-          _captureComplete = true;
-        });
-      }
-
-      _playSuccessAnimation();
-
-      await Future.delayed(const Duration(seconds: 2));
-      if (mounted) {
-        Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
-      }
-    } catch (e) {
-      print('❌ Save error: $e');
-      if (mounted) {
-        setState(() {
-          _statusMessage = '❌ บันทึกไม่สำเร็จ';
-          _instructionMessage = 'ลองใหม่';
-          _isSaving = false;
-        });
+        if (today.isAtSameMomentAs(classDay)) {
+          return TimeOfDay(
+            hour: special['startHour'] ?? 0,
+            minute: special['startMinute'] ?? 0,
+          );
+        }
       }
     }
   }
 
-  void _showCaptureSuccess() {
-    setState(() => _showGuide = true);
-    Future.delayed(const Duration(milliseconds: 400), () {
-      if (mounted) setState(() => _showGuide = false);
-    });
-  }
+  return _checkInStart;
+}
 
-  void _playSuccessAnimation() async {
-    await _successController.forward();
-    await Future.delayed(const Duration(milliseconds: 400));
-    await _successController.reverse();
-  }
+/// ดึงเวลาสิ้นสุดของวันนี้
+Future<TimeOfDay?> _getTodayEndTime() async {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final firestore = FirebaseFirestore.instance;
 
-  void _updateStatus(String status, String instruction, String detail) {
-    if (mounted) {
-      setState(() {
-        _statusMessage = status;
-        _instructionMessage = instruction;
-        _detailMessage = detail;
-      });
+  try {
+    final specialQuery = await firestore
+        .collection('special_classes')
+        .where('date', isGreaterThanOrEqualTo: Timestamp.fromDate(today))
+        .where('date',
+            isLessThan: Timestamp.fromDate(today.add(const Duration(days: 1))))
+        .limit(1)
+        .get();
+
+    if (specialQuery.docs.isNotEmpty) {
+      final data = specialQuery.docs.first.data();
+      return TimeOfDay(
+        hour: data['endHour'] ?? 0,
+        minute: data['endMinute'] ?? 0,
+      );
+    }
+  } catch (e) {
+    for (var special in _specialClasses) {
+      final classDate = special['date'];
+      if (classDate != null) {
+        final classDay = DateTime(
+          classDate.year,
+          classDate.month,
+          classDate.day,
+        );
+        if (today.isAtSameMomentAs(classDay)) {
+          return TimeOfDay(
+            hour: special['endHour'] ?? 0,
+            minute: special['endMinute'] ?? 0,
+          );
+        }
+      }
     }
   }
 
-  Color _getQualityColor(double quality) {
-    if (quality >= 0.85) return Colors.green;
-    if (quality >= 0.75) return Colors.lightGreen;
-    if (quality >= 0.65) return Colors.yellow;
-    if (quality >= 0.55) return Colors.orange;
-    return Colors.red;
+  return _checkInEnd;
+}
+
+/// เพิ่ม missed count ให้ผู้ใช้
+Future<void> _incrementMissedCount(String userId, DateTime date,
+    Map<String, dynamic> userData, Map<String, dynamic> userInfo) async {
+  try {
+    final firestore = FirebaseFirestore.instance;
+    final currentMissedCount = userData['missed_count'] ?? 0;
+    final userEmail = userData['email'] ?? 'ไม่ทราบอีเมล';
+    final firstName = userData['firstName'] ?? '';
+    final lastName = userData['lastName'] ?? '';
+
+    final educationLevel = userInfo['educationLevel'] ?? '';
+    final year = userInfo['year'] ?? '';
+    final department = userInfo['department'] ?? '';
+    final fullName = userInfo['fullName'] ?? '$firstName $lastName'.trim();
+    final studentId = userInfo['studentId'] ?? '';
+
+    print('\n   📝 ===== กำลังเพิ่ม Missed Out =====');
+    print('   👤 ผู้ใช้: $fullName ($userEmail)');
+    print('   🆔 รหัสนักศึกษา: $studentId');
+    print('   📚 ข้อมูล: $educationLevel $year $department');
+    print('   📊 missed_count ปัจจุบัน: $currentMissedCount');
+
+    final newMissedCount = currentMissedCount + 1;
+
+    await firestore.collection('users').doc(userId).update({
+      'missed_count': FieldValue.increment(1),
+      'last_missed_date': Timestamp.fromDate(date),
+      'last_missed_update': FieldValue.serverTimestamp(),
+      'updated_at': FieldValue.serverTimestamp(),
+    });
+
+    print('   ✅ เพิ่ม missed count สำเร็จ!');
+    print('      - จาก $currentMissedCount → $newMissedCount');
+
+    final logRef = await firestore.collection('missed_logs').add({
+      'userId': userId,
+      'studentId': studentId,
+      'userEmail': userEmail,
+      'userName': fullName,
+      'educationLevel': educationLevel,
+      'year': year,
+      'department': department,
+      'date': Timestamp.fromDate(date),
+      'check_date': DateFormat('yyyy-MM-dd').format(date),
+      'reason': 'ไม่เช็คชื่อ (ระบบอัตโนมัติ)',
+      'status': 'เพิ่มโดยระบบ',
+      'timestamp': FieldValue.serverTimestamp(),
+      'previous_count': currentMissedCount,
+      'new_count': newMissedCount,
+      'check_time': Timestamp.now(),
+    });
+
+    print('   📝 บันทึก log เรียบร้อย: ${logRef.id}');
+    print('      - studentId: $studentId');
+    print('      - check_date: ${DateFormat('yyyy-MM-dd').format(date)}');
+    print('   🔚 ===== จบการเพิ่ม Missed Out =====\n');
+  } catch (e, stackTrace) {
+    print('   ❌ Error incrementing missed count: $e');
+    await _logSystemError(
+        'Increment Missed Error', e.toString(), stackTrace.toString(),
+        userId: userId);
+  }
+}
+
+/// ส่ง notification สรุป missed count รายวัน
+Future<void> _sendMissedSummaryNotification(int totalMissed) async {
+  try {
+    await _showLocalNotification(
+      id: 9999,
+      title: '📊 สรุป missed count ประจำวัน',
+      body: 'วันนี้มีผู้ใช้ไม่เช็คชื่อ $totalMissed คน',
+      payload: 'missed_summary',
+    );
+
+    print('📊 Sent daily missed summary notification');
+  } catch (e) {
+    print('❌ Error sending missed summary: $e');
+  }
+}
+
+/// ส่งสรุป missed count รายวัน
+Future<void> _sendDailyMissedSummary() async {
+  try {
+    final firestore = FirebaseFirestore.instance;
+    final today = DateTime.now();
+    final dateStr = DateFormat('yyyy-MM-dd').format(today);
+
+    final logsSnapshot = await firestore
+        .collection('missed_logs')
+        .where('check_date', isEqualTo: dateStr)
+        .get();
+
+    final missedCount = logsSnapshot.docs.length;
+
+    if (missedCount > 0) {
+      await _sendMissedSummaryNotification(missedCount);
+    }
+  } catch (e) {
+    print('❌ Error sending daily summary: $e');
+  }
+}
+
+/// ตรวจสอบและตั้งเวลาการแจ้งเตือนตามเวลาจาก Firebase
+Future<void> _checkAndScheduleNotifications() async {
+  try {
+    print('🔍 Checking check-in times from Firebase...');
+
+    final firestore = FirebaseFirestore.instance;
+    final settingsDoc =
+        await firestore.collection('system_settings').doc('checkin_time').get();
+
+    if (!settingsDoc.exists) {
+      print('⚠️ No check-in settings found');
+      return;
+    }
+
+    final data = settingsDoc.data()!;
+    await _scheduleNotificationsFromData(data);
+  } catch (e, stackTrace) {
+    print('❌ Error checking notifications: $e');
+    await _logSystemError(
+        'Check Notifications Error', e.toString(), stackTrace.toString());
+  }
+}
+
+// ==================== UTILITY FUNCTIONS ====================
+
+String _formatTime(TimeOfDay time) {
+  return '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
+}
+
+String _formatTimeInt(int hour, int minute) {
+  final h = hour.toString().padLeft(2, '0');
+  final m = minute.toString().padLeft(2, '0');
+  return '$h:$m น.';
+}
+
+/// บันทึก error ลง Firestore
+Future<void> _logSystemError(
+  String errorType,
+  String errorMessage,
+  String stackTrace, {
+  String? userId,
+}) async {
+  try {
+    final firestore = FirebaseFirestore.instance;
+    await firestore.collection('system_errors').add({
+      'type': errorType,
+      'message': errorMessage,
+      'stack_trace': stackTrace,
+      'userId': userId,
+      'timestamp': FieldValue.serverTimestamp(),
+      'platform': Platform.operatingSystem,
+    });
+  } catch (e) {
+    print('❌ Could not log error to Firestore: $e');
+  }
+}
+
+// ==================== EXTENSIONS ====================
+
+extension DateTimeExtension on DateTime {
+  bool isSameDay(DateTime other) {
+    return year == other.year && month == other.month && day == other.day;
   }
 
-  // ================ BUILD UI ================
+  bool isToday() {
+    final now = DateTime.now();
+    return year == now.year && month == now.month && day == now.day;
+  }
+
+  bool isYesterday() {
+    final yesterday = DateTime.now().subtract(const Duration(days: 1));
+    return year == yesterday.year &&
+        month == yesterday.month &&
+        day == yesterday.day;
+  }
+}
+
+// ==================== APP WIDGET ====================
+
+class FaceApp extends StatelessWidget {
+  const FaceApp({super.key});
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: SafeArea(
-        child: Stack(
-          children: [
-            if (_isCameraReady && _cameraController != null)
-              Positioned.fill(
-                child: CameraPreview(_cameraController!),
-              )
-            else
-              _buildLoadingView(),
-
-            Positioned.fill(
-              child: Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      Colors.black.withOpacity(0.5),
-                      Colors.transparent,
-                      Colors.transparent,
-                      Colors.black.withOpacity(0.7),
-                    ],
-                  ),
-                ),
-                child: Column(
-                  children: [
-                    _buildHeader(),
-                    const Spacer(),
-                    _buildFaceFrame(),
-                    const SizedBox(height: 20),
-                    _buildMetricsGrid(),
-                    const SizedBox(height: 16),
-                    _buildProgressSection(),
-                    const SizedBox(height: 20),
-                  ],
-                ),
-              ),
-            ),
-
-            if (_isCapturing || _isSaving) _buildProcessingOverlay(),
-            if (_showGuide) _buildSuccessGuide(),
-            if (_successController.isAnimating) _buildSuccessAnimation(),
-          ],
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Face Recognition App',
+      theme: ThemeData(
+        primarySwatch: Colors.deepPurple,
+        fontFamily: 'Roboto',
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+        appBarTheme: const AppBarTheme(
+          elevation: 0,
+          centerTitle: true,
         ),
       ),
-    );
-  }
-
-  Widget _buildLoadingView() {
-    return Container(
-      color: Colors.black,
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const CircularProgressIndicator(color: Colors.white),
-            const SizedBox(height: 20),
-            Text(_statusMessage, style: const TextStyle(color: Colors.white)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildHeader() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-      child: Row(
-        children: [
-          IconButton(
-            icon:
-                const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20),
-            onPressed: () {
-              _detectionTimer?.cancel();
-              Navigator.pop(context);
-            },
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    const Text(
-                      'Face ID',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.15),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        '$_actualOutputDimension DIM',
-                        style: const TextStyle(
-                            color: Colors.white70, fontSize: 10),
-                      ),
-                    ),
-                  ],
-                ),
-                Text(
-                  _modelLoaded
-                      ? 'MobileFaceNet${_isIos ? " (iOS)" : " (Android)"}'
-                      : 'กำลังเตรียม...',
-                  style: const TextStyle(color: Colors.white60, fontSize: 11),
-                ),
-              ],
-            ),
-          ),
-          if (_bestFaces.isNotEmpty)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: Colors.amber.withOpacity(0.15),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: Colors.amber.withOpacity(0.3)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.star, color: Colors.amber, size: 14),
-                  const SizedBox(width: 4),
-                  Text(
-                    '${(_absoluteBestQuality * 100).toInt()}%',
-                    style: const TextStyle(
-                        color: Colors.amber,
-                        fontSize: 12,
-                        fontWeight: FontWeight.bold),
-                  ),
-                ],
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildFaceFrame() {
-    final size = _isSmallScreen ? 200.0 : 240.0;
-
-    return Center(
-      child: Column(
-        children: [
-          ScaleTransition(
-            scale: _pulseAnimation,
-            child: Container(
-              width: size,
-              height: size * 1.2,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: _currentFace != null
-                      ? _getQualityColor(_faceQuality).withOpacity(0.8)
-                      : Colors.white.withOpacity(0.3),
-                  width: 2,
-                ),
-              ),
-              child: Stack(
-                children: [
-                  ..._buildCorners(size, size * 1.2),
-                  if (_currentFace != null)
-                    Positioned(
-                      top: -20,
-                      left: 0,
-                      right: 0,
-                      child: Center(
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withOpacity(0.6),
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(
-                                color: _getQualityColor(_faceQuality)),
-                          ),
-                          child: Text(
-                            _statusMessage,
-                            style: TextStyle(
-                              color: _getQualityColor(_faceQuality),
-                              fontSize: 12,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.black.withOpacity(0.5),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Text(
-              _instructionMessage,
-              style: const TextStyle(color: Colors.white, fontSize: 13),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  List<Widget> _buildCorners(double width, double height) {
-    final color = _currentFace != null
-        ? _getQualityColor(_faceQuality)
-        : Colors.white.withOpacity(0.3);
-
-    return [
-      Positioned(
-        top: 0,
-        left: 0,
-        child: Container(
-          width: CORNER_SIZE,
-          height: CORNER_SIZE,
-          decoration: BoxDecoration(
-            border: Border(
-              top: BorderSide(color: color, width: CORNER_THICKNESS),
-              left: BorderSide(color: color, width: CORNER_THICKNESS),
-            ),
-          ),
-        ),
-      ),
-      Positioned(
-        top: 0,
-        right: 0,
-        child: Container(
-          width: CORNER_SIZE,
-          height: CORNER_SIZE,
-          decoration: BoxDecoration(
-            border: Border(
-              top: BorderSide(color: color, width: CORNER_THICKNESS),
-              right: BorderSide(color: color, width: CORNER_THICKNESS),
-            ),
-          ),
-        ),
-      ),
-      Positioned(
-        bottom: 0,
-        left: 0,
-        child: Container(
-          width: CORNER_SIZE,
-          height: CORNER_SIZE,
-          decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: color, width: CORNER_THICKNESS),
-              left: BorderSide(color: color, width: CORNER_THICKNESS),
-            ),
-          ),
-        ),
-      ),
-      Positioned(
-        bottom: 0,
-        right: 0,
-        child: Container(
-          width: CORNER_SIZE,
-          height: CORNER_SIZE,
-          decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: color, width: CORNER_THICKNESS),
-              right: BorderSide(color: color, width: CORNER_THICKNESS),
-            ),
-          ),
-        ),
-      ),
-    ];
-  }
-
-  Widget _buildMetricsGrid() {
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 20),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.5),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white.withOpacity(0.1)),
-      ),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(child: _buildMetricItem('คุณภาพ', _faceQuality)),
-              Expanded(child: _buildMetricItem('เสถียร', _faceStability)),
-              Expanded(child: _buildMetricItem('แสง', _lightingScore)),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(child: _buildMetricItem('คมชัด', _sharpnessScore)),
-              Expanded(child: _buildMetricItem('มุม', _poseScore)),
-              Expanded(child: _buildMetricItem('สมมาตร', _faceSymmetry)),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMetricItem(String label, double value) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(
-              label,
-              style: const TextStyle(color: Colors.white60, fontSize: 11),
-            ),
-            Text(
-              '${(value * 100).toInt()}%',
-              style: TextStyle(
-                color: _getQualityColor(value),
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 4),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(2),
-          child: LinearProgressIndicator(
-            value: value,
-            backgroundColor: Colors.white.withOpacity(0.1),
-            valueColor: AlwaysStoppedAnimation<Color>(_getQualityColor(value)),
-            minHeight: METRICS_BAR_HEIGHT,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildProgressSection() {
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 20),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.5),
-        borderRadius: BorderRadius.circular(30),
-        border: Border.all(color: Colors.white.withOpacity(0.1)),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Text(
-                      '$_enrollmentCount/$MIN_ENROLLMENT_EMBEDDINGS',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 14,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    if (_bestFaces.isNotEmpty)
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 6, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: Colors.amber.withOpacity(0.15),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Text(
-                          'ดีสุด ${(_absoluteBestQuality * 100).toInt()}%',
-                          style: const TextStyle(
-                              color: Colors.amber, fontSize: 10),
-                        ),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(2),
-                  child: LinearProgressIndicator(
-                    value: _enrollmentCount / MIN_ENROLLMENT_EMBEDDINGS,
-                    backgroundColor: Colors.white.withOpacity(0.1),
-                    valueColor: AlwaysStoppedAnimation<Color>(
-                      _enrollmentCount >= MIN_ENROLLMENT_EMBEDDINGS
-                          ? Colors.green
-                          : Colors.blue,
-                    ),
-                    minHeight: 4,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 16),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Text(
-              '$_captureAttempts/$MAX_CAPTURE_ATTEMPTS',
-              style: TextStyle(
-                color: Colors.white.withOpacity(0.7),
-                fontSize: 11,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildProcessingOverlay() {
-    return Container(
-      color: Colors.black.withOpacity(0.8),
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const CircularProgressIndicator(color: Colors.white),
-            const SizedBox(height: 20),
-            Text(
-              _isCapturing ? '📸 กำลังประมวลผล...' : '💾 กำลังบันทึก...',
-              style: const TextStyle(color: Colors.white, fontSize: 16),
-            ),
-            if (_bestFaces.isNotEmpty && _isSaving) ...[
-              const SizedBox(height: 8),
-              Text(
-                'ใช้ใบหน้าที่ดีที่สุด ${_bestFaces.length} รูป',
-                style: const TextStyle(color: Colors.white70, fontSize: 12),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSuccessGuide() {
-    return Positioned.fill(
-      child: Container(
-        color: Colors.transparent,
-        child: Center(
-          child: Container(
-            width: 70,
-            height: 70,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: Colors.green.withOpacity(0.3),
-              border: Border.all(color: Colors.green, width: 3),
-            ),
-            child: const Icon(Icons.check, color: Colors.white, size: 35),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSuccessAnimation() {
-    return Positioned.fill(
-      child: Container(
-        color: Colors.transparent,
-        child: Center(
-          child: ScaleTransition(
-            scale: _successController,
-            child: Container(
-              width: 100,
-              height: 100,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: Colors.green.withOpacity(0.3),
-                border: Border.all(color: Colors.green, width: 4),
-              ),
-              child: const Icon(Icons.check, color: Colors.white, size: 50),
-            ),
-          ),
-        ),
-      ),
+      home: const LoginPage(),
+      routes: {
+        '/login': (context) => LoginPage(),
+        '/register': (context) => RegisterPage(),
+        '/pdpa': (context) => PDPAPage(),
+        '/hat': (context) => HatPage(),
+        '/capture': (context) => CapturePage(),
+        '/home': (context) => HomePage(),
+        '/hat_2': (context) => Hat2Page(),
+        '/account': (context) => AccountPage(),
+        '/capture_checkin': (context) => CheckinMatchPage(),
+        '/Home_admin': (context) => HomeAdminPage(),
+        '/Home_personal': (context) => HomePersonalPage(),
+        '/edit_student': (context) => EditStudentPage(),
+        '/time': (context) => const TimeManagementPage(),
+        '/edit_check': (context) => const EditCheckPage(),
+        '/edit_personal': (context) => const EditPersonalPage(),
+        '/level_up': (context) => const LevelUpPage(),
+        '/reset_pass': (context) => ResetPassPage(),
+        '/screen': (context) => ScreenPage(),
+        '/new_password': (context) => NewPasswordPage(),
+        '/account_personal': (context) => const AccountPersonalPage(),
+      },
     );
   }
 }
