@@ -73,150 +73,94 @@ bool _isMissedSystemRunning = false;
 DateTime? _lastFullCheckTime;
 bool _isAppInForeground = true;
 
-// ==================== FIREBASE MESSAGING BACKGROUND HANDLER ====================
+// Service locator สำหรับระบบต่างๆ
+class AppServices {
+  static bool _isInitialized = false;
+  static bool _isInitializing = false;
 
-@pragma('vm:entry-point')
-Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  print("📨 [Background] Message: ${message.messageId}");
+  static Future<void> initialize() async {
+    if (_isInitialized || _isInitializing) return;
 
-  // จัดการ silent notification สำหรับ iOS
-  if (message.data['type'] == 'check_missed') {
-    print("🔍 [iOS Background] Checking missed count from push");
-    await _checkAllUsersMissedCount(isBackground: true);
-  }
-
-  // แสดง notification เมื่อได้รับ message ตอนแอปปิด
-  if (message.notification != null) {
-    await _showLocalNotification(
-      id: DateTime.now().millisecond,
-      title: message.notification?.title ?? 'การแจ้งเตือน',
-      body: message.notification?.body ?? '',
-      payload: message.data.toString(),
-    );
-  }
-}
-
-// ==================== WORKMANAGER CALLBACK (Android Only) ====================
-
-@pragma('vm:entry-point')
-void callbackDispatcher() {
-  Workmanager().executeTask((task, inputData) async {
-    print("📱 [WorkManager] Task: $task");
-
-    // iOS ไม่ควรเข้า WorkManager
-    if (Platform.isIOS) {
-      print("📱 iOS: Skipping WorkManager task");
-      return Future.value(true);
-    }
+    _isInitializing = true;
 
     try {
-      await Firebase.initializeApp(
-          options: DefaultFirebaseOptions.currentPlatform);
+      print(
+          '\n🚀 ===== เริ่มต้นระบบ Service (${Platform.operatingSystem}) =====');
 
-      switch (task) {
-        case 'checkin_notification_task':
-          print("📅 Running check-in notification task...");
-          await _checkAndScheduleNotifications();
-          break;
+      // Initialize timezone (ทำงานเร็ว)
+      tz_data.initializeTimeZones();
+      print('✅ Timezone initialized');
 
-        case 'missed_check_task':
-          print("🔍 Running missed count check task...");
-          await _checkAllUsersMissedCount(isBackground: true);
-          break;
+      // ตั้งค่า Firestore Settings (ทำงานเร็ว)
+      FirebaseFirestore.instance.settings = const Settings(
+        persistenceEnabled: true,
+        cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
+      );
+      print('✅ Firestore settings configured');
 
-        case 'daily_missed_summary':
-          print("📊 Running daily missed summary task...");
-          await _sendDailyMissedSummary();
-          break;
+      // Setup Notifications (ไม่บล็อค UI)
+      _setupNotifications().then((_) {
+        print('✅ Notifications setup completed');
+      }).catchError((e) {
+        print('❌ Notifications setup error: $e');
+      });
 
-        default:
-          print("⚠️ Unknown task: $task");
-      }
+      // Setup Firebase Messaging (ไม่บล็อค UI)
+      _setupFirebaseMessaging().then((_) {
+        print('✅ Firebase Messaging setup completed');
+      }).catchError((e) {
+        print('❌ Firebase Messaging error: $e');
+      });
+
+      // ตั้งค่า Listener (ไม่บล็อค UI)
+      _setupAllListeners().then((_) {
+        print('✅ All listeners setup completed');
+      }).catchError((e) {
+        print('❌ Listeners error: $e');
+      });
+
+      // Setup Background Tasks (ไม่บล็อค UI)
+      _setupBackgroundTasks().then((_) {
+        print('✅ Background tasks setup completed');
+      }).catchError((e) {
+        print('❌ Background tasks error: $e');
+      });
+
+      // โหลดข้อมูลเริ่มต้น (ไม่บล็อค UI)
+      _loadInitialData().then((_) {
+        print('✅ Initial data loaded');
+      }).catchError((e) {
+        print('❌ Load initial data error: $e');
+      });
+
+      // เริ่มระบบ Missed Count (ไม่บล็อค UI)
+      _initializeMissedCountSystem();
+
+      // ตรวจสอบและตั้งเวลาการแจ้งเตือนครั้งแรก (ไม่บล็อค UI)
+      _checkAndScheduleNotifications().then((_) {
+        print('✅ Initial notifications scheduled');
+      }).catchError((e) {
+        print('❌ Schedule notifications error: $e');
+      });
+
+      // ตั้งค่า App Lifecycle Listener
+      _setupAppLifecycleListener();
+
+      print('✅ ===== ระบบ Service พร้อมทำงาน =====\n');
+      _isInitialized = true;
     } catch (e, stackTrace) {
-      print('❌ [WorkManager] Error: $e');
-      await _logSystemError(
-          'WorkManager Error', e.toString(), stackTrace.toString());
-    }
-
-    return Future.value(true);
-  });
-}
-
-// ==================== MAIN FUNCTION ====================
-
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-
-  try {
-    print(
-        '\n🚀 ===== เริ่มต้นระบบ (Platform: ${Platform.operatingSystem}) =====');
-
-    // Initialize Firebase
-    await Firebase.initializeApp(
-        options: DefaultFirebaseOptions.currentPlatform);
-    print('✅ Firebase initialized');
-
-    // Initialize timezone
-    tz_data.initializeTimeZones();
-    print('✅ Timezone initialized');
-
-    // Setup Notifications (Platform specific)
-    await _setupNotifications();
-    print('✅ Notifications setup completed');
-
-    // Setup Firebase Messaging
-    await _setupFirebaseMessaging();
-    print('✅ Firebase Messaging setup completed');
-
-    // ตั้งค่า Firestore Settings
-    FirebaseFirestore.instance.settings = const Settings(
-      persistenceEnabled: true,
-      cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
-    );
-    print('✅ Firestore settings configured');
-
-    // ตั้งค่า Listener สำหรับข้อมูลที่เกี่ยวข้อง
-    await _setupAllListeners();
-    print('✅ All listeners setup completed');
-
-    // Setup Background Tasks (แยกตาม Platform)
-    await _setupBackgroundTasks();
-    print('✅ Background tasks setup completed');
-
-    // โหลดข้อมูลเริ่มต้น
-    await _loadInitialData();
-    print('✅ Initial data loaded');
-
-    // เริ่มระบบ Missed Count (Platform aware)
-    _initializeMissedCountSystem();
-    print('✅ Missed Count System initialized');
-
-    // ตรวจสอบและตั้งเวลาการแจ้งเตือนครั้งแรก
-    await _checkAndScheduleNotifications();
-    print('✅ Initial notifications scheduled');
-
-    // ตั้งค่า App Lifecycle Listener (สำคัญสำหรับ iOS)
-    _setupAppLifecycleListener();
-    print('✅ App lifecycle listener setup');
-
-    print('✅ ===== ระบบพร้อมทำงานบน ${Platform.operatingSystem} =====\n');
-  } catch (e, stackTrace) {
-    print('❌ [FATAL] Error initializing app: $e');
-    print('📚 Stack trace: $stackTrace');
-
-    try {
-      await _logSystemError(
-          'Main Initialization Error', e.toString(), stackTrace.toString());
-    } catch (logError) {
-      print('❌ Could not log error: $logError');
+      print('❌ Service initialization error: $e');
+      _logSystemError(
+          'Service Init Error', e.toString(), stackTrace.toString());
+    } finally {
+      _isInitializing = false;
     }
   }
 
-  runApp(const FaceApp());
+  static bool get isInitialized => _isInitialized;
 }
 
-// ==================== SETUP FUNCTIONS ====================
+// ==================== SETUP FUNCTIONS (เหมือนเดิม) ====================
 
 /// ตั้งค่า App Lifecycle Listener (จำเป็นสำหรับ iOS)
 void _setupAppLifecycleListener() {
@@ -362,7 +306,7 @@ Future<void> _setupNotifications() async {
     print('✅ Notifications setup completed for ${Platform.operatingSystem}');
   } catch (e, stackTrace) {
     print('❌ Error setting up notifications: $e');
-    await _logSystemError(
+    _logSystemError(
         'Setup Notifications Error', e.toString(), stackTrace.toString());
   }
 }
@@ -451,7 +395,7 @@ Future<void> _setupFirebaseMessaging() async {
     }
   } catch (e, stackTrace) {
     print('❌ Error setting up Firebase Messaging: $e');
-    await _logSystemError(
+    _logSystemError(
         'Setup Firebase Messaging Error', e.toString(), stackTrace.toString());
   }
 }
@@ -532,7 +476,7 @@ Future<void> _setupAndroidWorkManager() async {
     print('   ✅ Missed check task: ทุก 15 นาที');
   } catch (e, stackTrace) {
     print('❌ Error setting up WorkManager: $e');
-    await _logSystemError(
+    _logSystemError(
         'Setup WorkManager Error', e.toString(), stackTrace.toString());
   }
 }
@@ -700,7 +644,7 @@ Future<void> _checkAllUsersMissedCount({bool isBackground = false}) async {
     print('❌ [FATAL] Error checking all users missed count: $e');
     print('📚 Stack trace: $stackTrace');
 
-    await _logSystemError(
+    _logSystemError(
         'Check All Users Missed Error', e.toString(), stackTrace.toString());
   } finally {
     _isMissedSystemRunning = false;
@@ -890,7 +834,7 @@ Future<void> _scheduleNotificationsFromData(Map<String, dynamic> data) async {
         '✅ Scheduled $scheduledCount notifications for ${Platform.operatingSystem}');
   } catch (e, stackTrace) {
     print('❌ Error scheduling notifications: $e');
-    await _logSystemError(
+    _logSystemError(
         'Schedule Notifications Error', e.toString(), stackTrace.toString());
   }
 }
@@ -1063,7 +1007,7 @@ Future<void> _handleCheckinTimeChange(Map<String, dynamic> newData) async {
     print('✅ Real-time update completed successfully');
   } catch (e, stackTrace) {
     print('❌ Error handling real-time update: $e');
-    await _logSystemError(
+    _logSystemError(
         'Real-time Update Error', e.toString(), stackTrace.toString());
   } finally {
     _isScheduling = false;
@@ -1668,7 +1612,7 @@ Future<void> _incrementMissedCount(String userId, DateTime date,
     print('   🔚 ===== จบการเพิ่ม Missed Out =====\n');
   } catch (e, stackTrace) {
     print('   ❌ Error incrementing missed count: $e');
-    await _logSystemError(
+    _logSystemError(
         'Increment Missed Error', e.toString(), stackTrace.toString(),
         userId: userId);
   }
@@ -1730,7 +1674,7 @@ Future<void> _checkAndScheduleNotifications() async {
     await _scheduleNotificationsFromData(data);
   } catch (e, stackTrace) {
     print('❌ Error checking notifications: $e');
-    await _logSystemError(
+    _logSystemError(
         'Check Notifications Error', e.toString(), stackTrace.toString());
   }
 }
@@ -1769,6 +1713,76 @@ Future<void> _logSystemError(
   }
 }
 
+// ==================== FIREBASE MESSAGING BACKGROUND HANDLER ====================
+
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  print("📨 [Background] Message: ${message.messageId}");
+
+  // จัดการ silent notification สำหรับ iOS
+  if (message.data['type'] == 'check_missed') {
+    print("🔍 [iOS Background] Checking missed count from push");
+    await _checkAllUsersMissedCount(isBackground: true);
+  }
+
+  // แสดง notification เมื่อได้รับ message ตอนแอปปิด
+  if (message.notification != null) {
+    await _showLocalNotification(
+      id: DateTime.now().millisecond,
+      title: message.notification?.title ?? 'การแจ้งเตือน',
+      body: message.notification?.body ?? '',
+      payload: message.data.toString(),
+    );
+  }
+}
+
+// ==================== WORKMANAGER CALLBACK (Android Only) ====================
+
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((task, inputData) async {
+    print("📱 [WorkManager] Task: $task");
+
+    // iOS ไม่ควรเข้า WorkManager
+    if (Platform.isIOS) {
+      print("📱 iOS: Skipping WorkManager task");
+      return Future.value(true);
+    }
+
+    try {
+      await Firebase.initializeApp(
+          options: DefaultFirebaseOptions.currentPlatform);
+
+      switch (task) {
+        case 'checkin_notification_task':
+          print("📅 Running check-in notification task...");
+          await _checkAndScheduleNotifications();
+          break;
+
+        case 'missed_check_task':
+          print("🔍 Running missed count check task...");
+          await _checkAllUsersMissedCount(isBackground: true);
+          break;
+
+        case 'daily_missed_summary':
+          print("📊 Running daily missed summary task...");
+          await _sendDailyMissedSummary();
+          break;
+
+        default:
+          print("⚠️ Unknown task: $task");
+      }
+    } catch (e, stackTrace) {
+      print('❌ [WorkManager] Error: $e');
+      await _logSystemError(
+          'WorkManager Error', e.toString(), stackTrace.toString());
+    }
+
+    return Future.value(true);
+  });
+}
+
 // ==================== EXTENSIONS ====================
 
 extension DateTimeExtension on DateTime {
@@ -1786,6 +1800,46 @@ extension DateTimeExtension on DateTime {
     return year == yesterday.year &&
         month == yesterday.month &&
         day == yesterday.day;
+  }
+}
+
+// ==================== MAIN FUNCTION (OPTIMIZED FOR iOS) ====================
+
+Future<void> main() async {
+  // 1. ผูก Widgets Binding ทันที
+  WidgetsFlutterBinding.ensureInitialized();
+
+  try {
+    print(
+        '\n🚀 ===== เริ่มต้นแอปพลิเคชัน (Platform: ${Platform.operatingSystem}) =====');
+
+    // 2. Initialize Firebase เท่านั้น (เร็วที่สุด)
+    await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform);
+    print('✅ Firebase initialized');
+
+    // 3. เริ่มแสดง UI ทันที
+    runApp(const FaceApp());
+    print('✅ UI แสดงแล้ว');
+
+    // 4. เริ่มต้นระบบอื่นๆ หลังจาก UI แสดงแล้ว (ไม่บล็อค UI)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      print('🔄 UI แสดงสมบูรณ์ เริ่มต้นระบบอื่นๆ...');
+      AppServices.initialize();
+    });
+  } catch (e, stackTrace) {
+    print('❌ [FATAL] Error initializing app: $e');
+
+    // ถ้า Firebase ล้มเหลว ก็ยังต้องแสดง UI
+    runApp(const FaceApp());
+
+    // พยายาม log error
+    try {
+      await _logSystemError(
+          'Main Initialization Error', e.toString(), stackTrace.toString());
+    } catch (logError) {
+      print('❌ Could not log error: $logError');
+    }
   }
 }
 
