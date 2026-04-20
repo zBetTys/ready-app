@@ -12,6 +12,7 @@ import 'package:intl/intl.dart';
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 class CapturePage extends StatefulWidget {
   const CapturePage({super.key});
@@ -67,9 +68,9 @@ class _CapturePageState extends State<CapturePage>
   static const double MIN_ACCEPTABLE_QUALITY = 0.55;
 
   // ================ iOS OPTIMIZATIONS ================
-  static const int FRAME_SKIP_INTERVAL = 2;
+  static const int FRAME_SKIP_INTERVAL = 3;
   static const int CAPTURE_QUALITY_FRAMES_REQUIRED = 3;
-  static const ResolutionPreset OPTIMIZED_RESOLUTION = ResolutionPreset.low;
+  static const ResolutionPreset OPTIMIZED_RESOLUTION = ResolutionPreset.medium;
   
   // ================ UI CONSTANTS ================
   static const double FACE_FRAME_RATIO = 0.65;
@@ -118,7 +119,6 @@ class _CapturePageState extends State<CapturePage>
 
   // ================ iOS OPTIMIZATION VARIABLES ================
   bool _isIos = false;
-  bool _usingLowResolution = false;
   
   // ================ BEST FACE STORAGE ================
   List<Map<String, dynamic>> _allCapturedFaces = [];
@@ -249,16 +249,9 @@ class _CapturePageState extends State<CapturePage>
         orElse: () => cameras.first,
       );
 
-      ResolutionPreset resolution = OPTIMIZED_RESOLUTION;
-      if (_isIos) {
-        resolution = ResolutionPreset.low;
-        _usingLowResolution = true;
-        print('📱 iOS using low resolution for better performance');
-      }
-
       _cameraController = CameraController(
         frontCamera,
-        resolution,
+        OPTIMIZED_RESOLUTION,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
@@ -280,7 +273,6 @@ class _CapturePageState extends State<CapturePage>
 
       print('✅ กล้องพร้อม');
       print('📱 Camera ratio: $cameraRatio');
-      print('📱 Resolution: ${_cameraController!.value.previewSize}');
     } catch (e) {
       print('❌ Camera error: $e');
       rethrow;
@@ -324,7 +316,7 @@ class _CapturePageState extends State<CapturePage>
       }
 
       final interpreterOptions = InterpreterOptions()
-        ..threads = _isIos ? 1 : 4
+        ..threads = _isIos ? 2 : 4
         ..useNnApiForAndroid = true;
 
       _faceModel = await Interpreter.fromAsset(
@@ -391,7 +383,7 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ================ IMAGE STREAM ================
+  // ================ IMAGE STREAM - FIXED FOR BOTH PLATFORMS ================
   void _startImageStream() {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
       print('❌ Cannot start image stream: camera not ready');
@@ -399,7 +391,7 @@ class _CapturePageState extends State<CapturePage>
     }
 
     _cameraController!.startImageStream(_processCameraImage);
-    print('✅ Image stream started on ${_isIos ? "iOS" : "Android"}');
+    print('✅ Image stream started');
   }
 
   void _stopImageStream() {
@@ -407,11 +399,11 @@ class _CapturePageState extends State<CapturePage>
     print('🛑 Image stream stopped');
   }
 
-  // ================ CORRECTED IMAGE PROCESSING FOR iOS ================
+  // ================ FIXED: Working image processing for both platforms ================
   Future<void> _processCameraImage(CameraImage image) async {
     // Skip frames for performance
     _frameCounter++;
-    if (_isIos && _frameCounter % FRAME_SKIP_INTERVAL != 0) {
+    if (_frameCounter % FRAME_SKIP_INTERVAL != 0) {
       return;
     }
     
@@ -423,9 +415,12 @@ class _CapturePageState extends State<CapturePage>
     _isProcessingFrame = true;
 
     try {
-      // Convert CameraImage to InputImage
-      final inputImage = await _convertToInputImage(image);
-      if (inputImage == null) return;
+      // วิธีที่ง่ายและได้ผลที่สุด: แปลงเป็นไฟล์ชั่วคราว
+      final inputImage = await _cameraImageToInputImage(image);
+      if (inputImage == null) {
+        _isProcessingFrame = false;
+        return;
+      }
       
       final faces = await _faceDetector!.processImage(inputImage);
       
@@ -516,35 +511,40 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ================ FIXED: Convert CameraImage to InputImage ================
- // วิธีที่ถูกต้องสำหรับ InputImage.fromBytes
-
-
-// แก้ไขฟังก์ชัน _convertToInputImage เป็นดังนี้:
-Future<InputImage?> _convertToInputImage(CameraImage image) async {
-  try {
-    // แปลง YUV420 เป็น RGB
-    final rgbBytes = _yuv420ToRgb(image);
-    if (rgbBytes == null) return null;
-    
-    // สร้าง InputImage โดยตรงจาก bytes (วิธีที่ถูกต้อง)
-    return InputImage.fromBytes(
-      bytes: rgbBytes,
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: InputImageRotation.rotation0deg,
-        format: InputImageFormat.nv21,  // ใช้ nv21 format
-        bytesPerRow: image.width * 3,
-      ),
-    );
-  } catch (e) {
-    print('Error converting to InputImage: $e');
-    return null;
+  // ================ FIXED: Reliable conversion from CameraImage to InputImage ================
+  Future<InputImage?> _cameraImageToInputImage(CameraImage image) async {
+    try {
+      // สร้าง temporary directory
+      final Directory tempDir = await getTemporaryDirectory();
+      final String tempPath = '${tempDir.path}/face_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final File tempFile = File(tempPath);
+      
+      // แปลง YUV420 เป็น RGB image
+      final img.Image? rgbImage = _convertYUV420ToImage(image);
+      if (rgbImage == null) {
+        print('Failed to convert YUV to RGB');
+        return null;
+      }
+      
+      // บันทึกเป็น JPEG
+      final jpegData = img.encodeJpg(rgbImage, quality: 85);
+      await tempFile.writeAsBytes(jpegData);
+      
+      // สร้าง InputImage จากไฟล์
+      final inputImage = InputImage.fromFile(tempFile);
+      
+      // ลบไฟล์หลังใช้งาน (ไม่รอ)
+      tempFile.delete().catchError((e) {});
+      
+      return inputImage;
+    } catch (e) {
+      print('Error converting camera image: $e');
+      return null;
+    }
   }
-}
 
-  // Convert YUV420 to RGB888 bytes
-  Uint8List? _yuv420ToRgb(CameraImage image) {
+  // ================ Convert YUV420 to img.Image ================
+  img.Image? _convertYUV420ToImage(CameraImage image) {
     try {
       final int width = image.width;
       final int height = image.height;
@@ -557,8 +557,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
       final int uvRowStride = uPlane.bytesPerRow;
       final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
       
-      final Uint8List rgbBytes = Uint8List(width * height * 3);
-      int rgbIndex = 0;
+      final img.Image rgbImage = img.Image(width: width, height: height);
       
       for (int y = 0; y < height; y++) {
         int uvY = y ~/ 2;
@@ -587,16 +586,13 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
           g = g.clamp(0, 255);
           b = b.clamp(0, 255);
           
-          // Write RGB bytes
-          rgbBytes[rgbIndex++] = r;
-          rgbBytes[rgbIndex++] = g;
-          rgbBytes[rgbIndex++] = b;
+          rgbImage.setPixelRgb(x, y, r, g, b);
         }
       }
       
-      return rgbBytes;
+      return rgbImage;
     } catch (e) {
-      print('YUV to RGB conversion error: $e');
+      print('YUV to Image conversion error: $e');
       return null;
     }
   }
@@ -683,15 +679,13 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
           _absoluteBestFace = embeddingData;
           _hasGoodFaces = true;
 
-          print(
-              '✨ พบใบหน้าที่ดีขึ้น: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
+          print('✨ พบใบหน้าที่ดีขึ้น: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
         }
 
         setState(() {
           _enrollmentCount++;
           _hasGoodFaces = true;
-          _statusMessage =
-              '✅ ได้ใบหน้าคุณภาพ ${(totalQualityScore * 100).toInt()}%';
+          _statusMessage = '✅ ได้ใบหน้าคุณภาพ ${(totalQualityScore * 100).toInt()}%';
           _isCapturing = false;
           _stableFrameCount = 0;
           _consecutiveGoodFrames = 0;
@@ -715,16 +709,14 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
         }
       } else {
         setState(() {
-          _statusMessage =
-              '⚠️ คุณภาพ ${(totalQualityScore * 100).toInt()}% (ต้องการ ${(qualityThreshold * 100).toInt()}%)';
+          _statusMessage = '⚠️ คุณภาพ ${(totalQualityScore * 100).toInt()}% (ต้องการ ${(qualityThreshold * 100).toInt()}%)';
           _instructionMessage = _currentGuidance.isNotEmpty
               ? _currentGuidance
               : 'พยายามต่อไป (ครั้งที่ $_captureAttempts/$MAX_CAPTURE_ATTEMPTS)';
           _isCapturing = false;
         });
 
-        print(
-            '⚠️ คุณภาพไม่พอ: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
+        print('⚠️ คุณภาพไม่พอ: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
 
         if (_captureAttempts >= MAX_CAPTURE_ATTEMPTS &&
             _enrolledEmbeddings.isNotEmpty) {
@@ -871,8 +863,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
         leftCheek = 0.7 + (leftCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
       }
       if (rightCheekLandmark != null) {
-        rightCheek =
-            0.7 + (rightCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
+        rightCheek = 0.7 + (rightCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
       }
     } catch (_) {}
 
@@ -1008,10 +999,6 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
     }
 
     if (_enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-      String qualityText = _faceQuality >= 0.75
-          ? 'คุณภาพดี'
-          : (_faceQuality >= 0.65 ? 'คุณภาพพอใช้' : 'คุณภาพต่ำ');
-
       _updateStatus(
         '✅ ใส่ใบหน้าคุณภาพดี (${(_faceQuality * 100).toInt()}%)',
         'ถ่ายรูปที่ ${_enrollmentCount + 1}/$MIN_ENROLLMENT_EMBEDDINGS',
@@ -1279,8 +1266,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
               Text('ความสอดคล้อง: ${(_enrollmentConsistency * 100).toInt()}%'),
               Text('ต้องการ: ${(MIN_ENROLLMENT_CONSISTENCY * 100).toInt()}%'),
               const SizedBox(height: 16),
-              Text(
-                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
+              Text('ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
               Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
               if (_bestFaces.isNotEmpty) ...[
                 const SizedBox(height: 16),
@@ -1323,19 +1309,16 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                  'ลองถ่ายหลายครั้งแล้ว แต่ยังไม่ได้คุณภาพตามที่ต้องการ'),
+              const Text('ลองถ่ายหลายครั้งแล้ว แต่ยังไม่ได้คุณภาพตามที่ต้องการ'),
               const SizedBox(height: 16),
-              Text(
-                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
+              Text('ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
               Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
               if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS) ...[
                 const SizedBox(height: 8),
                 const Text('✅ มีจำนวนเพียงพอสำหรับการบันทึก'),
               ] else ...[
                 const SizedBox(height: 8),
-                Text(
-                    '⚠️ มีเพียง ${_bestFaces.length} รูป (ต้องการ $MIN_ENROLLMENT_EMBEDDINGS รูป)'),
+                Text('⚠️ มีเพียง ${_bestFaces.length} รูป (ต้องการ $MIN_ENROLLMENT_EMBEDDINGS รูป)'),
               ],
             ],
           ),
@@ -1391,8 +1374,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
               Text('จำนวนครั้งที่ลอง: $_captureAttempts ครั้ง'),
               if (_allCapturedFaces.isNotEmpty) ...[
                 const SizedBox(height: 8),
-                Text(
-                    'ใบหน้าที่ดีที่สุดจากที่ลอง: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
+                Text('ใบหน้าที่ดีที่สุดจากที่ลอง: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
               ],
               const SizedBox(height: 16),
               const Text('คุณต้องการ:'),
@@ -1439,8 +1421,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
     setState(() {
       _isRetryMode = false;
       _statusMessage = '📸 ถ่ายเพิ่มเติม';
-      _instructionMessage =
-          'ถ่ายอีก ${MIN_ENROLLMENT_EMBEDDINGS - _enrollmentCount} รูป';
+      _instructionMessage = 'ถ่ายอีก ${MIN_ENROLLMENT_EMBEDDINGS - _enrollmentCount} รูป';
       _stableFrameCount = 0;
     });
   }
@@ -1458,8 +1439,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
 
       final faceProfileId = _uuid.v4();
 
-      final facesToUse =
-          _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
+      final facesToUse = _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
       final meanEmbedding = _calculateMeanEmbedding();
 
       double totalQuality = 0;
@@ -1485,8 +1465,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
           avgSharpness * 0.15);
 
       print('✅ บันทึกด้วยใบหน้าที่ดีที่สุด ${facesToUse.length} รูป');
-      print(
-          '📊 คะแนนความมั่นใจ: ${(confidenceScore * 100).toStringAsFixed(1)}%');
+      print('📊 คะแนนความมั่นใจ: ${(confidenceScore * 100).toStringAsFixed(1)}%');
 
       final faceProfile = {
         'profile_id': faceProfileId,
@@ -1562,8 +1541,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
       if (mounted) {
         setState(() {
           _statusMessage = '✅ Face ID สำเร็จ!';
-          _instructionMessage =
-              'ความมั่นใจ ${(confidenceScore * 100).toInt()}%';
+          _instructionMessage = 'ความมั่นใจ ${(confidenceScore * 100).toInt()}%';
           _isSaving = false;
           _captureComplete = true;
         });
@@ -1681,13 +1659,6 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
             const CircularProgressIndicator(color: Colors.white),
             const SizedBox(height: 20),
             Text(_statusMessage, style: const TextStyle(color: Colors.white)),
-            if (_isIos && !_isCameraReady) ...[
-              const SizedBox(height: 10),
-              Text(
-                'iOS: กำลังเริ่มต้นกล้อง...',
-                style: TextStyle(color: Colors.white54, fontSize: 12),
-              ),
-            ],
           ],
         ),
       ),
@@ -1700,8 +1671,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
       child: Row(
         children: [
           IconButton(
-            icon:
-                const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20),
+            icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20),
             onPressed: () {
               _stopImageStream();
               Navigator.pop(context);
@@ -1724,8 +1694,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
                     ),
                     const SizedBox(width: 8),
                     Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 2),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                       decoration: BoxDecoration(
                         color: Colors.white.withOpacity(0.15),
                         borderRadius: BorderRadius.circular(12),
@@ -1735,8 +1704,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
                         children: [
                           Text(
                             '$_actualOutputDimension DIM',
-                            style: const TextStyle(
-                                color: Colors.white70, fontSize: 10),
+                            style: const TextStyle(color: Colors.white70, fontSize: 10),
                           ),
                           if (_isIos) ...[
                             const SizedBox(width: 4),
@@ -1756,7 +1724,7 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
                 ),
                 Text(
                   _modelLoaded
-                      ? 'MobileFaceNet${_isIos ? " (iOS${_usingLowResolution ? " LowRes" : ""})" : " (Android)"}'
+                      ? 'MobileFaceNet${_isIos ? " (iOS)" : " (Android)"}'
                       : 'กำลังเตรียม...',
                   style: const TextStyle(color: Colors.white60, fontSize: 11),
                 ),
@@ -1940,16 +1908,14 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
           Row(
             children: [
               Expanded(child: _buildMetricItem('คุณภาพ', _faceQuality, '75%')),
-              Expanded(
-                  child: _buildMetricItem('เสถียร', _faceStability, '73%')),
+              Expanded(child: _buildMetricItem('เสถียร', _faceStability, '73%')),
               Expanded(child: _buildMetricItem('แสง', _lightingScore, '100%')),
             ],
           ),
           const SizedBox(height: 12),
           Row(
             children: [
-              Expanded(
-                  child: _buildMetricItem('คมชัด', _sharpnessScore, '50%')),
+              Expanded(child: _buildMetricItem('คมชัด', _sharpnessScore, '50%')),
               Expanded(child: _buildMetricItem('มุม', _poseScore, '99%')),
               Expanded(child: _buildMetricItem('สมมาตร', _faceSymmetry, '98%')),
             ],
@@ -2022,16 +1988,14 @@ Future<InputImage?> _convertToInputImage(CameraImage image) async {
                     const SizedBox(width: 8),
                     if (_bestFaces.isNotEmpty)
                       Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 6, vertical: 2),
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                         decoration: BoxDecoration(
                           color: Colors.amber.withOpacity(0.15),
                           borderRadius: BorderRadius.circular(10),
                         ),
                         child: Text(
                           'ดีสุด ${(_absoluteBestQuality * 100).toInt()}%',
-                          style: const TextStyle(
-                              color: Colors.amber, fontSize: 10),
+                          style: const TextStyle(color: Colors.amber, fontSize: 10),
                         ),
                       ),
                   ],
