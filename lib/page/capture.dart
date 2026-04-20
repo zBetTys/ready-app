@@ -67,9 +67,9 @@ class _CapturePageState extends State<CapturePage>
   static const double MIN_ACCEPTABLE_QUALITY = 0.55;
 
   // ================ iOS OPTIMIZATIONS ================
-  static const int FRAME_SKIP_INTERVAL = 2;  // ลดลงเพื่อการตอบสนองที่ดีขึ้น
-  static const int CAPTURE_QUALITY_FRAMES_REQUIRED = 3;  // ลดลง
-  static const ResolutionPreset OPTIMIZED_RESOLUTION = ResolutionPreset.low;  // ใช้ low เพื่อประสิทธิภาพ
+  static const int FRAME_SKIP_INTERVAL = 2;
+  static const int CAPTURE_QUALITY_FRAMES_REQUIRED = 3;
+  static const ResolutionPreset OPTIMIZED_RESOLUTION = ResolutionPreset.low;
   
   // ================ UI CONSTANTS ================
   static const double FACE_FRAME_RATIO = 0.65;
@@ -118,7 +118,6 @@ class _CapturePageState extends State<CapturePage>
 
   // ================ iOS OPTIMIZATION VARIABLES ================
   bool _isIos = false;
-  int _iosFrameDropCount = 0;
   bool _usingLowResolution = false;
   
   // ================ BEST FACE STORAGE ================
@@ -162,9 +161,6 @@ class _CapturePageState extends State<CapturePage>
   bool _isSmallScreen = false;
   late Size _cameraPreviewSize;
 
-  // ================ Timer for iOS timeout ================
-  Timer? _iosInitializationTimer;
-
   @override
   void initState() {
     super.initState();
@@ -188,16 +184,6 @@ class _CapturePageState extends State<CapturePage>
     );
 
     _initializeSystem();
-    
-    // ตั้งเวลา timeout สำหรับ iOS
-    if (_isIos) {
-      _iosInitializationTimer = Timer(const Duration(seconds: 10), () {
-        if (mounted && !_isCameraReady) {
-          print('⚠️ iOS initialization timeout - retrying with lower resolution');
-          _retryWithLowerResolution();
-        }
-      });
-    }
   }
 
   @override
@@ -211,7 +197,6 @@ class _CapturePageState extends State<CapturePage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _iosInitializationTimer?.cancel();
     _stopImageStream();
     _cameraController?.dispose();
     _faceDetector?.close();
@@ -251,9 +236,6 @@ class _CapturePageState extends State<CapturePage>
     } catch (e) {
       print('❌ System error: $e');
       _updateStatus('❌ เกิดข้อผิดพลาด', 'กรุณาเปิดแอปใหม่', '');
-      if (_isIos && mounted) {
-        _showIOSErrorDialog();
-      }
     }
   }
 
@@ -267,7 +249,6 @@ class _CapturePageState extends State<CapturePage>
         orElse: () => cameras.first,
       );
 
-      // ใช้ resolution ที่ต่ำลงสำหรับ iOS เพื่อความเร็ว
       ResolutionPreset resolution = OPTIMIZED_RESOLUTION;
       if (_isIos) {
         resolution = ResolutionPreset.low;
@@ -343,7 +324,7 @@ class _CapturePageState extends State<CapturePage>
       }
 
       final interpreterOptions = InterpreterOptions()
-        ..threads = _isIos ? 1 : 4  // iOS ใช้ 1 thread เพื่อความเสถียร
+        ..threads = _isIos ? 1 : 4
         ..useNnApiForAndroid = true;
 
       _faceModel = await Interpreter.fromAsset(
@@ -410,55 +391,7 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  void _retryWithLowerResolution() async {
-    if (!mounted) return;
-    
-    setState(() {
-      _statusMessage = '🔄 ปรับการตั้งค่ากล้อง...';
-      _instructionMessage = 'กรุณารอสักครู่';
-    });
-    
-    try {
-      await _cameraController?.dispose();
-      await _initializeCamera();
-      _startImageStream();
-      
-      if (mounted) {
-        setState(() {
-          _isCameraReady = true;
-          _statusMessage = '🆔 พร้อมบันทึก Face ID';
-          _instructionMessage = 'วางใบหน้าในกรอบ';
-        });
-      }
-    } catch (e) {
-      print('❌ Retry failed: $e');
-      if (mounted) {
-        _showIOSErrorDialog();
-      }
-    }
-  }
-
-  void _showIOSErrorDialog() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('เกิดข้อผิดพลาด'),
-        content: const Text('ไม่สามารถเปิดกล้องได้ กรุณารีสตาร์ทแอปพลิเคชัน'),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              Navigator.pop(context);
-            },
-            child: const Text('กลับ'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ================ IMAGE STREAM (FIXED FOR iOS) ================
+  // ================ IMAGE STREAM ================
   void _startImageStream() {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
       print('❌ Cannot start image stream: camera not ready');
@@ -474,7 +407,7 @@ class _CapturePageState extends State<CapturePage>
     print('🛑 Image stream stopped');
   }
 
-  // iOS-optimized frame processing - ใช้ InputImage.fromBytes แทนการสร้างไฟล์
+  // ================ CORRECTED IMAGE PROCESSING FOR iOS ================
   Future<void> _processCameraImage(CameraImage image) async {
     // Skip frames for performance
     _frameCounter++;
@@ -490,8 +423,8 @@ class _CapturePageState extends State<CapturePage>
     _isProcessingFrame = true;
 
     try {
-      // สำหรับ iOS ใช้การแปลงแบบ lightweight กว่า
-      final inputImage = await _convertCameraImageToInputImage(image);
+      // Convert CameraImage to InputImage
+      final inputImage = await _convertToInputImage(image);
       if (inputImage == null) return;
       
       final faces = await _faceDetector!.processImage(inputImage);
@@ -583,13 +516,36 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ================ iOS OPTIMIZED CONVERSION - NO FILE CREATION ================
-  Future<InputImage?> _convertCameraImageToInputImage(CameraImage image) async {
+  // ================ FIXED: Convert CameraImage to InputImage ================
+ // วิธีที่ถูกต้องสำหรับ InputImage.fromBytes
+
+
+// แก้ไขฟังก์ชัน _convertToInputImage เป็นดังนี้:
+Future<InputImage?> _convertToInputImage(CameraImage image) async {
+  try {
+    // แปลง YUV420 เป็น RGB
+    final rgbBytes = _yuv420ToRgb(image);
+    if (rgbBytes == null) return null;
+    
+    // สร้าง InputImage โดยตรงจาก bytes (วิธีที่ถูกต้อง)
+    return InputImage.fromBytes(
+      bytes: rgbBytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: InputImageRotation.rotation0deg,
+        format: InputImageFormat.nv21,  // ใช้ nv21 format
+        bytesPerRow: image.width * 3,
+      ),
+    );
+  } catch (e) {
+    print('Error converting to InputImage: $e');
+    return null;
+  }
+}
+
+  // Convert YUV420 to RGB888 bytes
+  Uint8List? _yuv420ToRgb(CameraImage image) {
     try {
-      // วิธีที่เร็วกว่าสำหรับ iOS - ใช้ bytes โดยตรง
-      final WriteBuffer buffer = WriteBuffer();
-      
-      // YUV420 to RGB conversion
       final int width = image.width;
       final int height = image.height;
       
@@ -601,54 +557,46 @@ class _CapturePageState extends State<CapturePage>
       final int uvRowStride = uPlane.bytesPerRow;
       final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
       
-      // สร้าง RGB buffer
+      final Uint8List rgbBytes = Uint8List(width * height * 3);
+      int rgbIndex = 0;
+      
       for (int y = 0; y < height; y++) {
         int uvY = y ~/ 2;
         
         for (int x = 0; x < width; x++) {
           int uvX = x ~/ 2;
           
-          // Y value
+          // Get Y value
           int yIndex = y * yRowStride + x;
           int yValue = yPlane.bytes[yIndex];
           
-          // U and V values
+          // Get U and V values
           int uIndex = uvY * uvRowStride + uvX * uvPixelStride;
           int vIndex = uvY * uvRowStride + uvX * uvPixelStride;
           
-          int uValue = uPlane.bytes[uIndex];
-          int vValue = vPlane.bytes[vIndex];
+          int uValue = uPlane.bytes[uIndex] - 128;
+          int vValue = vPlane.bytes[vIndex] - 128;
           
           // YUV to RGB conversion
-          int r = (yValue + 1.402 * (vValue - 128)).toInt();
-          int g = (yValue - 0.344 * (uValue - 128) - 0.714 * (vValue - 128)).toInt();
-          int b = (yValue + 1.772 * (uValue - 128)).toInt();
+          int r = (yValue + 1.402 * vValue).toInt();
+          int g = (yValue - 0.344 * uValue - 0.714 * vValue).toInt();
+          int b = (yValue + 1.772 * uValue).toInt();
           
-          // Clamp
+          // Clamp values
           r = r.clamp(0, 255);
           g = g.clamp(0, 255);
           b = b.clamp(0, 255);
           
-          buffer.putUint8(r);
-          buffer.putUint8(g);
-          buffer.putUint8(b);
+          // Write RGB bytes
+          rgbBytes[rgbIndex++] = r;
+          rgbBytes[rgbIndex++] = g;
+          rgbBytes[rgbIndex++] = b;
         }
       }
       
-      final bytes = buffer.done().buffer.asUint8List();
-      
-      // สร้าง InputImage จาก bytes โดยตรง
-      return InputImage.fromBytes(
-        bytes: bytes,
-        inputImageData: InputImageData(
-          size: Size(width.toDouble(), height.toDouble()),
-          imageRotation: InputImageRotation.rotation0deg,
-          format: InputImageFormat.nv21, // iOS ใช้ nv21 format
-          bytesPerRow: width * 3,
-        ),
-      );
+      return rgbBytes;
     } catch (e) {
-      print('Error converting camera image to InputImage: $e');
+      print('YUV to RGB conversion error: $e');
       return null;
     }
   }
@@ -664,7 +612,6 @@ class _CapturePageState extends State<CapturePage>
     });
 
     try {
-      // ถ่ายรูปจริง
       final XFile imageFile = await _cameraController!.takePicture();
       
       img.Image? processedImage =
@@ -790,7 +737,6 @@ class _CapturePageState extends State<CapturePage>
         }
       }
 
-      // ลบไฟล์ชั่วคราว
       try {
         final file = File(imageFile.path);
         if (await file.exists()) {
@@ -808,11 +754,869 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ส่วนที่เหลือของโค้ด (ฟังก์ชันอื่นๆ) เหมือนเดิม...
-  // (ใส่ฟังก์ชัน _calculateIntelligentFaceQuality, _calculateAdaptiveThreshold,
-  // _analyzeAndImproveQuality, _updateIntelligentFaceStatus, ฯลฯ เหมือนเดิม)
-  
-  // ... [ใส่ฟังก์ชันอื่นๆ ที่มีอยู่แล้วทั้งหมดที่นี่] ...
+  // ================ QUALITY CALCULATION FUNCTIONS ================
+  double _calculateIntelligentFaceQuality(Face face) {
+    double score = 0.0;
+
+    final bbox = face.boundingBox;
+    final area = bbox.width * bbox.height;
+    final screenArea = _screenWidth * _screenHeight;
+    final areaRatio = area / screenArea;
+
+    double areaWeight = 0.3;
+    double centerWeight = 0.25;
+    double poseWeight = 0.25;
+    double eyeWeight = 0.2;
+
+    if (_consecutiveLowQuality > 3) {
+      areaWeight = 0.35;
+      centerWeight = 0.30;
+      poseWeight = 0.20;
+      eyeWeight = 0.15;
+    }
+
+    if (areaRatio >= IDEAL_MIN_FACE_AREA && areaRatio <= IDEAL_MAX_FACE_AREA) {
+      score += areaWeight;
+    } else if (areaRatio >= MIN_FACE_AREA_RATIO &&
+        areaRatio <= MAX_FACE_AREA_RATIO) {
+      score += areaWeight * 0.7;
+    } else {
+      score += areaWeight * 0.4;
+    }
+
+    final centerScore = _calculateCenterScore(bbox);
+    score += centerScore * centerWeight;
+
+    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
+    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
+    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
+
+    if (yaw <= MAX_HEAD_YAW &&
+        pitch <= MAX_HEAD_PITCH &&
+        roll <= MAX_HEAD_ROLL) {
+      score += poseWeight;
+    } else {
+      score += poseWeight * 0.6;
+    }
+
+    final leftEye = face.leftEyeOpenProbability ?? 0.0;
+    final rightEye = face.rightEyeOpenProbability ?? 0.0;
+    final eyeScore = (leftEye + rightEye) / 2;
+
+    if (eyeScore >= MIN_EYE_OPENNESS) {
+      score += eyeWeight;
+    } else {
+      score += eyeScore * eyeWeight;
+    }
+
+    if (ENABLE_QUALITY_BOOST && _isStruggling) {
+      score = min(1.0, score * 1.1);
+    }
+
+    return score.clamp(0.0, 1.0);
+  }
+
+  double _calculateCenterScore(Rect bbox) {
+    final faceCenter = Offset(
+      bbox.left + bbox.width / 2,
+      bbox.top + bbox.height / 2,
+    );
+    final screenCenter = Offset(_screenWidth / 2, _screenHeight / 2);
+
+    final distance = (faceCenter - screenCenter).distance;
+    final maxDistance = _screenWidth * 0.3;
+
+    return max(0.0, 1.0 - (distance / maxDistance).clamp(0.0, 1.0));
+  }
+
+  double _calculateFaceStability() {
+    if (_faceHistory.length < 2) return 1.0;
+
+    double totalMovement = 0.0;
+    int comparisons = 0;
+
+    for (int i = 1; i < _faceHistory.length; i++) {
+      final prev = _faceHistory[i - 1];
+      final curr = _faceHistory[i];
+
+      final prevCenter = Offset(
+        prev.boundingBox.left + prev.boundingBox.width / 2,
+        prev.boundingBox.top + prev.boundingBox.height / 2,
+      );
+
+      final currCenter = Offset(
+        curr.boundingBox.left + curr.boundingBox.width / 2,
+        curr.boundingBox.top + curr.boundingBox.height / 2,
+      );
+
+      totalMovement += (currCenter - prevCenter).distance;
+      comparisons++;
+    }
+
+    if (comparisons == 0) return 1.0;
+
+    final avgMovement = totalMovement / comparisons;
+    return max(0.0, 1.0 - (avgMovement / 20.0)).clamp(0.0, 1.0);
+  }
+
+  double _calculateLightingScore(Face face) {
+    double leftCheek = 0.5;
+    double rightCheek = 0.5;
+
+    try {
+      final leftCheekLandmark = face.landmarks[FaceLandmarkType.leftCheek];
+      final rightCheekLandmark = face.landmarks[FaceLandmarkType.rightCheek];
+
+      if (leftCheekLandmark != null) {
+        leftCheek = 0.7 + (leftCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
+      }
+      if (rightCheekLandmark != null) {
+        rightCheek =
+            0.7 + (rightCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
+      }
+    } catch (_) {}
+
+    final avgBrightness = (leftCheek + rightCheek) / 2;
+    final symmetry = 1.0 - (leftCheek - rightCheek).abs();
+
+    return (avgBrightness * 0.5 + symmetry * 0.5).clamp(0.0, 1.0);
+  }
+
+  double _calculateSharpnessScore(Face face) {
+    final leftEye = face.leftEyeOpenProbability ?? 0.0;
+    final rightEye = face.rightEyeOpenProbability ?? 0.0;
+
+    final eyeVariance = pow(leftEye - rightEye, 2).toDouble();
+    final sharpnessScore = min(1.0, eyeVariance * 10 + 0.5);
+
+    return sharpnessScore.clamp(0.0, 1.0);
+  }
+
+  double _calculatePoseScore(Face face) {
+    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
+    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
+    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
+
+    final yawScore = 1.0 / (1.0 + exp((yaw - MAX_HEAD_YAW) / 5.0));
+    final pitchScore = 1.0 / (1.0 + exp((pitch - MAX_HEAD_PITCH) / 4.0));
+    final rollScore = 1.0 / (1.0 + exp((roll - MAX_HEAD_ROLL) / 3.0));
+
+    return (yawScore + pitchScore + rollScore) / 3.0;
+  }
+
+  double _calculateFaceSymmetry(Face face) {
+    final leftEye = face.leftEyeOpenProbability ?? 0.0;
+    final rightEye = face.rightEyeOpenProbability ?? 0.0;
+
+    final eyeSymmetry = 1.0 - (leftEye - rightEye).abs();
+
+    return eyeSymmetry.clamp(0.0, 1.0);
+  }
+
+  bool _checkLiveness(Face face) {
+    int passed = 0;
+
+    final leftEye = face.leftEyeOpenProbability ?? 0.0;
+    final rightEye = face.rightEyeOpenProbability ?? 0.0;
+    final eyeAsymmetry = (leftEye - rightEye).abs();
+    if (eyeAsymmetry >= MIN_EYE_ASYMMETRY) passed++;
+
+    final smiling = face.smilingProbability ?? 0.0;
+    if (smiling <= MAX_SMILING_PROBABILITY) passed++;
+
+    return passed >= REQUIRED_LIVENESS_CHECKS;
+  }
+
+  double _calculateAdaptiveThreshold() {
+    if (_qualityHistory.isEmpty) return MIN_FACE_QUALITY;
+
+    final recentQuality = _qualityHistory.length > 5
+        ? _qualityHistory
+                .sublist(_qualityHistory.length - 5)
+                .reduce((a, b) => a + b) /
+            5
+        : _qualityHistory.reduce((a, b) => a + b) / _qualityHistory.length;
+
+    double adaptiveThreshold = recentQuality * 0.9;
+    return adaptiveThreshold.clamp(0.55, 0.75);
+  }
+
+  void _analyzeAndImproveQuality() {
+    _improvementTips.clear();
+
+    if (_faceQuality < 0.6) {
+      if (_poseScore < 0.5) {
+        _improvementTips['pose'] = 'หันมาตรงๆ';
+      }
+      if (_lightingScore < 0.5) {
+        _improvementTips['lighting'] = 'ปรับแสงให้สว่าง';
+      }
+      if (_sharpnessScore < 0.5) {
+        _improvementTips['sharpness'] = 'อยู่นิ่งๆ';
+      }
+      if (_faceSymmetry < 0.5) {
+        _improvementTips['symmetry'] = 'หันมาตรงๆ';
+      }
+    }
+
+    if (_improvementTips.isNotEmpty) {
+      _currentGuidance = _improvementTips.values.join(' • ');
+    } else {
+      _currentGuidance = '';
+    }
+  }
+
+  void _updateIntelligentFaceStatus() {
+    if (_currentFace == null) return;
+
+    final bbox = _currentFace!.boundingBox;
+    final area = bbox.width * bbox.height;
+    final screenArea = _screenWidth * _screenHeight;
+    final areaRatio = area / screenArea;
+
+    if (areaRatio > MAX_FACE_AREA_RATIO) {
+      _updateStatus('📱 ถอยหลัง', 'ใกล้เกินไป', '');
+      return;
+    } else if (areaRatio < MIN_FACE_AREA_RATIO) {
+      _updateStatus('📱 เข้ามาใกล้', 'ไกลเกินไป', '');
+      return;
+    }
+
+    final currentThreshold =
+        ENABLE_ADAPTIVE_THRESHOLDS ? _adaptiveThreshold : MIN_FACE_QUALITY;
+
+    if (_faceQuality < currentThreshold) {
+      if (_currentGuidance.isNotEmpty) {
+        _updateStatus('📸 ปรับปรุง', _currentGuidance,
+            'คุณภาพ ${(_faceQuality * 100).toInt()}%');
+      } else {
+        _updateStatus(
+            '📸 ปรับตำแหน่ง', 'คุณภาพ ${(_faceQuality * 100).toInt()}%', '');
+      }
+      return;
+    }
+
+    if (_faceStability < MIN_FACE_STABILITY) {
+      _updateStatus(
+          '🎯 อยู่นิ่งๆ', 'ความนิ่ง ${(_faceStability * 100).toInt()}%', '');
+      return;
+    }
+
+    if (!_livenessPassed) {
+      _updateStatus('🔄 ตรวจสอบ', 'กะพริบตาเล็กน้อย', '');
+      return;
+    }
+
+    if (_enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
+      String qualityText = _faceQuality >= 0.75
+          ? 'คุณภาพดี'
+          : (_faceQuality >= 0.65 ? 'คุณภาพพอใช้' : 'คุณภาพต่ำ');
+
+      _updateStatus(
+        '✅ ใส่ใบหน้าคุณภาพดี (${(_faceQuality * 100).toInt()}%)',
+        'ถ่ายรูปที่ ${_enrollmentCount + 1}/$MIN_ENROLLMENT_EMBEDDINGS',
+        '',
+      );
+    }
+  }
+
+  // ================ IMAGE ENHANCEMENT ================
+  img.Image _enhanceImageQuality(img.Image image) {
+    final sharpened = img.copyResize(image,
+        width: image.width,
+        height: image.height,
+        interpolation: img.Interpolation.linear);
+
+    for (var pixel in sharpened) {
+      pixel.r = (pixel.r * 1.1).clamp(0, 255).toInt();
+      pixel.g = (pixel.g * 1.1).clamp(0, 255).toInt();
+      pixel.b = (pixel.b * 1.1).clamp(0, 255).toInt();
+    }
+
+    return sharpened;
+  }
+
+  // ================ FACE PROCESSING ================
+  Future<img.Image?> _cropAndPreprocessFace(String imagePath, Face face) async {
+    try {
+      final file = File(imagePath);
+      final imageBytes = await file.readAsBytes();
+      final originalImage = img.decodeImage(imageBytes);
+
+      if (originalImage == null) return null;
+
+      final bbox = face.boundingBox;
+
+      final paddingX = (bbox.width * FACE_PADDING_RATIO).toInt();
+      final paddingY = (bbox.height * FACE_PADDING_RATIO).toInt();
+
+      int left = max(0, bbox.left.toInt() - paddingX);
+      int top = max(0, bbox.top.toInt() - paddingY);
+      int width =
+          min(originalImage.width - left, bbox.width.toInt() + paddingX * 2);
+      int height =
+          min(originalImage.height - top, bbox.height.toInt() + paddingY * 2);
+
+      if (width <= 0 || height <= 0) return null;
+
+      final croppedImage = img.copyCrop(
+        originalImage,
+        x: left,
+        y: top,
+        width: width,
+        height: height,
+      );
+
+      final resizedImage = img.copyResize(
+        croppedImage,
+        width: FACE_CROP_SIZE,
+        height: FACE_CROP_SIZE,
+        interpolation: img.Interpolation.linear,
+      );
+
+      return resizedImage;
+    } catch (e) {
+      print('❌ Error cropping: $e');
+      return null;
+    }
+  }
+
+  // ================ EXTRACT EMBEDDING ================
+  Future<List<double>> _extractEmbedding(img.Image faceImage) async {
+    if (!_modelLoaded || _faceModel == null) {
+      throw Exception('โมเดลไม่พร้อม');
+    }
+
+    try {
+      final input = _prepareInput(faceImage);
+      final outputShape = _faceModel!.getOutputTensor(0).shape;
+
+      int outputSize = 1;
+      for (var dim in outputShape) {
+        outputSize *= dim;
+      }
+
+      final outputBuffer = List<double>.filled(outputSize, 0.0);
+      final output = outputBuffer.reshape(outputShape);
+
+      _faceModel!.run(input, output);
+
+      List<double> result = [];
+
+      if (outputShape.length == 2) {
+        result = List<double>.from(output[0]);
+      } else if (outputShape.length == 1) {
+        result = List<double>.from(output);
+      } else {
+        result = _flattenOutput(output);
+      }
+
+      return result;
+    } catch (e) {
+      print('❌ Error extracting embedding: $e');
+      rethrow;
+    }
+  }
+
+  List<double> _flattenOutput(dynamic output) {
+    List<double> result = [];
+
+    void flatten(dynamic item) {
+      if (item is List) {
+        for (var subItem in item) {
+          flatten(subItem);
+        }
+      } else if (item is double) {
+        result.add(item);
+      }
+    }
+
+    flatten(output);
+    return result;
+  }
+
+  List<List<List<List<double>>>> _prepareInput(img.Image image) {
+    final input = List.generate(
+      1,
+      (_) => List.generate(
+        FACE_CROP_SIZE,
+        (_) => List.generate(
+          FACE_CROP_SIZE,
+          (_) => List.filled(3, 0.0),
+        ),
+      ),
+    );
+
+    final bytes = image.getBytes(order: img.ChannelOrder.rgb);
+    int byteIndex = 0;
+
+    for (int y = 0; y < FACE_CROP_SIZE; y++) {
+      for (int x = 0; x < FACE_CROP_SIZE; x++) {
+        if (byteIndex + 2 < bytes.length) {
+          final r = bytes[byteIndex].toDouble();
+          final g = bytes[byteIndex + 1].toDouble();
+          final b = bytes[byteIndex + 2].toDouble();
+
+          input[0][y][x][0] = (r / 127.5) - 1.0;
+          input[0][y][x][1] = (g / 127.5) - 1.0;
+          input[0][y][x][2] = (b / 127.5) - 1.0;
+
+          byteIndex += 3;
+        }
+      }
+    }
+
+    return input;
+  }
+
+  // ================ EVALUATE EMBEDDING QUALITY ================
+  double _evaluateEmbeddingQuality(List<double> embedding) {
+    double norm = 0.0;
+    for (final v in embedding) norm += v * v;
+    norm = sqrt(norm);
+
+    return 1.0 - (norm - 1.0).abs().clamp(0.0, 0.5);
+  }
+
+  // ================ CALCULATE CONSISTENCY ================
+  double _calculateConsistency() {
+    if (_enrolledEmbeddings.length < 2) return 1.0;
+
+    double totalSimilarity = 0.0;
+    int comparisons = 0;
+
+    for (int i = 0; i < _enrolledEmbeddings.length; i++) {
+      for (int j = i + 1; j < _enrolledEmbeddings.length; j++) {
+        final emb1 = _enrolledEmbeddings[i]['embedding'] as List<double>;
+        final emb2 = _enrolledEmbeddings[j]['embedding'] as List<double>;
+
+        final similarity = _cosineSimilarity(emb1, emb2);
+        totalSimilarity += similarity;
+        comparisons++;
+      }
+    }
+
+    return comparisons > 0 ? totalSimilarity / comparisons : 1.0;
+  }
+
+  // ================ CALCULATE MEAN EMBEDDING ================
+  List<double> _calculateMeanEmbedding() {
+    if (_enrolledEmbeddings.isEmpty) return [];
+
+    final facesToUse = _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
+
+    final firstEmb = facesToUse.first['embedding'] as List<double>;
+    final dimension = firstEmb.length;
+    final mean = List<double>.filled(dimension, 0.0);
+    double totalWeight = 0.0;
+
+    for (var emb in facesToUse) {
+      final vector = emb['embedding'] as List<double>;
+      final quality =
+          emb['total_quality'] as double? ?? emb['quality'] as double;
+      final weight = quality;
+
+      for (int i = 0; i < dimension; i++) {
+        mean[i] += vector[i] * weight;
+      }
+      totalWeight += weight;
+    }
+
+    for (int i = 0; i < dimension; i++) {
+      mean[i] /= totalWeight;
+    }
+
+    return _l2Normalize(mean);
+  }
+
+  // ================ UTILITY FUNCTIONS ================
+  double _cosineSimilarity(List<double> a, List<double> b) {
+    if (a.length != b.length) return 0.0;
+
+    double dot = 0.0, normA = 0.0, normB = 0.0;
+    for (int i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+
+    if (normA < 1e-12 || normB < 1e-12) return 0.0;
+
+    final similarity = dot / (sqrt(normA) * sqrt(normB));
+    return ((similarity + 1) / 2).clamp(0.0, 1.0);
+  }
+
+  List<double> _l2Normalize(List<double> vector) {
+    double norm = 0.0;
+    for (final v in vector) norm += v * v;
+    norm = sqrt(norm);
+
+    if (norm < 1e-12) return vector;
+
+    final normalized = List<double>.filled(vector.length, 0.0);
+    for (int i = 0; i < vector.length; i++) {
+      normalized[i] = vector[i] / norm;
+    }
+    return normalized;
+  }
+
+  // ================ DIALOGS ================
+  void _showInsufficientConsistencyDialog() {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('ความสอดคล้องไม่พอ'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('ใบหน้าที่ถ่ายมีความสอดคล้องกันไม่พอ'),
+              const SizedBox(height: 8),
+              Text('ความสอดคล้อง: ${(_enrollmentConsistency * 100).toInt()}%'),
+              Text('ต้องการ: ${(MIN_ENROLLMENT_CONSISTENCY * 100).toInt()}%'),
+              const SizedBox(height: 16),
+              Text(
+                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
+              Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
+              if (_bestFaces.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                const Text('คุณสามารถใช้ใบหน้าที่ดีที่สุดที่มีอยู่'),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                _resetAndTryAgain();
+              },
+              child: const Text('ถ่ายใหม่'),
+            ),
+            if (_bestFaces.isNotEmpty)
+              TextButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _saveFaceIDProfileWithBestFaces();
+                },
+                child: const Text('ใช้ใบหน้าที่ดีที่สุด'),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _offerToUseBestFaces() {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('ใช้ใบหน้าที่ดีที่สุด?'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                  'ลองถ่ายหลายครั้งแล้ว แต่ยังไม่ได้คุณภาพตามที่ต้องการ'),
+              const SizedBox(height: 16),
+              Text(
+                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
+              Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
+              if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS) ...[
+                const SizedBox(height: 8),
+                const Text('✅ มีจำนวนเพียงพอสำหรับการบันทึก'),
+              ] else ...[
+                const SizedBox(height: 8),
+                Text(
+                    '⚠️ มีเพียง ${_bestFaces.length} รูป (ต้องการ $MIN_ENROLLMENT_EMBEDDINGS รูป)'),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                _resetAndTryAgain();
+              },
+              child: const Text('ลองถ่ายใหม่'),
+            ),
+            if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS)
+              TextButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  _enrolledEmbeddings = List.from(_bestFaces);
+                  _enrollmentCount = _bestFaces.length;
+                  _enrollmentConsistency = _calculateConsistency();
+                  await _saveFaceIDProfileWithBestFaces();
+                },
+                child: const Text('บันทึกด้วยใบหน้าที่ดีที่สุด'),
+              ),
+            if (_bestFaces.length < MIN_ENROLLMENT_EMBEDDINGS &&
+                _bestFaces.isNotEmpty)
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  _continueCapturing();
+                },
+                child: const Text('ถ่ายเพิ่ม'),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _offerToUseBestAvailable() {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('ไม่พบใบหน้าที่มีคุณภาพดี'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('ลองถ่ายหลายครั้งแล้ว แต่ยังไม่มีใบหน้าที่มีคุณภาพดี'),
+              const SizedBox(height: 16),
+              Text('จำนวนครั้งที่ลอง: $_captureAttempts ครั้ง'),
+              if (_allCapturedFaces.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                    'ใบหน้าที่ดีที่สุดจากที่ลอง: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
+              ],
+              const SizedBox(height: 16),
+              const Text('คุณต้องการ:'),
+              const Text('1. ลองถ่ายใหม่'),
+              const Text('2. กลับไปหน้าแรก'),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                _resetAndTryAgain();
+              },
+              child: const Text('ลองถ่ายใหม่'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                Navigator.pushNamedAndRemoveUntil(
+                    context, '/home', (route) => false);
+              },
+              child: const Text('กลับหน้าแรก'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _resetAndTryAgain() {
+    setState(() {
+      _captureAttempts = 0;
+      _isRetryMode = true;
+      _statusMessage = '📸 ลองถ่ายใหม่';
+      _instructionMessage = 'วางใบหน้าในกรอบ';
+      _stableFrameCount = 0;
+      _consecutiveLowQuality = 0;
+      _consecutiveGoodFrames = 0;
+      _isStruggling = false;
+    });
+  }
+
+  void _continueCapturing() {
+    setState(() {
+      _isRetryMode = false;
+      _statusMessage = '📸 ถ่ายเพิ่มเติม';
+      _instructionMessage =
+          'ถ่ายอีก ${MIN_ENROLLMENT_EMBEDDINGS - _enrollmentCount} รูป';
+      _stableFrameCount = 0;
+    });
+  }
+
+  // ================ SAVE TO FIREBASE ================
+  Future<void> _saveFaceIDProfileWithBestFaces() async {
+    setState(() {
+      _isSaving = true;
+      _statusMessage = '💾 กำลังบันทึก...';
+    });
+
+    try {
+      final user = _auth.currentUser;
+      if (user == null) throw Exception('ไม่พบผู้ใช้');
+
+      final faceProfileId = _uuid.v4();
+
+      final facesToUse =
+          _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
+      final meanEmbedding = _calculateMeanEmbedding();
+
+      double totalQuality = 0;
+      double totalStability = 0;
+      double totalLighting = 0;
+      double totalSharpness = 0;
+
+      for (var face in facesToUse) {
+        totalQuality += face['quality'] as double;
+        totalStability += face['stability'] as double;
+        totalLighting += face['lighting'] as double? ?? 0.5;
+        totalSharpness += face['sharpness'] as double? ?? 0.5;
+      }
+
+      final avgQuality = totalQuality / facesToUse.length;
+      final avgStability = totalStability / facesToUse.length;
+      final avgLighting = totalLighting / facesToUse.length;
+      final avgSharpness = totalSharpness / facesToUse.length;
+
+      final confidenceScore = (avgQuality * 0.4 +
+          avgStability * 0.3 +
+          avgLighting * 0.15 +
+          avgSharpness * 0.15);
+
+      print('✅ บันทึกด้วยใบหน้าที่ดีที่สุด ${facesToUse.length} รูป');
+      print(
+          '📊 คะแนนความมั่นใจ: ${(confidenceScore * 100).toStringAsFixed(1)}%');
+
+      final faceProfile = {
+        'profile_id': faceProfileId,
+        'user_id': user.uid,
+        'mean_embedding': meanEmbedding,
+        'embedding_dimension': meanEmbedding.length,
+        'embedding_version': EMBEDDING_VERSION,
+        'embedding_model': MODEL_NAME,
+        'enrollment_stats': {
+          'total_embeddings': facesToUse.length,
+          'total_attempts': _captureAttempts,
+          'best_quality': _absoluteBestQuality,
+          'consistency': _enrollmentConsistency,
+          'confidence': confidenceScore,
+          'average_quality': avgQuality,
+          'average_stability': avgStability,
+        },
+        'quality_metrics': {
+          'face_quality': avgQuality,
+          'stability': avgStability,
+          'lighting_score': avgLighting,
+          'sharpness_score': avgSharpness,
+          'confidence_score': confidenceScore,
+        },
+        'liveness_verified': true,
+        'capture_timestamp': DateTime.now().toIso8601String(),
+        'created_at': FieldValue.serverTimestamp(),
+        'status': 'active',
+        'thresholds': {
+          'verification': 0.75,
+          'identification': 0.78,
+        },
+      };
+
+      await _firestore
+          .collection('users')
+          .doc(user.uid)
+          .collection('face_profiles')
+          .doc(faceProfileId)
+          .set(faceProfile);
+
+      for (int i = 0; i < facesToUse.length; i++) {
+        final emb = facesToUse[i];
+        final embeddingId = _uuid.v4();
+
+        await _firestore
+            .collection('users')
+            .doc(user.uid)
+            .collection('face_embeddings')
+            .doc(embeddingId)
+            .set({
+          'embedding_id': embeddingId,
+          'profile_id': faceProfileId,
+          'user_id': user.uid,
+          'embedding_vector': emb['embedding'],
+          'quality_score': emb['quality'],
+          'stability_score': emb['stability'],
+          'lighting_score': emb['lighting'] ?? 0.5,
+          'sharpness_score': emb['sharpness'] ?? 0.5,
+          'total_quality': emb['total_quality'] ?? emb['quality'],
+          'angles': emb['angles'],
+          'capture_sequence': i + 1,
+          'capture_attempt': emb['capture_attempt'],
+          'dimension': emb['dimension'],
+          'created_at': FieldValue.serverTimestamp(),
+        });
+      }
+
+      await _firestore.collection('users').doc(user.uid).set({
+        'active': true,
+      }, SetOptions(merge: true));
+
+      if (mounted) {
+        setState(() {
+          _statusMessage = '✅ Face ID สำเร็จ!';
+          _instructionMessage =
+              'ความมั่นใจ ${(confidenceScore * 100).toInt()}%';
+          _isSaving = false;
+          _captureComplete = true;
+        });
+      }
+
+      _playSuccessAnimation();
+
+      await Future.delayed(const Duration(seconds: 2));
+      if (mounted) {
+        Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
+      }
+    } catch (e) {
+      print('❌ Save error: $e');
+      if (mounted) {
+        setState(() {
+          _statusMessage = '❌ บันทึกไม่สำเร็จ';
+          _instructionMessage = 'ลองใหม่';
+          _isSaving = false;
+        });
+      }
+    }
+  }
+
+  void _showCaptureSuccess() {
+    setState(() => _showGuide = true);
+    Future.delayed(const Duration(milliseconds: 400), () {
+      if (mounted) setState(() => _showGuide = false);
+    });
+  }
+
+  void _playSuccessAnimation() async {
+    await _successController.forward();
+    await Future.delayed(const Duration(milliseconds: 400));
+    await _successController.reverse();
+  }
+
+  void _updateStatus(String status, String instruction, String detail) {
+    if (mounted) {
+      setState(() {
+        _statusMessage = status;
+        _instructionMessage = instruction;
+        _detailMessage = detail;
+      });
+    }
+  }
+
+  Color _getQualityColor(double quality) {
+    if (quality >= 0.85) return Colors.green;
+    if (quality >= 0.75) return Colors.lightGreen;
+    if (quality >= 0.65) return Colors.yellow;
+    if (quality >= 0.55) return Colors.orange;
+    return Colors.red;
+  }
 
   // ================ BUILD UI ================
   @override
@@ -890,8 +1694,6 @@ class _CapturePageState extends State<CapturePage>
     );
   }
 
-  // ... [ฟังก์ชัน build อื่นๆ เหมือนเดิม] ...
-  
   Widget _buildHeader() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
@@ -1338,860 +2140,5 @@ class _CapturePageState extends State<CapturePage>
         ),
       ),
     );
-  }
-
-  Color _getQualityColor(double quality) {
-    if (quality >= 0.85) return Colors.green;
-    if (quality >= 0.75) return Colors.lightGreen;
-    if (quality >= 0.65) return Colors.yellow;
-    if (quality >= 0.55) return Colors.orange;
-    return Colors.red;
-  }
-
-  void _updateStatus(String status, String instruction, String detail) {
-    if (mounted) {
-      setState(() {
-        _statusMessage = status;
-        _instructionMessage = instruction;
-        _detailMessage = detail;
-      });
-    }
-  }
-
-  // ฟังก์ชันอื่นๆ ที่จำเป็น (ต้องเพิ่มให้ครบ)
-  double _calculateIntelligentFaceQuality(Face face) {
-    double score = 0.0;
-
-    final bbox = face.boundingBox;
-    final area = bbox.width * bbox.height;
-    final screenArea = _screenWidth * _screenHeight;
-    final areaRatio = area / screenArea;
-
-    double areaWeight = 0.3;
-    double centerWeight = 0.25;
-    double poseWeight = 0.25;
-    double eyeWeight = 0.2;
-
-    if (_consecutiveLowQuality > 3) {
-      areaWeight = 0.35;
-      centerWeight = 0.30;
-      poseWeight = 0.20;
-      eyeWeight = 0.15;
-    }
-
-    if (areaRatio >= IDEAL_MIN_FACE_AREA && areaRatio <= IDEAL_MAX_FACE_AREA) {
-      score += areaWeight;
-    } else if (areaRatio >= MIN_FACE_AREA_RATIO &&
-        areaRatio <= MAX_FACE_AREA_RATIO) {
-      score += areaWeight * 0.7;
-    } else {
-      score += areaWeight * 0.4;
-    }
-
-    final centerScore = _calculateCenterScore(bbox);
-    score += centerScore * centerWeight;
-
-    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
-    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
-    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
-
-    if (yaw <= MAX_HEAD_YAW &&
-        pitch <= MAX_HEAD_PITCH &&
-        roll <= MAX_HEAD_ROLL) {
-      score += poseWeight;
-    } else {
-      score += poseWeight * 0.6;
-    }
-
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-    final eyeScore = (leftEye + rightEye) / 2;
-
-    if (eyeScore >= MIN_EYE_OPENNESS) {
-      score += eyeWeight;
-    } else {
-      score += eyeScore * eyeWeight;
-    }
-
-    if (ENABLE_QUALITY_BOOST && _isStruggling) {
-      score = min(1.0, score * 1.1);
-    }
-
-    return score.clamp(0.0, 1.0);
-  }
-
-  double _calculateCenterScore(Rect bbox) {
-    final faceCenter = Offset(
-      bbox.left + bbox.width / 2,
-      bbox.top + bbox.height / 2,
-    );
-    final screenCenter = Offset(_screenWidth / 2, _screenHeight / 2);
-
-    final distance = (faceCenter - screenCenter).distance;
-    final maxDistance = _screenWidth * 0.3;
-
-    return max(0.0, 1.0 - (distance / maxDistance).clamp(0.0, 1.0));
-  }
-
-  double _calculateFaceStability() {
-    if (_faceHistory.length < 2) return 1.0;
-
-    double totalMovement = 0.0;
-    int comparisons = 0;
-
-    for (int i = 1; i < _faceHistory.length; i++) {
-      final prev = _faceHistory[i - 1];
-      final curr = _faceHistory[i];
-
-      final prevCenter = Offset(
-        prev.boundingBox.left + prev.boundingBox.width / 2,
-        prev.boundingBox.top + prev.boundingBox.height / 2,
-      );
-
-      final currCenter = Offset(
-        curr.boundingBox.left + curr.boundingBox.width / 2,
-        curr.boundingBox.top + curr.boundingBox.height / 2,
-      );
-
-      totalMovement += (currCenter - prevCenter).distance;
-      comparisons++;
-    }
-
-    if (comparisons == 0) return 1.0;
-
-    final avgMovement = totalMovement / comparisons;
-    return max(0.0, 1.0 - (avgMovement / 20.0)).clamp(0.0, 1.0);
-  }
-
-  double _calculateLightingScore(Face face) {
-    double leftCheek = 0.5;
-    double rightCheek = 0.5;
-
-    try {
-      final leftCheekLandmark = face.landmarks[FaceLandmarkType.leftCheek];
-      final rightCheekLandmark = face.landmarks[FaceLandmarkType.rightCheek];
-
-      if (leftCheekLandmark != null) {
-        leftCheek = 0.7 + (leftCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
-      }
-      if (rightCheekLandmark != null) {
-        rightCheek =
-            0.7 + (rightCheekLandmark.position.y / 1000).clamp(0.0, 0.3);
-      }
-    } catch (_) {}
-
-    final avgBrightness = (leftCheek + rightCheek) / 2;
-    final symmetry = 1.0 - (leftCheek - rightCheek).abs();
-
-    return (avgBrightness * 0.5 + symmetry * 0.5).clamp(0.0, 1.0);
-  }
-
-  double _calculateSharpnessScore(Face face) {
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-
-    final eyeVariance = pow(leftEye - rightEye, 2).toDouble();
-    final sharpnessScore = min(1.0, eyeVariance * 10 + 0.5);
-
-    return sharpnessScore.clamp(0.0, 1.0);
-  }
-
-  double _calculatePoseScore(Face face) {
-    final yaw = face.headEulerAngleY?.abs() ?? 0.0;
-    final pitch = face.headEulerAngleX?.abs() ?? 0.0;
-    final roll = face.headEulerAngleZ?.abs() ?? 0.0;
-
-    final yawScore = 1.0 / (1.0 + exp((yaw - MAX_HEAD_YAW) / 5.0));
-    final pitchScore = 1.0 / (1.0 + exp((pitch - MAX_HEAD_PITCH) / 4.0));
-    final rollScore = 1.0 / (1.0 + exp((roll - MAX_HEAD_ROLL) / 3.0));
-
-    return (yawScore + pitchScore + rollScore) / 3.0;
-  }
-
-  double _calculateFaceSymmetry(Face face) {
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-
-    final eyeSymmetry = 1.0 - (leftEye - rightEye).abs();
-
-    return eyeSymmetry.clamp(0.0, 1.0);
-  }
-
-  bool _checkLiveness(Face face) {
-    int passed = 0;
-
-    final leftEye = face.leftEyeOpenProbability ?? 0.0;
-    final rightEye = face.rightEyeOpenProbability ?? 0.0;
-    final eyeAsymmetry = (leftEye - rightEye).abs();
-    if (eyeAsymmetry >= MIN_EYE_ASYMMETRY) passed++;
-
-    final smiling = face.smilingProbability ?? 0.0;
-    if (smiling <= MAX_SMILING_PROBABILITY) passed++;
-
-    return passed >= REQUIRED_LIVENESS_CHECKS;
-  }
-
-  double _calculateAdaptiveThreshold() {
-    if (_qualityHistory.isEmpty) return MIN_FACE_QUALITY;
-
-    final recentQuality = _qualityHistory.length > 5
-        ? _qualityHistory
-                .sublist(_qualityHistory.length - 5)
-                .reduce((a, b) => a + b) /
-            5
-        : _qualityHistory.reduce((a, b) => a + b) / _qualityHistory.length;
-
-    double adaptiveThreshold = recentQuality * 0.9;
-    return adaptiveThreshold.clamp(0.55, 0.75);
-  }
-
-  void _analyzeAndImproveQuality() {
-    _improvementTips.clear();
-
-    if (_faceQuality < 0.6) {
-      if (_poseScore < 0.5) {
-        _improvementTips['pose'] = 'หันมาตรงๆ';
-      }
-      if (_lightingScore < 0.5) {
-        _improvementTips['lighting'] = 'ปรับแสงให้สว่าง';
-      }
-      if (_sharpnessScore < 0.5) {
-        _improvementTips['sharpness'] = 'อยู่นิ่งๆ';
-      }
-      if (_faceSymmetry < 0.5) {
-        _improvementTips['symmetry'] = 'หันมาตรงๆ';
-      }
-    }
-
-    if (_improvementTips.isNotEmpty) {
-      _currentGuidance = _improvementTips.values.join(' • ');
-    } else {
-      _currentGuidance = '';
-    }
-  }
-
-  void _updateIntelligentFaceStatus() {
-    if (_currentFace == null) return;
-
-    final bbox = _currentFace!.boundingBox;
-    final area = bbox.width * bbox.height;
-    final screenArea = _screenWidth * _screenHeight;
-    final areaRatio = area / screenArea;
-
-    if (areaRatio > MAX_FACE_AREA_RATIO) {
-      _updateStatus('📱 ถอยหลัง', 'ใกล้เกินไป', '');
-      return;
-    } else if (areaRatio < MIN_FACE_AREA_RATIO) {
-      _updateStatus('📱 เข้ามาใกล้', 'ไกลเกินไป', '');
-      return;
-    }
-
-    final currentThreshold =
-        ENABLE_ADAPTIVE_THRESHOLDS ? _adaptiveThreshold : MIN_FACE_QUALITY;
-
-    if (_faceQuality < currentThreshold) {
-      if (_currentGuidance.isNotEmpty) {
-        _updateStatus('📸 ปรับปรุง', _currentGuidance,
-            'คุณภาพ ${(_faceQuality * 100).toInt()}%');
-      } else {
-        _updateStatus(
-            '📸 ปรับตำแหน่ง', 'คุณภาพ ${(_faceQuality * 100).toInt()}%', '');
-      }
-      return;
-    }
-
-    if (_faceStability < MIN_FACE_STABILITY) {
-      _updateStatus(
-          '🎯 อยู่นิ่งๆ', 'ความนิ่ง ${(_faceStability * 100).toInt()}%', '');
-      return;
-    }
-
-    if (!_livenessPassed) {
-      _updateStatus('🔄 ตรวจสอบ', 'กะพริบตาเล็กน้อย', '');
-      return;
-    }
-
-    if (_enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-      String qualityText = _faceQuality >= 0.75
-          ? 'คุณภาพดี'
-          : (_faceQuality >= 0.65 ? 'คุณภาพพอใช้' : 'คุณภาพต่ำ');
-
-      _updateStatus(
-        '✅ ใส่ใบหน้าคุณภาพดี (${(_faceQuality * 100).toInt()}%)',
-        'ถ่ายรูปที่ ${_enrollmentCount + 1}/$MIN_ENROLLMENT_EMBEDDINGS',
-        '',
-      );
-    }
-  }
-
-  img.Image _enhanceImageQuality(img.Image image) {
-    final sharpened = img.copyResize(image,
-        width: image.width,
-        height: image.height,
-        interpolation: img.Interpolation.linear);
-
-    for (var pixel in sharpened) {
-      pixel.r = (pixel.r * 1.1).clamp(0, 255).toInt();
-      pixel.g = (pixel.g * 1.1).clamp(0, 255).toInt();
-      pixel.b = (pixel.b * 1.1).clamp(0, 255).toInt();
-    }
-
-    return sharpened;
-  }
-
-  Future<img.Image?> _cropAndPreprocessFace(String imagePath, Face face) async {
-    try {
-      final file = File(imagePath);
-      final imageBytes = await file.readAsBytes();
-      final originalImage = img.decodeImage(imageBytes);
-
-      if (originalImage == null) return null;
-
-      final bbox = face.boundingBox;
-
-      final paddingX = (bbox.width * FACE_PADDING_RATIO).toInt();
-      final paddingY = (bbox.height * FACE_PADDING_RATIO).toInt();
-
-      int left = max(0, bbox.left.toInt() - paddingX);
-      int top = max(0, bbox.top.toInt() - paddingY);
-      int width =
-          min(originalImage.width - left, bbox.width.toInt() + paddingX * 2);
-      int height =
-          min(originalImage.height - top, bbox.height.toInt() + paddingY * 2);
-
-      if (width <= 0 || height <= 0) return null;
-
-      final croppedImage = img.copyCrop(
-        originalImage,
-        x: left,
-        y: top,
-        width: width,
-        height: height,
-      );
-
-      final resizedImage = img.copyResize(
-        croppedImage,
-        width: FACE_CROP_SIZE,
-        height: FACE_CROP_SIZE,
-        interpolation: img.Interpolation.linear,
-      );
-
-      return resizedImage;
-    } catch (e) {
-      print('❌ Error cropping: $e');
-      return null;
-    }
-  }
-
-  Future<List<double>> _extractEmbedding(img.Image faceImage) async {
-    if (!_modelLoaded || _faceModel == null) {
-      throw Exception('โมเดลไม่พร้อม');
-    }
-
-    try {
-      final input = _prepareInput(faceImage);
-      final outputShape = _faceModel!.getOutputTensor(0).shape;
-
-      int outputSize = 1;
-      for (var dim in outputShape) {
-        outputSize *= dim;
-      }
-
-      final outputBuffer = List<double>.filled(outputSize, 0.0);
-      final output = outputBuffer.reshape(outputShape);
-
-      _faceModel!.run(input, output);
-
-      List<double> result = [];
-
-      if (outputShape.length == 2) {
-        result = List<double>.from(output[0]);
-      } else if (outputShape.length == 1) {
-        result = List<double>.from(output);
-      } else {
-        result = _flattenOutput(output);
-      }
-
-      return result;
-    } catch (e) {
-      print('❌ Error extracting embedding: $e');
-      rethrow;
-    }
-  }
-
-  List<double> _flattenOutput(dynamic output) {
-    List<double> result = [];
-
-    void flatten(dynamic item) {
-      if (item is List) {
-        for (var subItem in item) {
-          flatten(subItem);
-        }
-      } else if (item is double) {
-        result.add(item);
-      }
-    }
-
-    flatten(output);
-    return result;
-  }
-
-  List<List<List<List<double>>>> _prepareInput(img.Image image) {
-    final input = List.generate(
-      1,
-      (_) => List.generate(
-        FACE_CROP_SIZE,
-        (_) => List.generate(
-          FACE_CROP_SIZE,
-          (_) => List.filled(3, 0.0),
-        ),
-      ),
-    );
-
-    final bytes = image.getBytes(order: img.ChannelOrder.rgb);
-    int byteIndex = 0;
-
-    for (int y = 0; y < FACE_CROP_SIZE; y++) {
-      for (int x = 0; x < FACE_CROP_SIZE; x++) {
-        if (byteIndex + 2 < bytes.length) {
-          final r = bytes[byteIndex].toDouble();
-          final g = bytes[byteIndex + 1].toDouble();
-          final b = bytes[byteIndex + 2].toDouble();
-
-          input[0][y][x][0] = (r / 127.5) - 1.0;
-          input[0][y][x][1] = (g / 127.5) - 1.0;
-          input[0][y][x][2] = (b / 127.5) - 1.0;
-
-          byteIndex += 3;
-        }
-      }
-    }
-
-    return input;
-  }
-
-  double _evaluateEmbeddingQuality(List<double> embedding) {
-    double norm = 0.0;
-    for (final v in embedding) norm += v * v;
-    norm = sqrt(norm);
-
-    return 1.0 - (norm - 1.0).abs().clamp(0.0, 0.5);
-  }
-
-  double _calculateConsistency() {
-    if (_enrolledEmbeddings.length < 2) return 1.0;
-
-    double totalSimilarity = 0.0;
-    int comparisons = 0;
-
-    for (int i = 0; i < _enrolledEmbeddings.length; i++) {
-      for (int j = i + 1; j < _enrolledEmbeddings.length; j++) {
-        final emb1 = _enrolledEmbeddings[i]['embedding'] as List<double>;
-        final emb2 = _enrolledEmbeddings[j]['embedding'] as List<double>;
-
-        final similarity = _cosineSimilarity(emb1, emb2);
-        totalSimilarity += similarity;
-        comparisons++;
-      }
-    }
-
-    return comparisons > 0 ? totalSimilarity / comparisons : 1.0;
-  }
-
-  List<double> _calculateMeanEmbedding() {
-    if (_enrolledEmbeddings.isEmpty) return [];
-
-    final facesToUse = _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
-
-    final firstEmb = facesToUse.first['embedding'] as List<double>;
-    final dimension = firstEmb.length;
-    final mean = List<double>.filled(dimension, 0.0);
-    double totalWeight = 0.0;
-
-    for (var emb in facesToUse) {
-      final vector = emb['embedding'] as List<double>;
-      final quality =
-          emb['total_quality'] as double? ?? emb['quality'] as double;
-      final weight = quality;
-
-      for (int i = 0; i < dimension; i++) {
-        mean[i] += vector[i] * weight;
-      }
-      totalWeight += weight;
-    }
-
-    for (int i = 0; i < dimension; i++) {
-      mean[i] /= totalWeight;
-    }
-
-    return _l2Normalize(mean);
-  }
-
-  double _cosineSimilarity(List<double> a, List<double> b) {
-    if (a.length != b.length) return 0.0;
-
-    double dot = 0.0, normA = 0.0, normB = 0.0;
-    for (int i = 0; i < a.length; i++) {
-      dot += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
-    }
-
-    if (normA < 1e-12 || normB < 1e-12) return 0.0;
-
-    final similarity = dot / (sqrt(normA) * sqrt(normB));
-    return ((similarity + 1) / 2).clamp(0.0, 1.0);
-  }
-
-  List<double> _l2Normalize(List<double> vector) {
-    double norm = 0.0;
-    for (final v in vector) norm += v * v;
-    norm = sqrt(norm);
-
-    if (norm < 1e-12) return vector;
-
-    final normalized = List<double>.filled(vector.length, 0.0);
-    for (int i = 0; i < vector.length; i++) {
-      normalized[i] = vector[i] / norm;
-    }
-    return normalized;
-  }
-
-  void _showInsufficientConsistencyDialog() {
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('ความสอดคล้องไม่พอ'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('ใบหน้าที่ถ่ายมีความสอดคล้องกันไม่พอ'),
-              const SizedBox(height: 8),
-              Text('ความสอดคล้อง: ${(_enrollmentConsistency * 100).toInt()}%'),
-              Text('ต้องการ: ${(MIN_ENROLLMENT_CONSISTENCY * 100).toInt()}%'),
-              const SizedBox(height: 16),
-              Text(
-                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
-              Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
-              if (_bestFaces.isNotEmpty) ...[
-                const SizedBox(height: 16),
-                const Text('คุณสามารถใช้ใบหน้าที่ดีที่สุดที่มีอยู่'),
-              ],
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _resetAndTryAgain();
-              },
-              child: const Text('ถ่ายใหม่'),
-            ),
-            if (_bestFaces.isNotEmpty)
-              TextButton(
-                onPressed: () async {
-                  Navigator.pop(context);
-                  await _saveFaceIDProfileWithBestFaces();
-                },
-                child: const Text('ใช้ใบหน้าที่ดีที่สุด'),
-              ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _offerToUseBestFaces() {
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('ใช้ใบหน้าที่ดีที่สุด?'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                  'ลองถ่ายหลายครั้งแล้ว แต่ยังไม่ได้คุณภาพตามที่ต้องการ'),
-              const SizedBox(height: 16),
-              Text(
-                  'ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
-              Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
-              if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS) ...[
-                const SizedBox(height: 8),
-                const Text('✅ มีจำนวนเพียงพอสำหรับการบันทึก'),
-              ] else ...[
-                const SizedBox(height: 8),
-                Text(
-                    '⚠️ มีเพียง ${_bestFaces.length} รูป (ต้องการ $MIN_ENROLLMENT_EMBEDDINGS รูป)'),
-              ],
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _resetAndTryAgain();
-              },
-              child: const Text('ลองถ่ายใหม่'),
-            ),
-            if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS)
-              TextButton(
-                onPressed: () async {
-                  Navigator.pop(context);
-                  _enrolledEmbeddings = List.from(_bestFaces);
-                  _enrollmentCount = _bestFaces.length;
-                  _enrollmentConsistency = _calculateConsistency();
-                  await _saveFaceIDProfileWithBestFaces();
-                },
-                child: const Text('บันทึกด้วยใบหน้าที่ดีที่สุด'),
-              ),
-            if (_bestFaces.length < MIN_ENROLLMENT_EMBEDDINGS &&
-                _bestFaces.isNotEmpty)
-              TextButton(
-                onPressed: () {
-                  Navigator.pop(context);
-                  _continueCapturing();
-                },
-                child: const Text('ถ่ายเพิ่ม'),
-              ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _offerToUseBestAvailable() {
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('ไม่พบใบหน้าที่มีคุณภาพดี'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('ลองถ่ายหลายครั้งแล้ว แต่ยังไม่มีใบหน้าที่มีคุณภาพดี'),
-              const SizedBox(height: 16),
-              Text('จำนวนครั้งที่ลอง: $_captureAttempts ครั้ง'),
-              if (_allCapturedFaces.isNotEmpty) ...[
-                const SizedBox(height: 8),
-                Text(
-                    'ใบหน้าที่ดีที่สุดจากที่ลอง: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
-              ],
-              const SizedBox(height: 16),
-              const Text('คุณต้องการ:'),
-              const Text('1. ลองถ่ายใหม่'),
-              const Text('2. กลับไปหน้าแรก'),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _resetAndTryAgain();
-              },
-              child: const Text('ลองถ่ายใหม่'),
-            ),
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                Navigator.pushNamedAndRemoveUntil(
-                    context, '/home', (route) => false);
-              },
-              child: const Text('กลับหน้าแรก'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _resetAndTryAgain() {
-    setState(() {
-      _captureAttempts = 0;
-      _isRetryMode = true;
-      _statusMessage = '📸 ลองถ่ายใหม่';
-      _instructionMessage = 'วางใบหน้าในกรอบ';
-      _stableFrameCount = 0;
-      _consecutiveLowQuality = 0;
-      _consecutiveGoodFrames = 0;
-      _isStruggling = false;
-    });
-  }
-
-  void _continueCapturing() {
-    setState(() {
-      _isRetryMode = false;
-      _statusMessage = '📸 ถ่ายเพิ่มเติม';
-      _instructionMessage =
-          'ถ่ายอีก ${MIN_ENROLLMENT_EMBEDDINGS - _enrollmentCount} รูป';
-      _stableFrameCount = 0;
-    });
-  }
-
-  Future<void> _saveFaceIDProfileWithBestFaces() async {
-    setState(() {
-      _isSaving = true;
-      _statusMessage = '💾 กำลังบันทึก...';
-    });
-
-    try {
-      final user = _auth.currentUser;
-      if (user == null) throw Exception('ไม่พบผู้ใช้');
-
-      final faceProfileId = _uuid.v4();
-
-      final facesToUse =
-          _bestFaces.isNotEmpty ? _bestFaces : _enrolledEmbeddings;
-      final meanEmbedding = _calculateMeanEmbedding();
-
-      double totalQuality = 0;
-      double totalStability = 0;
-      double totalLighting = 0;
-      double totalSharpness = 0;
-
-      for (var face in facesToUse) {
-        totalQuality += face['quality'] as double;
-        totalStability += face['stability'] as double;
-        totalLighting += face['lighting'] as double? ?? 0.5;
-        totalSharpness += face['sharpness'] as double? ?? 0.5;
-      }
-
-      final avgQuality = totalQuality / facesToUse.length;
-      final avgStability = totalStability / facesToUse.length;
-      final avgLighting = totalLighting / facesToUse.length;
-      final avgSharpness = totalSharpness / facesToUse.length;
-
-      final confidenceScore = (avgQuality * 0.4 +
-          avgStability * 0.3 +
-          avgLighting * 0.15 +
-          avgSharpness * 0.15);
-
-      print('✅ บันทึกด้วยใบหน้าที่ดีที่สุด ${facesToUse.length} รูป');
-      print(
-          '📊 คะแนนความมั่นใจ: ${(confidenceScore * 100).toStringAsFixed(1)}%');
-
-      final faceProfile = {
-        'profile_id': faceProfileId,
-        'user_id': user.uid,
-        'mean_embedding': meanEmbedding,
-        'embedding_dimension': meanEmbedding.length,
-        'embedding_version': EMBEDDING_VERSION,
-        'embedding_model': MODEL_NAME,
-        'enrollment_stats': {
-          'total_embeddings': facesToUse.length,
-          'total_attempts': _captureAttempts,
-          'best_quality': _absoluteBestQuality,
-          'consistency': _enrollmentConsistency,
-          'confidence': confidenceScore,
-          'average_quality': avgQuality,
-          'average_stability': avgStability,
-        },
-        'quality_metrics': {
-          'face_quality': avgQuality,
-          'stability': avgStability,
-          'lighting_score': avgLighting,
-          'sharpness_score': avgSharpness,
-          'confidence_score': confidenceScore,
-        },
-        'liveness_verified': true,
-        'capture_timestamp': DateTime.now().toIso8601String(),
-        'created_at': FieldValue.serverTimestamp(),
-        'status': 'active',
-        'thresholds': {
-          'verification': 0.75,
-          'identification': 0.78,
-        },
-      };
-
-      await _firestore
-          .collection('users')
-          .doc(user.uid)
-          .collection('face_profiles')
-          .doc(faceProfileId)
-          .set(faceProfile);
-
-      for (int i = 0; i < facesToUse.length; i++) {
-        final emb = facesToUse[i];
-        final embeddingId = _uuid.v4();
-
-        await _firestore
-            .collection('users')
-            .doc(user.uid)
-            .collection('face_embeddings')
-            .doc(embeddingId)
-            .set({
-          'embedding_id': embeddingId,
-          'profile_id': faceProfileId,
-          'user_id': user.uid,
-          'embedding_vector': emb['embedding'],
-          'quality_score': emb['quality'],
-          'stability_score': emb['stability'],
-          'lighting_score': emb['lighting'] ?? 0.5,
-          'sharpness_score': emb['sharpness'] ?? 0.5,
-          'total_quality': emb['total_quality'] ?? emb['quality'],
-          'angles': emb['angles'],
-          'capture_sequence': i + 1,
-          'capture_attempt': emb['capture_attempt'],
-          'dimension': emb['dimension'],
-          'created_at': FieldValue.serverTimestamp(),
-        });
-      }
-
-      await _firestore.collection('users').doc(user.uid).set({
-        'active': true,
-      }, SetOptions(merge: true));
-
-      if (mounted) {
-        setState(() {
-          _statusMessage = '✅ Face ID สำเร็จ!';
-          _instructionMessage =
-              'ความมั่นใจ ${(confidenceScore * 100).toInt()}%';
-          _isSaving = false;
-          _captureComplete = true;
-        });
-      }
-
-      _playSuccessAnimation();
-
-      await Future.delayed(const Duration(seconds: 2));
-      if (mounted) {
-        Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
-      }
-    } catch (e) {
-      print('❌ Save error: $e');
-      if (mounted) {
-        setState(() {
-          _statusMessage = '❌ บันทึกไม่สำเร็จ';
-          _instructionMessage = 'ลองใหม่';
-          _isSaving = false;
-        });
-      }
-    }
-  }
-
-  void _showCaptureSuccess() {
-    setState(() => _showGuide = true);
-    Future.delayed(const Duration(milliseconds: 400), () {
-      if (mounted) setState(() => _showGuide = false);
-    });
-  }
-
-  void _playSuccessAnimation() async {
-    await _successController.forward();
-    await Future.delayed(const Duration(milliseconds: 400));
-    await _successController.reverse();
   }
 }
