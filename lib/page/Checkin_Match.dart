@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
@@ -43,6 +44,10 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
 
   // ================ MATCHING THRESHOLDS ================
   static const double MATCH_THRESHOLD = 0.75;
+
+  // ================ iOS OPTIMIZATIONS ================
+  static const int IOS_DETECTION_INTERVAL_MS = 800;
+  static const int ANDROID_DETECTION_INTERVAL_MS = 300;
 
   // ================ Camera & Detection ================
   CameraController? _cameraController;
@@ -84,7 +89,6 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
   String? _firebaseError;
   String? _firestorePath;
 
-  // ข้อมูล Face Profile จาก Firebase
   List<Map<String, dynamic>> _faceProfiles = [];
   List<Map<String, dynamic>> _faceEmbeddings = [];
   Map<String, dynamic>? _primaryProfile;
@@ -111,15 +115,24 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
   double _screenHeight = 1280.0;
   bool _isSmallScreen = false;
 
-  // ================ Timer ================
+  // ================ Timer & Processing ================
   Timer? _detectionTimer;
   Timer? _cooldownTimer;
   bool _isProcessing = false;
+  
+  // 🔥 iOS: Platform detection & Image Stream variables
+  bool _isIos = false;
+  StreamSubscription<CameraImage>? _imageStreamSubscription;
+  Timer? _frameThrottleTimer;
+  CameraImage? _latestCameraImage;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+
+    _isIos = Platform.isIOS;
+    print('📱 Platform: ${_isIos ? 'iOS' : 'Android'}');
 
     _pulseController = AnimationController(
       duration: const Duration(milliseconds: 1500),
@@ -156,6 +169,8 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
     WidgetsBinding.instance.removeObserver(this);
     _detectionTimer?.cancel();
     _cooldownTimer?.cancel();
+    _frameThrottleTimer?.cancel();
+    _imageStreamSubscription?.cancel();
     _cameraController?.dispose();
     _faceDetector?.close();
     _faceModel?.close();
@@ -304,7 +319,6 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
       if (userDoc.exists) {
         final data = userDoc.data() as Map<String, dynamic>;
 
-        // ✅ ดึงข้อมูลจาก users collection
         String firstName = data['firstName']?.toString() ?? '';
         String lastName = data['lastName']?.toString() ?? '';
         String studentId = data['studentId']?.toString() ??
@@ -318,7 +332,6 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
           'email': email,
           'firstName': firstName.isEmpty ? 'นายดนุพล' : firstName,
           'lastName': lastName.isEmpty ? 'นิลอนันต์' : lastName,
-          // ✅ ข้อมูลการศึกษา (อาจมีใน users หรือไม่ก็ได้)
           'educationLevel': data['educationLevel']?.toString() ??
               data['level']?.toString() ??
               data['education_level']?.toString() ??
@@ -343,7 +356,6 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
         }
       } else {
         _addDebugLog('⚠️ ไม่พบเอกสารผู้ใช้: $correctUserId');
-        // ✅ สร้างข้อมูลจำลอง
         _userData = {
           'userId': correctUserId,
           'studentId': '6304101305',
@@ -359,7 +371,6 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
       }
     } catch (e) {
       _addDebugLog('⚠️ Error loading user data: $e');
-      // ✅ สร้างข้อมูลจำลองเมื่อ error
       _userData = {
         'userId': _targetUserId,
         'studentId': '6304101305',
@@ -395,7 +406,6 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
 
       final userRef = _firestore.collection('users').doc(_targetUserId);
 
-      // ========== โหลด Face Profiles ==========
       _addDebugLog('\n📁 กำลังโหลด face_profiles...');
 
       try {
@@ -442,7 +452,6 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
         _addDebugLog('❌ Error loading profiles: $e');
       }
 
-      // ========== โหลด Face Embeddings ==========
       _addDebugLog('\n📁 กำลังโหลด face_embeddings...');
 
       try {
@@ -664,7 +673,7 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
     }
   }
 
-  // ================ INITIALIZE CAMERA ================
+  // ================ INITIALIZE CAMERA (iOS Optimized) ================
   Future<void> _initializeCamera() async {
     try {
       _cameras = await availableCameras();
@@ -675,14 +684,29 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
         orElse: () => _cameras!.first,
       );
 
+      // 🔥 iOS: ใช้ความละเอียดต่ำกว่าและ format ที่เหมาะสม
+      final resolution = _isIos ? ResolutionPreset.low : ResolutionPreset.medium;
+      final imageFormat = _isIos ? ImageFormatGroup.bgra8888 : ImageFormatGroup.nv21;
+
       _cameraController = CameraController(
         frontCamera,
-        ResolutionPreset.medium,
+        resolution,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.nv21,
+        imageFormatGroup: imageFormat,
       );
 
       await _cameraController!.initialize();
+      
+      // 🔥 iOS: Lock exposure and focus to prevent flicker
+      if (_isIos) {
+        try {
+          await _cameraController!.setExposureMode(ExposureMode.locked);
+          await _cameraController!.setFocusMode(FocusMode.locked);
+        } catch (e) {
+          _addDebugLog('⚠️ iOS camera lock error: $e');
+        }
+      }
+      
       _addDebugLog('✅ กล้องพร้อม: ${frontCamera.name}');
     } catch (e) {
       _addDebugLog('❌ Camera error: $e');
@@ -692,16 +716,19 @@ class _CheckinMatchPageState extends State<CheckinMatchPage>
 
   Future<void> _initializeFaceDetector() async {
     try {
+      // 🔥 iOS: ใช้ fast mode เพื่อประสิทธิภาพ
+      final performanceMode = _isIos ? FaceDetectorMode.fast : FaceDetectorMode.accurate;
+      
       final options = FaceDetectorOptions(
         enableLandmarks: true,
         enableClassification: true,
         enableTracking: true,
         minFaceSize: MIN_FACE_SIZE,
-        performanceMode: FaceDetectorMode.fast,
+        performanceMode: performanceMode,
       );
 
       _faceDetector = FaceDetector(options: options);
-      _addDebugLog('✅ Face Detector พร้อม');
+      _addDebugLog('✅ Face Detector พร้อม (Mode: $performanceMode)');
     } catch (e) {
       _addDebugLog('⚠️ Face detector error: $e');
       _faceDetector = FaceDetector(
@@ -743,98 +770,399 @@ ${_debugLog.reversed.take(5).join('\n')}
 ''';
   }
 
-  // ================ FACE DETECTION ================
+  // ================ FACE DETECTION (Platform Optimized) ================
   void _startFaceDetection() {
     _detectionTimer?.cancel();
+    _frameThrottleTimer?.cancel();
+    _imageStreamSubscription?.cancel();
 
-    _detectionTimer =
-        Timer.periodic(const Duration(milliseconds: 300), (timer) async {
-      if (!_isCameraReady || _isMatching || _matchSuccess || _matchFailed)
+    if (_isIos) {
+      _addDebugLog('📱 iOS: Using image stream for detection');
+      _startIOSImageStream();
+    } else {
+      _addDebugLog('📱 Android: Using timer-based detection');
+      _startAndroidTimerDetection();
+    }
+  }
+
+// 🔥 iOS: Image Stream Method (No flicker!) - FIXED VERSION
+void _startIOSImageStream() {
+  _latestCameraImage = null;
+  
+  // Timer for processing frames at controlled interval
+  _frameThrottleTimer = Timer.periodic(
+    Duration(milliseconds: IOS_DETECTION_INTERVAL_MS),
+    (_) async {
+      if (!_isCameraReady || 
+          _isMatching || 
+          _matchSuccess || 
+          _matchFailed ||
+          _isProcessing ||
+          _latestCameraImage == null) {
         return;
-      if (_cameraController == null || !_cameraController!.value.isInitialized)
-        return;
-      if (_isProcessing) return;
-      if (_lastMatchAttempt != null) {
-        final timeSinceLast = DateTime.now().difference(_lastMatchAttempt!);
-        if (timeSinceLast.inSeconds < 2) return;
       }
+      
+      final image = _latestCameraImage;
+      _latestCameraImage = null;
+      
+      if (image != null && mounted) {
+        await _processIOSImageFrame(image);
+      }
+    },
+  );
+  
+  // 🔥 FIXED: startImageStream ไม่ต้องใช้ await และไม่ต้องเก็บ subscription
+  _cameraController!.startImageStream((CameraImage image) {
+    if (mounted) {
+      _latestCameraImage = image;
+    }
+  });
+}
 
-      try {
-        _isProcessing = true;
+  // 🔥 Process iOS frame without takePicture()
+  Future<void> _processIOSImageFrame(CameraImage image) async {
+    if (_isProcessing) return;
+    _isProcessing = true;
+    
+    try {
+      // Convert CameraImage to InputImage
+      final inputImage = await _convertCameraImageToInputImage(image);
+      if (inputImage == null) {
+        _isProcessing = false;
+        return;
+      }
+      
+      final faces = await _faceDetector!.processImage(inputImage);
+      
+      if (!mounted) {
+        _isProcessing = false;
+        return;
+      }
+      
+      await _handleDetectionResult(faces);
+      
+    } catch (e) {
+      _addDebugLog('iOS detection error: $e');
+    } finally {
+      _isProcessing = false;
+    }
+  }
 
-        final imageFile = await _cameraController!.takePicture();
-        _addDebugLog('📸 ถ่ายภาพ: ${imageFile.path}');
+  // 🔥 Convert CameraImage to InputImage (no file I/O!)
+  Future<InputImage?> _convertCameraImageToInputImage(CameraImage image) async {
+    try {
+      final WriteBuffer buffer = WriteBuffer();
+      
+      for (final Plane plane in image.planes) {
+        buffer.putUint8List(plane.bytes);
+      }
+      
+      final bytes = buffer.done().buffer.asUint8List();
+      
+      return InputImage.fromBytes(
+        bytes: bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: InputImageRotation.rotation0deg,
+          format: _isIos ? InputImageFormat.bgra8888 : InputImageFormat.nv21,
+          bytesPerRow: image.planes[0].bytesPerRow,
+        ),
+      );
+    } catch (e) {
+      _addDebugLog('Error converting camera image: $e');
+      return null;
+    }
+  }
 
-        final inputImage = InputImage.fromFilePath(imageFile.path);
-        final faces = await _faceDetector!.processImage(inputImage);
-
-        if (faces.isNotEmpty) {
-          final face = faces.first;
-
-          setState(() {
-            _currentFace = face;
-          });
-
-          _faceHistory.add(face);
-          if (_faceHistory.length > 5) _faceHistory.removeAt(0);
-
-          final quality = _calculateFaceQuality(face);
-          final stability = _calculateFaceStability();
-          final aligned = _checkFaceAlignment(face);
-
-          setState(() {
-            _faceQuality = quality;
-            _faceStability = stability;
-            _isFaceAligned = aligned;
-          });
-
-          _updateGuidance(face, quality, stability, aligned);
-
-          if (_shouldMatch(quality, stability, aligned)) {
-            setState(() => _stableFrameCount++);
-
-            if (_stableFrameCount >= REQUIRED_STABLE_FRAMES && !_isMatching) {
-              _lastMatchAttempt = DateTime.now();
-              await _performFaceMatching(imageFile.path, face);
-
-              try {
-                if (await File(imageFile.path).exists()) {
-                  await File(imageFile.path).delete();
-                  _addDebugLog('🗑️ ลบไฟล์: ${imageFile.path}');
-                }
-              } catch (e) {
-                _addDebugLog('⚠️ ลบไฟล์ไม่สำเร็จ: $e');
-              }
-            }
-          } else {
-            setState(() => _stableFrameCount = 0);
-
-            try {
-              if (await File(imageFile.path).exists()) {
-                await File(imageFile.path).delete();
-              }
-            } catch (_) {}
-          }
-        } else {
-          setState(() {
-            _currentFace = null;
-            _stableFrameCount = 0;
-          });
-          _updateStatus('👤 ไม่พบใบหน้า', 'วางใบหน้าในกรอบ', '');
-
-          try {
-            if (await File(imageFile.path).exists()) {
-              await File(imageFile.path).delete();
-            }
-          } catch (_) {}
+  // 🔥 Android: Timer-based detection (original)
+  void _startAndroidTimerDetection() {
+    _detectionTimer = Timer.periodic(
+      Duration(milliseconds: ANDROID_DETECTION_INTERVAL_MS),
+      (timer) async {
+        if (!_isCameraReady || 
+            _isMatching || 
+            _matchSuccess || 
+            _matchFailed ||
+            _isProcessing) {
+          return;
         }
+        
+        if (_cameraController == null || !_cameraController!.value.isInitialized) {
+          return;
+        }
+        
+        _isProcessing = true;
+        
+        try {
+          final imageFile = await _cameraController!.takePicture();
+          final inputImage = InputImage.fromFilePath(imageFile.path);
+          final faces = await _faceDetector!.processImage(inputImage);
+          
+          // Delete temp file
+          try {
+            await File(imageFile.path).delete();
+          } catch (_) {}
+          
+          if (mounted) {
+            await _handleDetectionResult(faces);
+          }
+        } catch (e) {
+          _addDebugLog('Android detection error: $e');
+        } finally {
+          _isProcessing = false;
+        }
+      },
+    );
+  }
 
-        _isProcessing = false;
-      } catch (e) {
-        _addDebugLog('Detection error: $e');
-        _isProcessing = false;
+  // 🔥 Common handler for detection results
+  Future<void> _handleDetectionResult(List<Face> faces) async {
+    if (faces.isNotEmpty) {
+      final face = faces.first;
+      
+      setState(() {
+        _currentFace = face;
+      });
+      
+      _faceHistory.add(face);
+      if (_faceHistory.length > 5) _faceHistory.removeAt(0);
+      
+      final quality = _calculateFaceQuality(face);
+      final stability = _calculateFaceStability();
+      final aligned = _checkFaceAlignment(face);
+      
+      setState(() {
+        _faceQuality = quality;
+        _faceStability = stability;
+        _isFaceAligned = aligned;
+      });
+      
+      _updateGuidance(face, quality, stability, aligned);
+      
+      if (_shouldMatch(quality, stability, aligned)) {
+        setState(() => _stableFrameCount++);
+        
+        if (_stableFrameCount >= REQUIRED_STABLE_FRAMES && !_isMatching) {
+          // Check cooldown
+          if (_lastMatchAttempt != null) {
+            final timeSinceLast = DateTime.now().difference(_lastMatchAttempt!);
+            if (timeSinceLast.inSeconds < 2) return;
+          }
+          
+          _lastMatchAttempt = DateTime.now();
+          
+          // For iOS, we need to capture from the latest frame
+          if (_isIos && _latestCameraImage != null) {
+            await _performIOSFaceMatching(_latestCameraImage!, face);
+          } else {
+            await _performAndroidFaceMatching(face);
+          }
+        }
+      } else {
+        setState(() => _stableFrameCount = 0);
       }
+    } else {
+      setState(() {
+        _currentFace = null;
+        _stableFrameCount = 0;
+      });
+      _updateStatus('👤 ไม่พบใบหน้า', 'วางใบหน้าในกรอบ', '');
+    }
+  }
+
+  // 🔥 iOS: Face matching from camera image (no file I/O)
+  Future<void> _performIOSFaceMatching(CameraImage image, Face face) async {
+    if (_isMatching) return;
+    
+    setState(() {
+      _isMatching = true;
+      _statusMessage = '🔍 กำลังตรวจสอบ...';
     });
+    
+    try {
+      _addDebugLog('\n🔍 เริ่มเปรียบเทียบใบหน้า (iOS)');
+      
+      final processedImage = await _convertCameraImageToProcessedImage(image, face);
+      if (processedImage == null) throw Exception('ไม่สามารถประมวลผลใบหน้าได้');
+      
+      final currentEmbedding = await _extractEmbedding(processedImage);
+      _addDebugLog('📊 Current embedding: ${currentEmbedding.length} dim');
+      
+      final bestScore = await _compareWithReferenceEmbeddings(currentEmbedding);
+      
+      _addDebugLog('📊 Best: ${(bestScore * 100).toStringAsFixed(1)}%');
+      
+      setState(() => _similarityScore = bestScore);
+      
+      if (bestScore >= MATCH_THRESHOLD) {
+        _addDebugLog('✅✅✅ MATCH!');
+        await _handleMatchSuccess(null, bestScore);
+      } else {
+        _addDebugLog('❌❌❌ NO MATCH');
+        await _handleMatchFailure(bestScore);
+      }
+    } catch (e) {
+      _addDebugLog('❌ Matching error: $e');
+      _updateStatus('❌ ตรวจสอบไม่สำเร็จ', 'กรุณาลองใหม่', '');
+    } finally {
+      if (mounted) setState(() => _isMatching = false);
+    }
+  }
+
+  // 🔥 Android: Face matching from file
+  Future<void> _performAndroidFaceMatching(Face face) async {
+    if (_isMatching) return;
+    
+    setState(() {
+      _isMatching = true;
+      _statusMessage = '🔍 กำลังตรวจสอบ...';
+    });
+    
+    try {
+      _addDebugLog('\n🔍 เริ่มเปรียบเทียบใบหน้า (Android)');
+      
+      final imageFile = await _cameraController!.takePicture();
+      final processedImage = await _cropAndPreprocessFace(imageFile.path, face);
+      
+      if (processedImage == null) throw Exception('ไม่สามารถประมวลผลใบหน้าได้');
+      
+      final currentEmbedding = await _extractEmbedding(processedImage);
+      _addDebugLog('📊 Current embedding: ${currentEmbedding.length} dim');
+      
+      final bestScore = await _compareWithReferenceEmbeddings(currentEmbedding);
+      
+      _addDebugLog('📊 Best: ${(bestScore * 100).toStringAsFixed(1)}%');
+      
+      setState(() => _similarityScore = bestScore);
+      
+      // Delete temp file
+      try {
+        await File(imageFile.path).delete();
+      } catch (_) {}
+      
+      if (bestScore >= MATCH_THRESHOLD) {
+        _addDebugLog('✅✅✅ MATCH!');
+        await _handleMatchSuccess(null, bestScore);
+      } else {
+        _addDebugLog('❌❌❌ NO MATCH');
+        await _handleMatchFailure(bestScore);
+      }
+    } catch (e) {
+      _addDebugLog('❌ Matching error: $e');
+      _updateStatus('❌ ตรวจสอบไม่สำเร็จ', 'กรุณาลองใหม่', '');
+    } finally {
+      if (mounted) setState(() => _isMatching = false);
+    }
+  }
+
+  // 🔥 Convert CameraImage to processed img.Image
+  Future<img.Image?> _convertCameraImageToProcessedImage(CameraImage image, Face face) async {
+    try {
+      final width = image.width;
+      final height = image.height;
+      
+      final img.Image result = img.Image(width: width, height: height);
+      
+      final plane = image.planes[0];
+      final bytes = plane.bytes;
+      
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final int pixelIndex = y * plane.bytesPerRow + x * 4;
+          if (pixelIndex + 3 < bytes.length) {
+            final int b = bytes[pixelIndex];
+            final int g = bytes[pixelIndex + 1];
+            final int r = bytes[pixelIndex + 2];
+            result.setPixelRgb(x, y, r, g, b);
+          }
+        }
+      }
+      
+      final bbox = face.boundingBox;
+      final previewSize = _cameraController!.value.previewSize!;
+      final scaleX = result.width / previewSize.height;
+      final scaleY = result.height / previewSize.width;
+      
+      double left = bbox.left * scaleX;
+      double top = bbox.top * scaleY;
+      double right = bbox.right * scaleX;
+      double bottom = bbox.bottom * scaleY;
+      
+      if (_cameraController!.description.lensDirection == CameraLensDirection.front) {
+        final tempLeft = left;
+        left = result.width - right;
+        right = result.width - tempLeft;
+      }
+      
+      final paddingX = (right - left) * FACE_PADDING_RATIO;
+      final paddingY = (bottom - top) * FACE_PADDING_RATIO;
+      
+      left = (left - paddingX).clamp(0.0, result.width.toDouble());
+      top = (top - paddingY).clamp(0.0, result.height.toDouble());
+      right = (right + paddingX).clamp(0.0, result.width.toDouble());
+      bottom = (bottom + paddingY).clamp(0.0, result.height.toDouble());
+      
+      final cropWidth = (right - left).toInt();
+      final cropHeight = (bottom - top).toInt();
+      
+      if (cropWidth <= 0 || cropHeight <= 0) return null;
+      
+      final cropped = img.copyCrop(result,
+          x: left.toInt(),
+          y: top.toInt(),
+          width: cropWidth,
+          height: cropHeight);
+      
+      final resized = img.copyResize(cropped,
+          width: FACE_CROP_SIZE, height: FACE_CROP_SIZE);
+      
+      return resized;
+    } catch (e) {
+      _addDebugLog('❌ Convert error: $e');
+      return null;
+    }
+  }
+
+  // 🔥 Compare with reference embeddings
+  Future<double> _compareWithReferenceEmbeddings(List<double> currentEmbedding) async {
+    List<Map<String, dynamic>> referenceVectors = [];
+    
+    for (var profile in _faceProfiles) {
+      if (profile.containsKey('mean_embedding')) {
+        referenceVectors.add({
+          'type': 'profile_mean',
+          'profile_id': profile['id'],
+          'vector': profile['mean_embedding'],
+          'confidence': profile['confidence'] ?? 0.8,
+        });
+      }
+    }
+    
+    for (var emb in _faceEmbeddings) {
+      referenceVectors.add({
+        'type': 'single_embedding',
+        'profile_id': emb['profile_id'],
+        'vector': emb['embedding'],
+        'confidence': emb['quality'] ?? 0.7,
+      });
+    }
+    
+    if (referenceVectors.isEmpty) throw Exception('ไม่มีข้อมูลเปรียบเทียบ');
+    
+    double bestScore = 0.0;
+    
+    for (var ref in referenceVectors) {
+      final refVector = ref['vector'] as List<double>;
+      if (refVector.length == currentEmbedding.length) {
+        final similarity = _cosineSimilarity(currentEmbedding, refVector);
+        _addDebugLog('   📍 ${ref['type']}: ${(similarity * 100).toStringAsFixed(1)}%');
+        if (similarity > bestScore) {
+          bestScore = similarity;
+        }
+      }
+    }
+    
+    return bestScore;
   }
 
   double _calculateFaceQuality(Face face) {
@@ -1111,83 +1439,6 @@ ${_debugLog.reversed.take(5).join('\n')}
     return ((similarity + 1) / 2).clamp(0.0, 1.0);
   }
 
-  // ================ MAIN FACE MATCHING ================
-  Future<void> _performFaceMatching(String imagePath, Face face) async {
-    if (_isMatching) return;
-
-    setState(() {
-      _isMatching = true;
-      _statusMessage = '🔍 กำลังตรวจสอบ...';
-    });
-
-    try {
-      _addDebugLog('\n🔍 เริ่มเปรียบเทียบใบหน้า');
-
-      final processedImage = await _cropAndPreprocessFace(imagePath, face);
-      if (processedImage == null) throw Exception('ไม่สามารถประมวลผลใบหน้าได้');
-
-      final currentEmbedding = await _extractEmbedding(processedImage);
-      _addDebugLog('📊 Current embedding: ${currentEmbedding.length} dim');
-
-      List<Map<String, dynamic>> referenceVectors = [];
-
-      for (var profile in _faceProfiles) {
-        if (profile.containsKey('mean_embedding')) {
-          referenceVectors.add({
-            'type': 'profile_mean',
-            'profile_id': profile['id'],
-            'vector': profile['mean_embedding'],
-            'confidence': profile['confidence'] ?? 0.8,
-          });
-        }
-      }
-
-      for (var emb in _faceEmbeddings) {
-        referenceVectors.add({
-          'type': 'single_embedding',
-          'profile_id': emb['profile_id'],
-          'vector': emb['embedding'],
-          'confidence': emb['quality'] ?? 0.7,
-        });
-      }
-
-      if (referenceVectors.isEmpty) throw Exception('ไม่มีข้อมูลเปรียบเทียบ');
-
-      double bestScore = 0.0;
-      String? bestProfileId;
-
-      for (var ref in referenceVectors) {
-        final refVector = ref['vector'] as List<double>;
-        if (refVector.length == currentEmbedding.length) {
-          final similarity = _cosineSimilarity(currentEmbedding, refVector);
-          _addDebugLog(
-              '   📍 ${ref['type']}: ${(similarity * 100).toStringAsFixed(1)}%');
-          if (similarity > bestScore) {
-            bestScore = similarity;
-            bestProfileId = ref['profile_id'];
-          }
-        }
-      }
-
-      _addDebugLog('📊 Best: ${(bestScore * 100).toStringAsFixed(1)}%');
-
-      setState(() => _similarityScore = bestScore);
-
-      if (bestScore >= MATCH_THRESHOLD) {
-        _addDebugLog('✅✅✅ MATCH!');
-        await _handleMatchSuccess(bestProfileId, bestScore);
-      } else {
-        _addDebugLog('❌❌❌ NO MATCH');
-        await _handleMatchFailure(bestScore);
-      }
-    } catch (e) {
-      _addDebugLog('❌ Matching error: $e');
-      _updateStatus('❌ ตรวจสอบไม่สำเร็จ', 'กรุณาลองใหม่', '');
-    } finally {
-      if (mounted) setState(() => _isMatching = false);
-    }
-  }
-
   Future<void> _handleMatchSuccess(String? profileId, double score) async {
     setState(() {
       _matchSuccess = true;
@@ -1199,7 +1450,6 @@ ${_debugLog.reversed.take(5).join('\n')}
     _showSuccessAnimation = true;
     _successController.forward();
 
-    // ✅ บันทึกข้อมูล checkin พร้อม educationLevel, year, department
     await _saveCheckinRecord(score, profileId);
 
     await Future.delayed(const Duration(seconds: 3));
@@ -1228,8 +1478,6 @@ ${_debugLog.reversed.take(5).join('\n')}
     });
   }
 
-  // ================ ✅ บันทึก Checkin ไปยัง Firestore ================
-// ================ ✅ บันทึก Checkin ไปยัง Firestore (แบบ Minimal) ================
   Future<void> _saveCheckinRecord(double score, String? profileId) async {
     try {
       if (_currentUser == null || _targetUserId == null) return;
@@ -1246,12 +1494,10 @@ ${_debugLog.reversed.take(5).join('\n')}
         'อาทิตย์'
       ];
 
-      // ✅ ดึงข้อมูลที่จำเป็นเท่านั้น
       String educationLevel = _userData?['educationLevel']?.toString() ?? '';
       String year = _userData?['year']?.toString() ?? '';
       String department = _userData?['department']?.toString() ?? '';
 
-      // ✅ ถ้าไม่มีข้อมูล ให้ใช้ค่าเริ่มต้น
       if (educationLevel.isEmpty) educationLevel = 'ป.ตรี';
       if (year.isEmpty) year = '4';
       if (department.isEmpty) department = 'สาขาวิศวกรรมซอฟต์แวร์';
@@ -1261,45 +1507,30 @@ ${_debugLog.reversed.take(5).join('\n')}
       _addDebugLog('   - year: $year');
       _addDebugLog('   - department: $department');
 
-      // ✅ สร้างข้อมูล checkin แบบ Minimal (เฉพาะที่จำเป็น)
       Map<String, dynamic> checkinData = {
-        // 🔥 Primary fields (จำเป็น)
         'checkin_id': checkinId,
         'user_id': _targetUserId,
         'checked_by': _currentUser!.uid,
-
-        // 🔥 Student information (จำเป็น)
         'student_id': _userData?['studentId']?.toString() ?? '',
         'first_name': _userData?['firstName']?.toString() ?? '',
         'last_name': _userData?['lastName']?.toString() ?? '',
-
-        // 🔥 EDUCATION FIELDS (จำเป็นสำหรับการกรอง)
         'education_level': educationLevel,
         'year': year,
         'department': department,
-
-        // 🔥 Date and time (จำเป็น)
         'day': thaiWeekdays[now.weekday - 1],
         'date': DateFormat('yyyy-MM-dd').format(now),
         'time': DateFormat('HH:mm:ss').format(now),
         'timestamp': FieldValue.serverTimestamp(),
-
-        // 🔥 Match results (จำเป็น)
         'similarity_score': score,
         'is_match': true,
         'profile_id': profileId ?? '',
-
-        // 🔥 Method (จำเป็น)
         'method': 'Face Recognition',
       };
 
-      // ✅ บันทึกไปยัง checkins collection
       await _firestore.collection('checkins').doc(checkinId).set(checkinData);
 
       _addDebugLog('✅ บันทึก checkin สำเร็จ: $checkinId');
-      _addDebugLog('📊 จำนวนฟิลด์ที่ส่ง: ${checkinData.length} ฟิลด์');
 
-      // ✅ อัปเดต users collection (เฉพาะสถิติที่จำเป็น)
       await _firestore.collection('users').doc(_targetUserId).set({
         'last_checkin': FieldValue.serverTimestamp(),
         'last_checkin_date': now.toIso8601String(),
@@ -1309,28 +1540,6 @@ ${_debugLog.reversed.take(5).join('\n')}
       _addDebugLog('✅ อัปเดต users collection สำเร็จ');
     } catch (e) {
       _addDebugLog('❌ Error saving checkin: $e');
-
-      // ✅ Fallback: บันทึกเฉพาะข้อมูลสำคัญที่สุด
-      try {
-        _addDebugLog('🔄 พยายามบันทึกอีกครั้งแบบ minimal...');
-
-        final fallbackData = {
-          'checkin_id': _uuid.v4(),
-          'user_id': _targetUserId,
-          'checked_by': _currentUser!.uid,
-          'timestamp': FieldValue.serverTimestamp(),
-          'similarity_score': score,
-          'is_match': true,
-          'education_level': _userData?['educationLevel'] ?? 'ป.ตรี',
-          'year': _userData?['year'] ?? '4',
-          'department': _userData?['department'] ?? 'สาขาวิศวกรรมซอฟต์แวร์',
-        };
-
-        await _firestore.collection('checkins').doc().set(fallbackData);
-        _addDebugLog('✅ บันทึก fallback สำเร็จ');
-      } catch (fallbackError) {
-        _addDebugLog('❌ Fallback ก็ล้มเหลว: $fallbackError');
-      }
     }
   }
 
