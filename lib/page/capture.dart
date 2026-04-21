@@ -12,6 +12,7 @@ import 'package:intl/intl.dart';
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:flutter/services.dart';
+import 'dart:convert';
 
 class CapturePage extends StatefulWidget {
   const CapturePage({super.key});
@@ -39,6 +40,7 @@ class _CapturePageState extends State<CapturePage>
   static const double MAX_HEAD_ROLL = 18.0;
 
   static const double MIN_EYE_OPENNESS = 0.4;
+  static const int REQUIRED_STABLE_FRAMES = 2;
 
   static const double MIN_FACE_AREA_RATIO = 0.04;
   static const double MAX_FACE_AREA_RATIO = 0.50;
@@ -59,15 +61,32 @@ class _CapturePageState extends State<CapturePage>
   static const double EXCELLENT_FACE_THRESHOLD = 0.85;
   static const int MAX_BEST_FACES_STORAGE = 5;
 
-  // ================ OPTIMIZATIONS ================
-  static const int FRAME_SKIP_INTERVAL = 2;
-  static const int CAPTURE_QUALITY_FRAMES_REQUIRED = 3;
-  static const ResolutionPreset OPTIMIZED_RESOLUTION = ResolutionPreset.medium;
+  // ================ INTELLIGENT ENHANCEMENTS ================
+  static const bool ENABLE_ADAPTIVE_THRESHOLDS = true;
+  static const bool ENABLE_QUALITY_BOOST = true;
+  static const bool ENABLE_SMART_GUIDANCE = true;
+  static const double MIN_ACCEPTABLE_QUALITY = 0.55;
+
+  // ================ iOS OPTIMIZATIONS (IMPROVED) ================
+  static const int IOS_DETECTION_INTERVAL_MS = 800; // ลดลงเหลือ 800ms
+  static const int ANDROID_DETECTION_INTERVAL_MS = 500;
+  static const ResolutionPreset IOS_RESOLUTION = ResolutionPreset.medium; // ใช้ medium
+  static const ResolutionPreset ANDROID_RESOLUTION = ResolutionPreset.medium;
+  static const int IOS_THREADS = 2;
+  static const int ANDROID_THREADS = 4;
+  static const bool IOS_USE_FAST_MODE = true;
+  static const int MAX_IOS_CONSECUTIVE_ERRORS = 5;
   
+  // iOS การจัดการหน่วยความจำ
+  static const int MAX_IOS_IMAGE_CACHE = 2;
+  static const Duration IOS_CAPTURE_DELAY = Duration(milliseconds: 100);
+  static const Duration IOS_RETRY_DELAY = Duration(milliseconds: 500);
+
   // ================ UI CONSTANTS ================
+  static const double FACE_FRAME_RATIO = 0.65;
+  static const double METRICS_BAR_HEIGHT = 4.0;
   static const double CORNER_SIZE = 30.0;
   static const double CORNER_THICKNESS = 4.0;
-  static const double METRICS_BAR_HEIGHT = 4.0;
 
   // ================ Camera & Detection ================
   CameraController? _cameraController;
@@ -75,13 +94,7 @@ class _CapturePageState extends State<CapturePage>
   FaceDetector? _faceDetector;
   Face? _currentFace;
   List<Face> _faceHistory = [];
-  
-  // ================ Image Stream Processing ================
-  int _frameCounter = 0;
-  bool _isProcessingFrame = false;
-  int _consecutiveGoodFrames = 0;
-  bool _captureRequested = false;
-  
+
   // ================ MobileFaceNet Model ================
   Interpreter? _faceModel;
   bool _modelLoaded = false;
@@ -91,12 +104,16 @@ class _CapturePageState extends State<CapturePage>
   // ================ Quality Metrics ================
   double _faceQuality = 0.0;
   double _faceStability = 0.0;
+  int _stableFrameCount = 0;
   bool _livenessPassed = false;
+
+  // ================ ENHANCED METRICS ================
   double _lightingScore = 0.0;
+  double _sharpnessScore = 0.0;
   double _poseScore = 0.0;
   double _faceSymmetry = 0.0;
 
-  // ================ Tracking ================
+  // ================ INTELLIGENT TRACKING ================
   List<double> _qualityHistory = [];
   Map<String, String> _improvementTips = {};
   String _currentGuidance = '';
@@ -104,10 +121,18 @@ class _CapturePageState extends State<CapturePage>
   int _consecutiveLowQuality = 0;
   bool _isStruggling = false;
 
-  // ================ Platform ================
+  // ================ iOS OPTIMIZATION VARIABLES (IMPROVED) ================
   bool _isIos = false;
-  
-  // ================ Storage ================
+  bool _isProcessing = false;
+  int _iosConsecutiveErrors = 0;
+  DateTime? _lastIosDetectionTime;
+  Timer? _iosRetryTimer;
+  bool _isCameraDisposed = false;
+  List<XFile> _iosImageCache = [];
+  int _frameSkipCounter = 0;
+  static const int IOS_FRAME_SKIP = 2; // ข้าม frame บน iOS
+
+  // ================ BEST FACE STORAGE ================
   List<Map<String, dynamic>> _allCapturedFaces = [];
   List<Map<String, dynamic>> _bestFaces = [];
   Map<String, dynamic>? _absoluteBestFace;
@@ -125,6 +150,9 @@ class _CapturePageState extends State<CapturePage>
   bool _isSaving = false;
   bool _captureComplete = false;
   bool _showGuide = false;
+  bool _isTakingPicture = false;
+  bool _isRetryMode = false;
+  bool _isInitializing = true;
 
   // ================ Status Messages ================
   String _statusMessage = 'กำลังเตรียมระบบ...';
@@ -145,12 +173,16 @@ class _CapturePageState extends State<CapturePage>
   double _screenWidth = 720.0;
   double _screenHeight = 1280.0;
   bool _isSmallScreen = false;
+  late Size _cameraPreviewSize;
+
+  // ================ Timer ================
+  Timer? _detectionTimer;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    
+
     _isIos = Platform.isIOS;
     print('📱 Platform: ${_isIos ? 'iOS' : 'Android'}');
 
@@ -181,14 +213,33 @@ class _CapturePageState extends State<CapturePage>
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _stopImageStream();
-    _cameraController?.dispose();
-    _faceDetector?.close();
-    _faceModel?.close();
+    _disposeSystem();
+    super.dispose();
+  }
+
+  Future<void> _disposeSystem() async {
+    _isCameraDisposed = true;
+    _detectionTimer?.cancel();
+    _detectionTimer = null;
+    _iosRetryTimer?.cancel();
+    _iosRetryTimer = null;
+    
+    if (_cameraController != null) {
+      await _cameraController?.dispose();
+      _cameraController = null;
+    }
+    
+    await _faceDetector?.close();
+    _faceDetector = null;
+    
+    await _faceModel?.close();
+    _faceModel = null;
+    
     _pulseController.dispose();
     _successController.dispose();
-    super.dispose();
+    
+    // ล้าง cache
+    _iosImageCache.clear();
   }
 
   // ================ SYSTEM INITIALIZATION ================
@@ -206,20 +257,23 @@ class _CapturePageState extends State<CapturePage>
       await _initializeFaceDetector();
       await _loadMobileFaceNetModel();
 
-      if (mounted) {
+      if (mounted && !_isCameraDisposed) {
         setState(() {
           _isCameraReady = true;
+          _isInitializing = false;
           _statusMessage = _modelLoaded ? '🆔 พร้อมบันทึก Face ID' : '⚠️ โหลดโมเดลไม่สำเร็จ';
-          _instructionMessage = 'วางใบหน้าในกรอบ';
         });
       }
 
-      if (_modelLoaded) {
-        _startImageStream();
+      if (_modelLoaded && !_isCameraDisposed) {
+        _startPlatformOptimizedDetection();
       }
     } catch (e) {
       print('❌ System error: $e');
-      _updateStatus('❌ เกิดข้อผิดพลาด', 'กรุณาเปิดแอปใหม่', '');
+      if (mounted && !_isCameraDisposed) {
+        _updateStatus('❌ เกิดข้อผิดพลาด', 'กรุณาเปิดแอปใหม่', '');
+        setState(() => _isInitializing = false);
+      }
     }
   }
 
@@ -233,25 +287,28 @@ class _CapturePageState extends State<CapturePage>
         orElse: () => cameras.first,
       );
 
+      final resolution = _isIos ? IOS_RESOLUTION : ANDROID_RESOLUTION;
+
       _cameraController = CameraController(
         frontCamera,
-        OPTIMIZED_RESOLUTION,
+        resolution,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420,
+        imageFormatGroup: ImageFormatGroup.jpeg,
       );
 
       await _cameraController!.initialize();
       
-      if (_isIos) {
-        try {
-          await _cameraController!.setExposureMode(ExposureMode.auto);
-          await _cameraController!.setFocusMode(FocusMode.auto);
-        } catch (e) {
-          print('⚠️ iOS camera settings error: $e');
-        }
+      // iOS: ตั้งค่า exposure และ focus แบบไม่รอ
+      if (_isIos && _cameraController != null) {
+        unawaited(_cameraController!.setExposureMode(ExposureMode.auto));
+        unawaited(_cameraController!.setFocusMode(FocusMode.auto));
       }
 
-      print('✅ กล้องพร้อม');
+      final size = MediaQuery.of(context).size;
+      final cameraRatio = _cameraController!.value.aspectRatio;
+      _cameraPreviewSize = Size(size.width, size.width / cameraRatio);
+
+      print('✅ กล้องพร้อม (iOS: $_isIos)');
     } catch (e) {
       print('❌ Camera error: $e');
       rethrow;
@@ -260,16 +317,20 @@ class _CapturePageState extends State<CapturePage>
 
   Future<void> _initializeFaceDetector() async {
     try {
+      final performanceMode = _isIos && IOS_USE_FAST_MODE
+          ? FaceDetectorMode.fast
+          : FaceDetectorMode.accurate;
+
       final options = FaceDetectorOptions(
         enableLandmarks: true,
         enableClassification: true,
         enableTracking: true,
         minFaceSize: 0.15,
-        performanceMode: FaceDetectorMode.accurate,
+        performanceMode: performanceMode,
       );
 
       _faceDetector = FaceDetector(options: options);
-      print('✅ Face Detector พร้อม');
+      print('✅ Face Detector พร้อม (Mode: $performanceMode)');
     } catch (e) {
       print('❌ Face detector error: $e');
       rethrow;
@@ -287,15 +348,13 @@ class _CapturePageState extends State<CapturePage>
     try {
       print('🔄 โหลดโมเดล MobileFaceNet...');
 
-      try {
-        await rootBundle.load(MODEL_ASSET_PATH);
-        print('✅ พบไฟล์โมเดล');
-      } catch (e) {
-        throw Exception('ไม่พบไฟล์โมเดล');
-      }
+      await rootBundle.load(MODEL_ASSET_PATH);
+      print('✅ พบไฟล์โมเดล');
+
+      final threads = _isIos ? IOS_THREADS : ANDROID_THREADS;
 
       final interpreterOptions = InterpreterOptions()
-        ..threads = _isIos ? 2 : 4
+        ..threads = threads
         ..useNnApiForAndroid = true;
 
       _faceModel = await Interpreter.fromAsset(
@@ -314,7 +373,8 @@ class _CapturePageState extends State<CapturePage>
       }
       _actualOutputDimension = outputSize;
 
-      print('📊 Output Size: $_actualOutputDimension');
+      print('📊 Output Dimension: $_actualOutputDimension');
+      print('📊 Threads: $threads');
 
       await _validateModelInference();
       _modelLoaded = true;
@@ -323,7 +383,7 @@ class _CapturePageState extends State<CapturePage>
       print('❌ โหลดโมเดลล้มเหลว: $e');
       _modelLoaded = false;
     } finally {
-      if (mounted) {
+      if (mounted && !_isCameraDisposed) {
         setState(() => _modelLoading = false);
       }
     }
@@ -344,8 +404,14 @@ class _CapturePageState extends State<CapturePage>
         ),
       );
 
-      final outputBuffer = List<double>.filled(_actualOutputDimension, 0.0);
-      final output = outputBuffer.reshape([1, _actualOutputDimension]);
+      final outputShape = _faceModel!.getOutputTensor(0).shape;
+      int outputSize = 1;
+      for (var dim in outputShape) {
+        outputSize *= dim;
+      }
+
+      final outputBuffer = List<double>.filled(outputSize, 0.0);
+      final output = outputBuffer.reshape(outputShape);
 
       _faceModel!.run(dummyInput, output);
       print('✅ โมเดลทำงานได้ปกติ');
@@ -355,253 +421,287 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
-  // ================ IMAGE STREAM ================
-  void _startImageStream() {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      print('❌ Cannot start image stream');
-      return;
+  // ================ PLATFORM OPTIMIZED DETECTION (IMPROVED) ================
+  void _startPlatformOptimizedDetection() {
+    _detectionTimer?.cancel();
+
+    final interval = _isIos
+        ? Duration(milliseconds: IOS_DETECTION_INTERVAL_MS)
+        : Duration(milliseconds: ANDROID_DETECTION_INTERVAL_MS);
+
+    print('📱 Detection interval: ${interval.inMilliseconds}ms');
+
+    _detectionTimer = Timer.periodic(interval, (timer) async {
+      if (_shouldSkipDetection()) return;
+      await _performPlatformOptimizedDetection();
+    });
+  }
+
+  bool _shouldSkipDetection() {
+    if (_isCameraDisposed || !_isCameraReady || _isCapturing || _isSaving || 
+        _captureComplete || _isTakingPicture || _cameraController == null ||
+        !_cameraController!.value.isInitialized) {
+      return true;
     }
 
-    _cameraController!.startImageStream(_processCameraImage);
-    print('✅ Image stream started');
-  }
-
-  void _stopImageStream() {
-    _cameraController?.stopImageStream();
-    print('🛑 Image stream stopped');
-  }
-
-  // ================ PROCESS IMAGE FROM STREAM (NO FLICKERING) ================
-  Future<void> _processCameraImage(CameraImage image) async {
-    // Skip frames for performance
-    _frameCounter++;
-    if (_frameCounter % FRAME_SKIP_INTERVAL != 0) {
-      return;
+    if (_isIos) {
+      // ข้าม frame บน iOS
+      _frameSkipCounter++;
+      if (_frameSkipCounter % IOS_FRAME_SKIP != 0) {
+        return true;
+      }
+      
+      if (_isProcessing) return true;
+      
+      if (_lastIosDetectionTime != null) {
+        final elapsed = DateTime.now().difference(_lastIosDetectionTime!);
+        if (elapsed.inMilliseconds < IOS_DETECTION_INTERVAL_MS - 100) {
+          return true;
+        }
+      }
     }
     
-    // Prevent concurrent processing
-    if (_isProcessingFrame || _isCapturing || _isSaving || _captureComplete) {
-      return;
+    return false;
+  }
+
+  Future<void> _performPlatformOptimizedDetection() async {
+    if (_isIos) {
+      if (_isProcessing) return;
+      _isProcessing = true;
+      _lastIosDetectionTime = DateTime.now();
     }
 
-    _isProcessingFrame = true;
-
     try {
-      // สร้าง InputImage โดยตรงจาก CameraImage (ไม่ต้องสร้างไฟล์)
-      final inputImage = _cameraImageToInputImageDirect(image);
-      if (inputImage == null) return;
-      
-      final faces = await _faceDetector!.processImage(inputImage);
-      
-      if (faces.isNotEmpty) {
-        final face = faces.first;
-        
-        if (mounted) {
-          setState(() {
-            _currentFace = face;
-          });
-        }
+      _isTakingPicture = true;
 
-        _faceHistory.add(face);
-        if (_faceHistory.length > 3) _faceHistory.removeAt(0);
+      XFile? imageFile;
 
-        final quality = _calculateIntelligentFaceQuality(face);
-        final stability = _calculateFaceStability();
-        final lighting = _calculateLightingScore(face);
-        final pose = _calculatePoseScore(face);
-        final symmetry = _calculateFaceSymmetry(face);
-        final livenessResult = _checkLiveness(face);
-
-        _qualityHistory.add(quality);
-        if (_qualityHistory.length > 10) _qualityHistory.removeAt(0);
-
-        _analyzeAndImproveQuality();
-
-        if (mounted) {
-          setState(() {
-            _faceQuality = quality;
-            _faceStability = stability;
-            _lightingScore = lighting;
-            _poseScore = pose;
-            _faceSymmetry = symmetry;
-            _livenessPassed = livenessResult;
-
-            if (ENABLE_ADAPTIVE_THRESHOLDS) {
-              _adaptiveThreshold = _calculateAdaptiveThreshold();
-            }
-          });
-        }
-
-        _updateIntelligentFaceStatus();
-
-        final currentThreshold =
-            ENABLE_ADAPTIVE_THRESHOLDS ? _adaptiveThreshold : MIN_FACE_QUALITY;
-
-        if (quality >= currentThreshold &&
-            stability >= MIN_FACE_STABILITY &&
-            _livenessPassed &&
-            !_captureRequested) {
-          
-          _consecutiveGoodFrames++;
-          
-          if (_consecutiveGoodFrames >= CAPTURE_QUALITY_FRAMES_REQUIRED &&
-              !_isCapturing &&
-              _enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-            _captureRequested = true;
-            await _autoCapture();
-            _captureRequested = false;
+      if (_isIos) {
+        imageFile = await _captureIosOptimized();
+        if (imageFile == null) {
+          _iosConsecutiveErrors++;
+          if (_iosConsecutiveErrors >= MAX_IOS_CONSECUTIVE_ERRORS) {
+            _handleIosError();
           }
+          return;
+        }
+        _iosConsecutiveErrors = 0;
+        
+        // จัดการ cache
+        _iosImageCache.add(imageFile);
+        while (_iosImageCache.length > MAX_IOS_IMAGE_CACHE) {
+          final oldFile = _iosImageCache.removeAt(0);
+          unawaited(oldFile.delete());
+        }
+      } else {
+        imageFile = await _cameraController!.takePicture();
+      }
+
+      final inputImage = InputImage.fromFilePath(imageFile.path);
+
+      List<Face> faces = [];
+      try {
+        faces = await _faceDetector!.processImage(inputImage);
+      } catch (e) {
+        print('Face detection error: $e');
+      }
+
+      // ลบไฟล์ทันที (iOS ก็ลบได้เลย)
+      unawaited(_deleteImageFile(imageFile));
+
+      if (faces.isNotEmpty && mounted && !_isCameraDisposed) {
+        await _processDetectedFace(faces.first);
+      } else {
+        if (mounted && !_isCameraDisposed) {
+          setState(() {
+            _currentFace = null;
+            _stableFrameCount = 0;
+          });
+          _updateStatus('👤 ไม่พบใบหน้า', 'วางใบหน้าในกรอบ', '');
+        }
+      }
+
+      _isTakingPicture = false;
+    } catch (e) {
+      print('Detection error: $e');
+      _isTakingPicture = false;
+      if (_isIos) _iosConsecutiveErrors++;
+    } finally {
+      if (_isIos) _isProcessing = false;
+    }
+  }
+
+  Future<void> _deleteImageFile(XFile imageFile) async {
+    try {
+      final file = File(imageFile.path);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {}
+  }
+
+  void _handleIosError() {
+    if (!mounted || _isCameraDisposed) return;
+    
+    _updateStatus('⚠️ ระบบกล้องมีปัญหา', 'กรุณาเปิดแอปใหม่', '');
+    _iosConsecutiveErrors = 0;
+    
+    // ลอง restart detection
+    _iosRetryTimer?.cancel();
+    _iosRetryTimer = Timer(IOS_RETRY_DELAY, () {
+      if (mounted && !_isCameraDisposed) {
+        _startPlatformOptimizedDetection();
+      }
+    });
+  }
+
+  Future<XFile?> _captureIosOptimized() async {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return null;
+    }
+    
+    try {
+      // iOS: ใช้ delayed capture เพื่อลดความเครียด
+      await Future.delayed(IOS_CAPTURE_DELAY);
+      return await _cameraController!.takePicture();
+    } catch (e) {
+      print('⚠️ iOS capture error: $e');
+      return null;
+    }
+  }
+
+  Future<void> _processDetectedFace(Face face) async {
+    setState(() {
+      _currentFace = face;
+    });
+
+    _faceHistory.add(face);
+    if (_faceHistory.length > 3) _faceHistory.removeAt(0);
+
+    final quality = _calculateIntelligentFaceQuality(face);
+    final stability = _calculateFaceStability();
+    final lighting = _calculateLightingScore(face);
+    final sharpness = _calculateSharpnessScore(face);
+    final pose = _calculatePoseScore(face);
+    final symmetry = _calculateFaceSymmetry(face);
+    final livenessResult = _checkLiveness(face);
+
+    _qualityHistory.add(quality);
+    if (_qualityHistory.length > 10) _qualityHistory.removeAt(0);
+
+    _analyzeAndImproveQuality();
+
+    if (mounted && !_isCameraDisposed) {
+      setState(() {
+        _faceQuality = quality;
+        _faceStability = stability;
+        _lightingScore = lighting;
+        _sharpnessScore = sharpness;
+        _poseScore = pose;
+        _faceSymmetry = symmetry;
+        _livenessPassed = livenessResult;
+
+        if (ENABLE_ADAPTIVE_THRESHOLDS) {
+          _adaptiveThreshold = _calculateAdaptiveThreshold();
+        }
+      });
+    }
+
+    _updateIntelligentFaceStatus();
+
+    final currentThreshold = ENABLE_ADAPTIVE_THRESHOLDS ? _adaptiveThreshold : MIN_FACE_QUALITY;
+
+    if (quality >= currentThreshold && stability >= MIN_FACE_STABILITY && _livenessPassed) {
+      if (mounted && !_isCameraDisposed) {
+        setState(() {
+          _stableFrameCount++;
+          _consecutiveLowQuality = 0;
+        });
+      }
+
+      if (_stableFrameCount >= REQUIRED_STABLE_FRAMES && !_isCapturing && 
+          _enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
+        if (_isIos) {
+          Future.delayed(IOS_CAPTURE_DELAY, () {
+            if (mounted && !_isCameraDisposed) _capturePlatformOptimizedFaceID();
+          });
         } else {
-          _consecutiveGoodFrames = 0;
+          _capturePlatformOptimizedFaceID();
+        }
+      }
+    } else {
+      if (mounted && !_isCameraDisposed) {
+        setState(() {
+          _stableFrameCount = 0;
           if (quality < MIN_ACCEPTABLE_QUALITY) {
             _consecutiveLowQuality++;
           } else {
             _consecutiveLowQuality = 0;
           }
-        }
-
-        _isStruggling = _consecutiveLowQuality > 5;
-      } else {
-        if (mounted) {
-          setState(() {
-            _currentFace = null;
-            _consecutiveGoodFrames = 0;
-          });
-        }
-        _updateStatus('👤 ไม่พบใบหน้า', 'วางใบหน้าในกรอบ', '');
+        });
       }
-    } catch (e) {
-      print('Frame processing error: $e');
-    } finally {
-      _isProcessingFrame = false;
     }
+
+    _isStruggling = _consecutiveLowQuality > 5;
   }
 
-  // ================ DIRECT CONVERSION (NO FILE, NO FLICKERING) ================
-  InputImage? _cameraImageToInputImageDirect(CameraImage image) {
-    try {
-      // แปลง YUV420 เป็น RGB bytes
-      final rgbBytes = _yuv420ToRgbBytes(image);
-      if (rgbBytes == null) return null;
-      
-      // สร้าง InputImage โดยตรงจาก bytes
-      return InputImage.fromBytes(
-        bytes: rgbBytes,
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: InputImageRotation.rotation0deg,
-          format: InputImageFormat.nv21,
-          bytesPerRow: image.width * 3,
-        ),
-      );
-    } catch (e) {
-      print('Direct conversion error: $e');
-      return null;
-    }
-  }
-
-  // ================ Convert YUV420 to RGB Bytes ================
-  Uint8List? _yuv420ToRgbBytes(CameraImage image) {
-    try {
-      final int width = image.width;
-      final int height = image.height;
-      
-      final Plane yPlane = image.planes[0];
-      final Plane uPlane = image.planes[1];
-      final Plane vPlane = image.planes[2];
-      
-      final int yRowStride = yPlane.bytesPerRow;
-      final int uvRowStride = uPlane.bytesPerRow;
-      final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
-      
-      final Uint8List rgbBytes = Uint8List(width * height * 3);
-      int rgbIndex = 0;
-      
-      for (int y = 0; y < height; y++) {
-        int uvY = y ~/ 2;
-        
-        for (int x = 0; x < width; x++) {
-          int uvX = x ~/ 2;
-          
-          // Y value
-          int yIndex = y * yRowStride + x;
-          int yValue = yPlane.bytes[yIndex];
-          
-          // U and V values
-          int uIndex = uvY * uvRowStride + uvX * uvPixelStride;
-          int vIndex = uvY * uvRowStride + uvX * uvPixelStride;
-          
-          int uValue = uPlane.bytes[uIndex] - 128;
-          int vValue = vPlane.bytes[vIndex] - 128;
-          
-          // YUV to RGB
-          int r = (yValue + 1.402 * vValue).toInt();
-          int g = (yValue - 0.344 * uValue - 0.714 * vValue).toInt();
-          int b = (yValue + 1.772 * uValue).toInt();
-          
-          // Clamp
-          r = r.clamp(0, 255);
-          g = g.clamp(0, 255);
-          b = b.clamp(0, 255);
-          
-          rgbBytes[rgbIndex++] = r;
-          rgbBytes[rgbIndex++] = g;
-          rgbBytes[rgbIndex++] = b;
-        }
-      }
-      
-      return rgbBytes;
-    } catch (e) {
-      print('YUV to RGB error: $e');
-      return null;
-    }
-  }
-
-  // ================ AUTO CAPTURE (USING CURRENT FRAME, NO EXTRA TAKE PICTURE) ================
-  Future<void> _autoCapture() async {
-    if (_isCapturing || _captureComplete || _currentFace == null) return;
+  // ================ PLATFORM OPTIMIZED CAPTURE ================
+  Future<void> _capturePlatformOptimizedFaceID() async {
+    if (_isCapturing || _captureComplete || _isCameraDisposed) return;
 
     setState(() {
       _isCapturing = true;
       _captureAttempts++;
-      _statusMessage = '📸 กำลังบันทึก (ครั้งที่ $_captureAttempts)...';
+      _statusMessage = '📸 กำลังถ่ายรูป (ครั้งที่ $_captureAttempts)...';
     });
 
     try {
-      // ใช้ current frame ที่เรามีอยู่แล้วในการตรวจจับใบหน้า
-      // แต่เราต้องการภาพคุณภาพสูงสำหรับ embedding
-      // ถ้าไม่ต้องการให้หน้าจอกระพริบ ให้ใช้ current frame แทนการ takePicture
-      
-      // วิธีที่ 1: ใช้ current frame (เร็วกว่า ไม่มี flicker)
-      // วิธีที่ 2: ใช้ takePicture (คุณภาพดีกว่า แต่มี flicker เล็กน้อย)
-      
-      // ใช้ takePicture แบบเงียบ - iOS จะมี flicker นิดหน่อยแต่ไม่มาก
-      final XFile imageFile = await _cameraController!.takePicture();
-      
+      XFile? imageFile;
+
+      if (_isIos) {
+        imageFile = await _captureIosOptimized();
+        if (imageFile == null) throw Exception('ไม่สามารถถ่ายรูปได้');
+      } else {
+        imageFile = await _cameraController!.takePicture();
+      }
+
+      if (_currentFace == null) {
+        throw Exception('ไม่พบใบหน้า');
+      }
+
       img.Image? processedImage = await _cropAndPreprocessFace(imageFile.path, _currentFace!);
+
+      if (ENABLE_QUALITY_BOOST && _faceQuality < 0.65 && processedImage != null) {
+        processedImage = _enhanceImageQuality(processedImage);
+      }
 
       if (processedImage == null) {
         throw Exception('ประมวลผลใบหน้าไม่สำเร็จ');
       }
 
       final embedding = await _extractEmbedding(processedImage);
+      final embeddingQuality = _evaluateEmbeddingQuality(embedding);
       final normalizedEmbedding = _l2Normalize(embedding);
 
       final totalQualityScore = (_faceQuality * 0.3 +
               _faceStability * 0.2 +
               _lightingScore * 0.15 +
-              _poseScore * 0.15 +
-              _faceSymmetry * 0.2)
+              _sharpnessScore * 0.15 +
+              _poseScore * 0.1 +
+              _faceSymmetry * 0.1)
           .clamp(0.0, 1.0);
 
       final embeddingData = {
         'embedding': normalizedEmbedding,
+        'raw_embedding': embedding,
         'quality': _faceQuality,
         'stability': _faceStability,
         'lighting': _lightingScore,
+        'sharpness': _sharpnessScore,
         'pose': _poseScore,
         'symmetry': _faceSymmetry,
         'total_quality': totalQualityScore,
+        'embedding_quality': embeddingQuality,
         'angles': {
           'yaw': _currentFace!.headEulerAngleY ?? 0.0,
           'pitch': _currentFace!.headEulerAngleX ?? 0.0,
@@ -610,6 +710,7 @@ class _CapturePageState extends State<CapturePage>
         'timestamp': DateTime.now().toIso8601String(),
         'dimension': normalizedEmbedding.length,
         'capture_attempt': _captureAttempts,
+        'is_best': false,
       };
 
       _allCapturedFaces.add(embeddingData);
@@ -632,17 +733,24 @@ class _CapturePageState extends State<CapturePage>
           _absoluteBestQuality = totalQualityScore;
           _absoluteBestFace = embeddingData;
           _hasGoodFaces = true;
+
+          print('✨ พบใบหน้าที่ดีขึ้น: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
         }
 
-        setState(() {
-          _enrollmentCount++;
-          _statusMessage = '✅ ได้คุณภาพ ${(totalQualityScore * 100).toInt()}%';
-          _instructionMessage = 'ถ่ายรูปที่ ${_enrollmentCount + 1}/$MIN_ENROLLMENT_EMBEDDINGS';
-          _isCapturing = false;
-          _consecutiveGoodFrames = 0;
-        });
+        if (mounted && !_isCameraDisposed) {
+          setState(() {
+            _enrollmentCount++;
+            _hasGoodFaces = true;
+            _statusMessage = '✅ ได้ใบหน้าคุณภาพ ${(totalQualityScore * 100).toInt()}%';
+            _isCapturing = false;
+            _stableFrameCount = 0;
+          });
+        }
 
         _showCaptureSuccess();
+
+        print('📊 คุณภาพรวม: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
+        print('📊 จำนวนใบหน้าที่ดี: $_enrollmentCount/${_bestFaces.length}');
 
         if (_enrollmentCount >= MIN_ENROLLMENT_EMBEDDINGS) {
           _enrollmentConsistency = _calculateConsistency();
@@ -650,41 +758,46 @@ class _CapturePageState extends State<CapturePage>
           if (_enrollmentConsistency >= MIN_ENROLLMENT_CONSISTENCY) {
             await _saveFaceIDProfileWithBestFaces();
           } else {
-            _showInsufficientConsistencyDialog();
+            if (_enrollmentCount >= MIN_ENROLLMENT_EMBEDDINGS && mounted) {
+              _showInsufficientConsistencyDialog();
+            }
           }
         }
       } else {
-        setState(() {
-          _statusMessage = '⚠️ คุณภาพ ${(totalQualityScore * 100).toInt()}%';
-          _instructionMessage = _currentGuidance.isNotEmpty
-              ? _currentGuidance
-              : 'พยายามต่อไป';
-          _isCapturing = false;
-        });
+        if (mounted && !_isCameraDisposed) {
+          setState(() {
+            _statusMessage = '⚠️ คุณภาพ ${(totalQualityScore * 100).toInt()}% (ต้องการ ${(qualityThreshold * 100).toInt()}%)';
+            _instructionMessage = _currentGuidance.isNotEmpty
+                ? _currentGuidance
+                : 'พยายามต่อไป (ครั้งที่ $_captureAttempts/$MAX_CAPTURE_ATTEMPTS)';
+            _isCapturing = false;
+          });
+        }
 
-        if (_captureAttempts >= MAX_CAPTURE_ATTEMPTS && _enrolledEmbeddings.isNotEmpty) {
+        print('⚠️ คุณภาพไม่พอ: ${(totalQualityScore * 100).toStringAsFixed(1)}%');
+
+        if (_captureAttempts >= MAX_CAPTURE_ATTEMPTS && _enrolledEmbeddings.isNotEmpty && mounted) {
           _offerToUseBestFaces();
-        } else if (_captureAttempts >= MAX_CAPTURE_ATTEMPTS && _enrolledEmbeddings.isEmpty) {
+        } else if (_captureAttempts >= MAX_CAPTURE_ATTEMPTS && _enrolledEmbeddings.isEmpty && mounted) {
           _offerToUseBestAvailable();
         }
       }
 
-      await File(imageFile.path).delete();
-      
+      unawaited(_deleteImageFile(imageFile));
     } catch (e) {
       print('❌ Capture error: $e');
-      setState(() {
-        _isCapturing = false;
-        _statusMessage = '❌ ไม่สำเร็จ';
-        _instructionMessage = 'ลองใหม่';
-      });
+      if (mounted && !_isCameraDisposed) {
+        setState(() {
+          _isCapturing = false;
+          _statusMessage = '❌ ถ่ายรูปไม่สำเร็จ';
+          _instructionMessage = 'ลองใหม่';
+          _stableFrameCount = 0;
+        });
+      }
     }
   }
 
-  // ================ QUALITY CALCULATION FUNCTIONS ================
-  static const bool ENABLE_ADAPTIVE_THRESHOLDS = true;
-  static const double MIN_ACCEPTABLE_QUALITY = 0.55;
-
+  // ================ INTELLIGENT QUALITY IMPROVEMENT ================
   double _calculateIntelligentFaceQuality(Face face) {
     double score = 0.0;
 
@@ -707,8 +820,7 @@ class _CapturePageState extends State<CapturePage>
 
     if (areaRatio >= IDEAL_MIN_FACE_AREA && areaRatio <= IDEAL_MAX_FACE_AREA) {
       score += areaWeight;
-    } else if (areaRatio >= MIN_FACE_AREA_RATIO &&
-        areaRatio <= MAX_FACE_AREA_RATIO) {
+    } else if (areaRatio >= MIN_FACE_AREA_RATIO && areaRatio <= MAX_FACE_AREA_RATIO) {
       score += areaWeight * 0.7;
     } else {
       score += areaWeight * 0.4;
@@ -721,9 +833,7 @@ class _CapturePageState extends State<CapturePage>
     final pitch = face.headEulerAngleX?.abs() ?? 0.0;
     final roll = face.headEulerAngleZ?.abs() ?? 0.0;
 
-    if (yaw <= MAX_HEAD_YAW &&
-        pitch <= MAX_HEAD_PITCH &&
-        roll <= MAX_HEAD_ROLL) {
+    if (yaw <= MAX_HEAD_YAW && pitch <= MAX_HEAD_PITCH && roll <= MAX_HEAD_ROLL) {
       score += poseWeight;
     } else {
       score += poseWeight * 0.6;
@@ -746,6 +856,81 @@ class _CapturePageState extends State<CapturePage>
     return score.clamp(0.0, 1.0);
   }
 
+  double _calculateAdaptiveThreshold() {
+    if (_qualityHistory.isEmpty) return MIN_FACE_QUALITY;
+
+    final recentQuality = _qualityHistory.length > 5
+        ? _qualityHistory.sublist(_qualityHistory.length - 5).reduce((a, b) => a + b) / 5
+        : _qualityHistory.reduce((a, b) => a + b) / _qualityHistory.length;
+
+    double adaptiveThreshold = recentQuality * 0.9;
+    return adaptiveThreshold.clamp(0.55, 0.75);
+  }
+
+  void _analyzeAndImproveQuality() {
+    _improvementTips.clear();
+
+    if (_faceQuality < 0.6) {
+      if (_poseScore < 0.5) _improvementTips['pose'] = 'หันมาตรงๆ';
+      if (_lightingScore < 0.5) _improvementTips['lighting'] = 'ปรับแสงให้สว่าง';
+      if (_sharpnessScore < 0.5) _improvementTips['sharpness'] = 'อยู่นิ่งๆ';
+      if (_faceSymmetry < 0.5) _improvementTips['symmetry'] = 'หันมาตรงๆ';
+    }
+
+    if (_improvementTips.isNotEmpty) {
+      _currentGuidance = _improvementTips.values.join(' • ');
+    } else {
+      _currentGuidance = '';
+    }
+  }
+
+  void _updateIntelligentFaceStatus() {
+    if (_currentFace == null) return;
+
+    final bbox = _currentFace!.boundingBox;
+    final area = bbox.width * bbox.height;
+    final screenArea = _screenWidth * _screenHeight;
+    final areaRatio = area / screenArea;
+
+    if (areaRatio > MAX_FACE_AREA_RATIO) {
+      _updateStatus('📱 ถอยหลัง', 'ใกล้เกินไป', '');
+      return;
+    } else if (areaRatio < MIN_FACE_AREA_RATIO) {
+      _updateStatus('📱 เข้ามาใกล้', 'ไกลเกินไป', '');
+      return;
+    }
+
+    final currentThreshold = ENABLE_ADAPTIVE_THRESHOLDS ? _adaptiveThreshold : MIN_FACE_QUALITY;
+
+    if (_faceQuality < currentThreshold) {
+      if (_currentGuidance.isNotEmpty) {
+        _updateStatus('📸 ปรับปรุง', _currentGuidance, 'คุณภาพ ${(_faceQuality * 100).toInt()}%');
+      } else {
+        _updateStatus('📸 ปรับตำแหน่ง', 'คุณภาพ ${(_faceQuality * 100).toInt()}%', '');
+      }
+      return;
+    }
+
+    if (_faceStability < MIN_FACE_STABILITY) {
+      _updateStatus('🎯 อยู่นิ่งๆ', 'ความนิ่ง ${(_faceStability * 100).toInt()}%', '');
+      return;
+    }
+
+    if (!_livenessPassed) {
+      _updateStatus('🔄 ตรวจสอบ', 'กะพริบตาเล็กน้อย', '');
+      return;
+    }
+
+    if (_enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
+      _updateStatus(
+        '✅ ใส่ใบหน้าคุณภาพดี (${(_faceQuality * 100).toInt()}%)',
+        'ถ่ายรูปที่ ${_enrollmentCount + 1}/$MIN_ENROLLMENT_EMBEDDINGS',
+        '',
+      );
+    }
+  }
+
+  // ================ FACE QUALITY CALCULATIONS ================
   double _calculateCenterScore(Rect bbox) {
     final faceCenter = Offset(
       bbox.left + bbox.width / 2,
@@ -811,6 +996,16 @@ class _CapturePageState extends State<CapturePage>
     return (avgBrightness * 0.5 + symmetry * 0.5).clamp(0.0, 1.0);
   }
 
+  double _calculateSharpnessScore(Face face) {
+    final leftEye = face.leftEyeOpenProbability ?? 0.0;
+    final rightEye = face.rightEyeOpenProbability ?? 0.0;
+
+    final eyeVariance = pow(leftEye - rightEye, 2).toDouble();
+    final sharpnessScore = min(1.0, eyeVariance * 10 + 0.5);
+
+    return sharpnessScore.clamp(0.0, 1.0);
+  }
+
   double _calculatePoseScore(Face face) {
     final yaw = face.headEulerAngleY?.abs() ?? 0.0;
     final pitch = face.headEulerAngleX?.abs() ?? 0.0;
@@ -846,91 +1041,21 @@ class _CapturePageState extends State<CapturePage>
     return passed >= REQUIRED_LIVENESS_CHECKS;
   }
 
-  double _calculateAdaptiveThreshold() {
-    if (_qualityHistory.isEmpty) return MIN_FACE_QUALITY;
+  // ================ IMAGE ENHANCEMENT ================
+  img.Image _enhanceImageQuality(img.Image image) {
+    final sharpened = img.copyResize(image,
+        width: image.width,
+        height: image.height,
+        interpolation: img.Interpolation.linear);
 
-    final recentQuality = _qualityHistory.length > 5
-        ? _qualityHistory
-                .sublist(_qualityHistory.length - 5)
-                .reduce((a, b) => a + b) /
-            5
-        : _qualityHistory.reduce((a, b) => a + b) / _qualityHistory.length;
+    for (var pixel in sharpened) {
+      pixel.r = (pixel.r * 1.1).clamp(0, 255).toInt();
+      pixel.g = (pixel.g * 1.1).clamp(0, 255).toInt();
+      pixel.b = (pixel.b * 1.1).clamp(0, 255).toInt();
+    }
 
-    double adaptiveThreshold = recentQuality * 0.9;
-    return adaptiveThreshold.clamp(0.55, 0.75);
+    return sharpened;
   }
-
-  void _analyzeAndImproveQuality() {
-    _improvementTips.clear();
-
-    if (_faceQuality < 0.6) {
-      if (_poseScore < 0.5) {
-        _improvementTips['pose'] = 'หันมาตรงๆ';
-      }
-      if (_lightingScore < 0.5) {
-        _improvementTips['lighting'] = 'ปรับแสงให้สว่าง';
-      }
-      if (_faceSymmetry < 0.5) {
-        _improvementTips['symmetry'] = 'หันมาตรงๆ';
-      }
-    }
-
-    if (_improvementTips.isNotEmpty) {
-      _currentGuidance = _improvementTips.values.join(' • ');
-    } else {
-      _currentGuidance = '';
-    }
-  }
-
-  void _updateIntelligentFaceStatus() {
-    if (_currentFace == null) return;
-
-    final bbox = _currentFace!.boundingBox;
-    final area = bbox.width * bbox.height;
-    final screenArea = _screenWidth * _screenHeight;
-    final areaRatio = area / screenArea;
-
-    if (areaRatio > MAX_FACE_AREA_RATIO) {
-      _updateStatus('📱 ถอยหลัง', 'ใกล้เกินไป', '');
-      return;
-    } else if (areaRatio < MIN_FACE_AREA_RATIO) {
-      _updateStatus('📱 เข้ามาใกล้', 'ไกลเกินไป', '');
-      return;
-    }
-
-    final currentThreshold =
-        ENABLE_ADAPTIVE_THRESHOLDS ? _adaptiveThreshold : MIN_FACE_QUALITY;
-
-    if (_faceQuality < currentThreshold) {
-      if (_currentGuidance.isNotEmpty) {
-        _updateStatus('📸 ปรับปรุง', _currentGuidance,
-            '${(_faceQuality * 100).toInt()}%');
-      } else {
-        _updateStatus('📸 ปรับตำแหน่ง', '${(_faceQuality * 100).toInt()}%', '');
-      }
-      return;
-    }
-
-    if (_faceStability < MIN_FACE_STABILITY) {
-      _updateStatus('🎯 อยู่นิ่งๆ', '${(_faceStability * 100).toInt()}%', '');
-      return;
-    }
-
-    if (!_livenessPassed) {
-      _updateStatus('🔄 ตรวจสอบ', 'กะพริบตาเล็กน้อย', '');
-      return;
-    }
-
-    if (_enrollmentCount < MIN_ENROLLMENT_EMBEDDINGS) {
-      _updateStatus(
-        '✅ กำลังถ่ายรูปอัตโนมัติ',
-        'ครั้งที่ ${_enrollmentCount + 1}/$MIN_ENROLLMENT_EMBEDDINGS',
-        '',
-      );
-    }
-  }
-
-  static const bool ENABLE_QUALITY_BOOST = true;
 
   // ================ FACE PROCESSING ================
   Future<img.Image?> _cropAndPreprocessFace(String imagePath, Face face) async {
@@ -975,6 +1100,7 @@ class _CapturePageState extends State<CapturePage>
     }
   }
 
+  // ================ EXTRACT EMBEDDING ================
   Future<List<double>> _extractEmbedding(img.Image faceImage) async {
     if (!_modelLoaded || _faceModel == null) {
       throw Exception('โมเดลไม่พร้อม');
@@ -982,17 +1108,50 @@ class _CapturePageState extends State<CapturePage>
 
     try {
       final input = _prepareInput(faceImage);
-      
-      final outputBuffer = List<double>.filled(_actualOutputDimension, 0.0);
-      final output = outputBuffer.reshape([1, _actualOutputDimension]);
-      
+      final outputShape = _faceModel!.getOutputTensor(0).shape;
+
+      int outputSize = 1;
+      for (var dim in outputShape) {
+        outputSize *= dim;
+      }
+
+      final outputBuffer = List<double>.filled(outputSize, 0.0);
+      final output = outputBuffer.reshape(outputShape);
+
       _faceModel!.run(input, output);
-      
-      return List<double>.from(output[0]);
+
+      List<double> result = [];
+
+      if (outputShape.length == 2) {
+        result = List<double>.from(output[0]);
+      } else if (outputShape.length == 1) {
+        result = List<double>.from(output);
+      } else {
+        result = _flattenOutput(output);
+      }
+
+      return result;
     } catch (e) {
       print('❌ Error extracting embedding: $e');
       rethrow;
     }
+  }
+
+  List<double> _flattenOutput(dynamic output) {
+    List<double> result = [];
+
+    void flatten(dynamic item) {
+      if (item is List) {
+        for (var subItem in item) {
+          flatten(subItem);
+        }
+      } else if (item is double) {
+        result.add(item);
+      }
+    }
+
+    flatten(output);
+    return result;
   }
 
   List<List<List<List<double>>>> _prepareInput(img.Image image) {
@@ -1029,13 +1188,16 @@ class _CapturePageState extends State<CapturePage>
     return input;
   }
 
+  // ================ EVALUATE EMBEDDING QUALITY ================
   double _evaluateEmbeddingQuality(List<double> embedding) {
     double norm = 0.0;
     for (final v in embedding) norm += v * v;
     norm = sqrt(norm);
+
     return 1.0 - (norm - 1.0).abs().clamp(0.0, 0.5);
   }
 
+  // ================ CALCULATE CONSISTENCY ================
   double _calculateConsistency() {
     if (_enrolledEmbeddings.length < 2) return 1.0;
 
@@ -1046,7 +1208,9 @@ class _CapturePageState extends State<CapturePage>
       for (int j = i + 1; j < _enrolledEmbeddings.length; j++) {
         final emb1 = _enrolledEmbeddings[i]['embedding'] as List<double>;
         final emb2 = _enrolledEmbeddings[j]['embedding'] as List<double>;
-        totalSimilarity += _cosineSimilarity(emb1, emb2);
+
+        final similarity = _cosineSimilarity(emb1, emb2);
+        totalSimilarity += similarity;
         comparisons++;
       }
     }
@@ -1054,6 +1218,7 @@ class _CapturePageState extends State<CapturePage>
     return comparisons > 0 ? totalSimilarity / comparisons : 1.0;
   }
 
+  // ================ CALCULATE MEAN EMBEDDING ================
   List<double> _calculateMeanEmbedding() {
     if (_enrolledEmbeddings.isEmpty) return [];
 
@@ -1082,6 +1247,7 @@ class _CapturePageState extends State<CapturePage>
     return _l2Normalize(mean);
   }
 
+  // ================ UTILITY FUNCTIONS ================
   double _cosineSimilarity(List<double> a, List<double> b) {
     if (a.length != b.length) return 0.0;
 
@@ -1114,7 +1280,7 @@ class _CapturePageState extends State<CapturePage>
 
   // ================ DIALOGS ================
   void _showInsufficientConsistencyDialog() {
-    if (!mounted) return;
+    if (!mounted || _isCameraDisposed) return;
 
     showDialog(
       context: context,
@@ -1133,6 +1299,10 @@ class _CapturePageState extends State<CapturePage>
               const SizedBox(height: 16),
               Text('ใบหน้าที่ดีที่สุด: ${(_absoluteBestQuality * 100).toInt()}%'),
               Text('จำนวนใบหน้าที่ดี: ${_bestFaces.length} รูป'),
+              if (_bestFaces.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                const Text('คุณสามารถใช้ใบหน้าที่ดีที่สุดที่มีอยู่'),
+              ],
             ],
           ),
           actions: [
@@ -1158,7 +1328,7 @@ class _CapturePageState extends State<CapturePage>
   }
 
   void _offerToUseBestFaces() {
-    if (!mounted) return;
+    if (!mounted || _isCameraDisposed) return;
 
     showDialog(
       context: context,
@@ -1177,6 +1347,9 @@ class _CapturePageState extends State<CapturePage>
               if (_bestFaces.length >= MIN_ENROLLMENT_EMBEDDINGS) ...[
                 const SizedBox(height: 8),
                 const Text('✅ มีจำนวนเพียงพอสำหรับการบันทึก'),
+              ] else ...[
+                const SizedBox(height: 8),
+                Text('⚠️ มีเพียง ${_bestFaces.length} รูป (ต้องการ $MIN_ENROLLMENT_EMBEDDINGS รูป)'),
               ],
             ],
           ),
@@ -1199,6 +1372,14 @@ class _CapturePageState extends State<CapturePage>
                 },
                 child: const Text('บันทึกด้วยใบหน้าที่ดีที่สุด'),
               ),
+            if (_bestFaces.length < MIN_ENROLLMENT_EMBEDDINGS && _bestFaces.isNotEmpty)
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  _continueCapturing();
+                },
+                child: const Text('ถ่ายเพิ่ม'),
+              ),
           ],
         );
       },
@@ -1206,7 +1387,7 @@ class _CapturePageState extends State<CapturePage>
   }
 
   void _offerToUseBestAvailable() {
-    if (!mounted) return;
+    if (!mounted || _isCameraDisposed) return;
 
     showDialog(
       context: context,
@@ -1223,8 +1404,12 @@ class _CapturePageState extends State<CapturePage>
               Text('จำนวนครั้งที่ลอง: $_captureAttempts ครั้ง'),
               if (_allCapturedFaces.isNotEmpty) ...[
                 const SizedBox(height: 8),
-                Text('ใบหน้าที่ดีที่สุด: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
+                Text('ใบหน้าที่ดีที่สุดจากที่ลอง: ${(_allCapturedFaces.map((e) => e['total_quality'] as double).reduce(max) * 100).toInt()}%'),
               ],
+              const SizedBox(height: 16),
+              const Text('คุณต้องการ:'),
+              const Text('1. ลองถ่ายใหม่'),
+              const Text('2. กลับไปหน้าแรก'),
             ],
           ),
           actions: [
@@ -1249,17 +1434,34 @@ class _CapturePageState extends State<CapturePage>
   }
 
   void _resetAndTryAgain() {
+    if (!mounted || _isCameraDisposed) return;
+    
     setState(() {
       _captureAttempts = 0;
+      _isRetryMode = true;
       _statusMessage = '📸 ลองถ่ายใหม่';
       _instructionMessage = 'วางใบหน้าในกรอบ';
+      _stableFrameCount = 0;
       _consecutiveLowQuality = 0;
       _isStruggling = false;
     });
   }
 
+  void _continueCapturing() {
+    if (!mounted || _isCameraDisposed) return;
+    
+    setState(() {
+      _isRetryMode = false;
+      _statusMessage = '📸 ถ่ายเพิ่มเติม';
+      _instructionMessage = 'ถ่ายอีก ${MIN_ENROLLMENT_EMBEDDINGS - _enrollmentCount} รูป';
+      _stableFrameCount = 0;
+    });
+  }
+
   // ================ SAVE TO FIREBASE ================
   Future<void> _saveFaceIDProfileWithBestFaces() async {
+    if (!mounted || _isCameraDisposed) return;
+    
     setState(() {
       _isSaving = true;
       _statusMessage = '💾 กำลังบันทึก...';
@@ -1277,21 +1479,27 @@ class _CapturePageState extends State<CapturePage>
       double totalQuality = 0;
       double totalStability = 0;
       double totalLighting = 0;
-      double totalPose = 0;
+      double totalSharpness = 0;
 
       for (var face in facesToUse) {
         totalQuality += face['quality'] as double;
         totalStability += face['stability'] as double;
         totalLighting += face['lighting'] as double? ?? 0.5;
-        totalPose += face['pose'] as double? ?? 0.5;
+        totalSharpness += face['sharpness'] as double? ?? 0.5;
       }
 
       final avgQuality = totalQuality / facesToUse.length;
       final avgStability = totalStability / facesToUse.length;
       final avgLighting = totalLighting / facesToUse.length;
-      final avgPose = totalPose / facesToUse.length;
+      final avgSharpness = totalSharpness / facesToUse.length;
 
-      final confidenceScore = (avgQuality * 0.4 + avgStability * 0.3 + avgLighting * 0.15 + avgPose * 0.15);
+      final confidenceScore = (avgQuality * 0.4 +
+          avgStability * 0.3 +
+          avgLighting * 0.15 +
+          avgSharpness * 0.15);
+
+      print('✅ บันทึกด้วยใบหน้าที่ดีที่สุด ${facesToUse.length} รูป');
+      print('📊 คะแนนความมั่นใจ: ${(confidenceScore * 100).toStringAsFixed(1)}%');
 
       final faceProfile = {
         'profile_id': faceProfileId,
@@ -1306,17 +1514,24 @@ class _CapturePageState extends State<CapturePage>
           'best_quality': _absoluteBestQuality,
           'consistency': _enrollmentConsistency,
           'confidence': confidenceScore,
+          'average_quality': avgQuality,
+          'average_stability': avgStability,
         },
         'quality_metrics': {
           'face_quality': avgQuality,
           'stability': avgStability,
           'lighting_score': avgLighting,
+          'sharpness_score': avgSharpness,
           'confidence_score': confidenceScore,
         },
         'liveness_verified': true,
         'capture_timestamp': DateTime.now().toIso8601String(),
         'created_at': FieldValue.serverTimestamp(),
         'status': 'active',
+        'thresholds': {
+          'verification': 0.75,
+          'identification': 0.78,
+        },
       };
 
       await _firestore
@@ -1342,6 +1557,8 @@ class _CapturePageState extends State<CapturePage>
           'embedding_vector': emb['embedding'],
           'quality_score': emb['quality'],
           'stability_score': emb['stability'],
+          'lighting_score': emb['lighting'] ?? 0.5,
+          'sharpness_score': emb['sharpness'] ?? 0.5,
           'total_quality': emb['total_quality'] ?? emb['quality'],
           'angles': emb['angles'],
           'capture_sequence': i + 1,
@@ -1352,10 +1569,10 @@ class _CapturePageState extends State<CapturePage>
       }
 
       await _firestore.collection('users').doc(user.uid).set({
-        'has_face_id': true,
+        'active': true,
       }, SetOptions(merge: true));
 
-      if (mounted) {
+      if (mounted && !_isCameraDisposed) {
         setState(() {
           _statusMessage = '✅ Face ID สำเร็จ!';
           _instructionMessage = 'ความมั่นใจ ${(confidenceScore * 100).toInt()}%';
@@ -1367,12 +1584,12 @@ class _CapturePageState extends State<CapturePage>
       _playSuccessAnimation();
 
       await Future.delayed(const Duration(seconds: 2));
-      if (mounted) {
+      if (mounted && !_isCameraDisposed) {
         Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
       }
     } catch (e) {
       print('❌ Save error: $e');
-      if (mounted) {
+      if (mounted && !_isCameraDisposed) {
         setState(() {
           _statusMessage = '❌ บันทึกไม่สำเร็จ';
           _instructionMessage = 'ลองใหม่';
@@ -1383,9 +1600,10 @@ class _CapturePageState extends State<CapturePage>
   }
 
   void _showCaptureSuccess() {
+    if (!mounted || _isCameraDisposed) return;
     setState(() => _showGuide = true);
     Future.delayed(const Duration(milliseconds: 400), () {
-      if (mounted) setState(() => _showGuide = false);
+      if (mounted && !_isCameraDisposed) setState(() => _showGuide = false);
     });
   }
 
@@ -1396,7 +1614,7 @@ class _CapturePageState extends State<CapturePage>
   }
 
   void _updateStatus(String status, String instruction, String detail) {
-    if (mounted) {
+    if (mounted && !_isCameraDisposed) {
       setState(() {
         _statusMessage = status;
         _instructionMessage = instruction;
@@ -1413,7 +1631,7 @@ class _CapturePageState extends State<CapturePage>
     return Colors.red;
   }
 
-  // ================ BUILD UI ================
+  // ================ BUILD UI (IMPROVED) ================
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1421,27 +1639,20 @@ class _CapturePageState extends State<CapturePage>
       body: SafeArea(
         child: Stack(
           children: [
-            if (_isCameraReady && _cameraController != null)
+            // Camera Preview
+            if (_isCameraReady && _cameraController != null && !_isInitializing)
               Positioned.fill(
-                child: CameraPreview(_cameraController!),
+                child: ClipRect(
+                  child: CameraPreview(_cameraController!),
+                ),
               )
             else
               _buildLoadingView(),
 
+            // Overlay UI (ใช้ Opacity แทน Container gradient เพื่อลด flicker)
             Positioned.fill(
-              child: Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      Colors.black.withOpacity(0.5),
-                      Colors.transparent,
-                      Colors.transparent,
-                      Colors.black.withOpacity(0.7),
-                    ],
-                  ),
-                ),
+              child: IgnorePointer(
+                ignoring: _isCapturing || _isSaving,
                 child: Column(
                   children: [
                     _buildHeader(),
@@ -1457,8 +1668,9 @@ class _CapturePageState extends State<CapturePage>
               ),
             ),
 
+            // Processing Overlays
             if (_isCapturing || _isSaving) _buildProcessingOverlay(),
-            if (_showGuide) _buildSuccessGuide(),
+            if (_showGuide && !_isCapturing) _buildSuccessGuide(),
             if (_successController.isAnimating) _buildSuccessAnimation(),
           ],
         ),
@@ -1485,12 +1697,22 @@ class _CapturePageState extends State<CapturePage>
   Widget _buildHeader() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            Colors.black.withOpacity(0.5),
+            Colors.transparent,
+          ],
+        ),
+      ),
       child: Row(
         children: [
           IconButton(
             icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20),
             onPressed: () {
-              _stopImageStream();
+              _disposeSystem();
               Navigator.pop(context);
             },
           ),
@@ -1503,7 +1725,11 @@ class _CapturePageState extends State<CapturePage>
                   children: [
                     const Text(
                       'Face ID',
-                      style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     const SizedBox(width: 8),
                     Container(
@@ -1512,15 +1738,33 @@ class _CapturePageState extends State<CapturePage>
                         color: Colors.white.withOpacity(0.15),
                         borderRadius: BorderRadius.circular(12),
                       ),
-                      child: Text(
-                        '$_actualOutputDimension DIM',
-                        style: const TextStyle(color: Colors.white70, fontSize: 10),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            '$_actualOutputDimension DIM',
+                            style: const TextStyle(color: Colors.white70, fontSize: 10),
+                          ),
+                          if (_isIos) ...[
+                            const SizedBox(width: 4),
+                            Container(
+                              width: 6,
+                              height: 6,
+                              decoration: const BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Colors.blue,
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     ),
                   ],
                 ),
                 Text(
-                  _modelLoaded ? 'MobileFaceNet' : 'กำลังเตรียม...',
+                  _modelLoaded
+                      ? 'MobileFaceNet${_isIos ? " (iOS)" : " (Android)"}'
+                      : 'กำลังเตรียม...',
                   style: const TextStyle(color: Colors.white60, fontSize: 11),
                 ),
               ],
@@ -1537,11 +1781,14 @@ class _CapturePageState extends State<CapturePage>
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.star, color: Colors.amber, size: 14),
+                  const Icon(Icons.star, color: Colors.amber, size: 14),
                   const SizedBox(width: 4),
                   Text(
                     '${(_absoluteBestQuality * 100).toInt()}%',
-                    style: const TextStyle(color: Colors.amber, fontSize: 12, fontWeight: FontWeight.bold),
+                    style: const TextStyle(
+                        color: Colors.amber,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold),
                   ),
                 ],
               ),
@@ -1626,9 +1873,11 @@ class _CapturePageState extends State<CapturePage>
 
     return [
       Positioned(
-        top: 0, left: 0,
+        top: 0,
+        left: 0,
         child: Container(
-          width: CORNER_SIZE, height: CORNER_SIZE,
+          width: CORNER_SIZE,
+          height: CORNER_SIZE,
           decoration: BoxDecoration(
             border: Border(
               top: BorderSide(color: color, width: CORNER_THICKNESS),
@@ -1638,9 +1887,11 @@ class _CapturePageState extends State<CapturePage>
         ),
       ),
       Positioned(
-        top: 0, right: 0,
+        top: 0,
+        right: 0,
         child: Container(
-          width: CORNER_SIZE, height: CORNER_SIZE,
+          width: CORNER_SIZE,
+          height: CORNER_SIZE,
           decoration: BoxDecoration(
             border: Border(
               top: BorderSide(color: color, width: CORNER_THICKNESS),
@@ -1650,9 +1901,11 @@ class _CapturePageState extends State<CapturePage>
         ),
       ),
       Positioned(
-        bottom: 0, left: 0,
+        bottom: 0,
+        left: 0,
         child: Container(
-          width: CORNER_SIZE, height: CORNER_SIZE,
+          width: CORNER_SIZE,
+          height: CORNER_SIZE,
           decoration: BoxDecoration(
             border: Border(
               bottom: BorderSide(color: color, width: CORNER_THICKNESS),
@@ -1662,9 +1915,11 @@ class _CapturePageState extends State<CapturePage>
         ),
       ),
       Positioned(
-        bottom: 0, right: 0,
+        bottom: 0,
+        right: 0,
         child: Container(
-          width: CORNER_SIZE, height: CORNER_SIZE,
+          width: CORNER_SIZE,
+          height: CORNER_SIZE,
           decoration: BoxDecoration(
             border: Border(
               bottom: BorderSide(color: color, width: CORNER_THICKNESS),
@@ -1697,9 +1952,9 @@ class _CapturePageState extends State<CapturePage>
           const SizedBox(height: 12),
           Row(
             children: [
+              Expanded(child: _buildMetricItem('คมชัด', _sharpnessScore)),
               Expanded(child: _buildMetricItem('มุม', _poseScore)),
               Expanded(child: _buildMetricItem('สมมาตร', _faceSymmetry)),
-              Expanded(child: _buildMetricItem('Liveness', _livenessPassed ? 1.0 : 0.0)),
             ],
           ),
         ],
@@ -1714,9 +1969,12 @@ class _CapturePageState extends State<CapturePage>
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(label, style: const TextStyle(color: Colors.white60, fontSize: 11)),
             Text(
-              label == 'Liveness' ? (value >= 0.5 ? 'ผ่าน' : 'ไม่ผ่าน') : '${(value * 100).toInt()}%',
+              label,
+              style: const TextStyle(color: Colors.white60, fontSize: 11),
+            ),
+            Text(
+              '${(value * 100).toInt()}%',
               style: TextStyle(
                 color: _getQualityColor(value),
                 fontSize: 13,
@@ -1740,8 +1998,6 @@ class _CapturePageState extends State<CapturePage>
   }
 
   Widget _buildProgressSection() {
-    final progress = _enrollmentCount / MIN_ENROLLMENT_EMBEDDINGS;
-    
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 20),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -1756,18 +2012,41 @@ class _CapturePageState extends State<CapturePage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  'ความคืบหน้า $_enrollmentCount/$MIN_ENROLLMENT_EMBEDDINGS',
-                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                Row(
+                  children: [
+                    Text(
+                      '$_enrollmentCount/$MIN_ENROLLMENT_EMBEDDINGS',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    if (_bestFaces.isNotEmpty)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: Colors.amber.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          'ดีสุด ${(_absoluteBestQuality * 100).toInt()}%',
+                          style: const TextStyle(color: Colors.amber, fontSize: 10),
+                        ),
+                      ),
+                  ],
                 ),
                 const SizedBox(height: 6),
                 ClipRRect(
                   borderRadius: BorderRadius.circular(2),
                   child: LinearProgressIndicator(
-                    value: progress,
+                    value: _enrollmentCount / MIN_ENROLLMENT_EMBEDDINGS,
                     backgroundColor: Colors.white.withOpacity(0.1),
                     valueColor: AlwaysStoppedAnimation<Color>(
-                      _enrollmentCount >= MIN_ENROLLMENT_EMBEDDINGS ? Colors.green : Colors.blue,
+                      _enrollmentCount >= MIN_ENROLLMENT_EMBEDDINGS
+                          ? Colors.green
+                          : Colors.blue,
                     ),
                     minHeight: 4,
                   ),
@@ -1776,9 +2055,19 @@ class _CapturePageState extends State<CapturePage>
             ),
           ),
           const SizedBox(width: 16),
-          Text(
-            '$_captureAttempts/$MAX_CAPTURE_ATTEMPTS',
-            style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 11),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Text(
+              '$_captureAttempts/$MAX_CAPTURE_ATTEMPTS',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.7),
+                fontSize: 11,
+              ),
+            ),
           ),
         ],
       ),
@@ -1787,7 +2076,7 @@ class _CapturePageState extends State<CapturePage>
 
   Widget _buildProcessingOverlay() {
     return Container(
-      color: Colors.black.withOpacity(0.8),
+      color: Colors.black.withOpacity(0.85),
       child: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -1795,9 +2084,16 @@ class _CapturePageState extends State<CapturePage>
             const CircularProgressIndicator(color: Colors.white),
             const SizedBox(height: 20),
             Text(
-              _isCapturing ? '📸 กำลังบันทึก...' : '💾 กำลังบันทึก...',
+              _isCapturing ? '📸 กำลังถ่ายรูป...' : '💾 กำลังบันทึก...',
               style: const TextStyle(color: Colors.white, fontSize: 16),
             ),
+            if (_bestFaces.isNotEmpty && _isSaving) ...[
+              const SizedBox(height: 8),
+              Text(
+                'ใช้ใบหน้าที่ดีที่สุด ${_bestFaces.length} รูป',
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+            ],
           ],
         ),
       ),
@@ -1805,12 +2101,13 @@ class _CapturePageState extends State<CapturePage>
   }
 
   Widget _buildSuccessGuide() {
-    return Positioned.fill(
+    return IgnorePointer(
       child: Container(
         color: Colors.transparent,
         child: Center(
           child: Container(
-            width: 70, height: 70,
+            width: 70,
+            height: 70,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               color: Colors.green.withOpacity(0.3),
@@ -1824,14 +2121,15 @@ class _CapturePageState extends State<CapturePage>
   }
 
   Widget _buildSuccessAnimation() {
-    return Positioned.fill(
+    return IgnorePointer(
       child: Container(
         color: Colors.transparent,
         child: Center(
           child: ScaleTransition(
             scale: _successController,
             child: Container(
-              width: 100, height: 100,
+              width: 100,
+              height: 100,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 color: Colors.green.withOpacity(0.3),
