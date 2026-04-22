@@ -1849,42 +1849,42 @@ class FaceApp extends StatelessWidget {
   const FaceApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Face Recognition App',
-      theme: ThemeData(
-        primarySwatch: Colors.deepPurple,
-        fontFamily: 'Roboto',
-        visualDensity: VisualDensity.adaptivePlatformDensity,
-        appBarTheme: const AppBarTheme(
-          elevation: 0,
-          centerTitle: true,
-        ),
+Widget build(BuildContext context) {
+  return MaterialApp(
+    debugShowCheckedModeBanner: false,
+    title: 'Face Recognition App',
+    theme: ThemeData(
+      primarySwatch: Colors.deepPurple,
+      fontFamily: 'Roboto',
+      visualDensity: VisualDensity.adaptivePlatformDensity,
+      appBarTheme: const AppBarTheme(
+        elevation: 0,
+        centerTitle: true,
       ),
-      home: const LoginPage(),
-      routes: {
-        '/login': (context) => LoginPage(),
-        '/register': (context) => RegisterPage(),
-        '/pdpa': (context) => PDPAPage(),
-        '/hat': (context) => HatPage(),
-        '/capture': (context) => CapturePage(),
-        '/home': (context) => HomePage(),
-        '/hat_2': (context) => Hat2Page(),
-        '/account': (context) => AccountPage(),
-        '/capture_checkin': (context) => CheckinMatchPage(),
-        '/Home_admin': (context) => HomeAdminPage(),
-        '/Home_personal': (context) => HomePersonalPage(),
-        '/edit_student': (context) => EditStudentPage(),
-        '/time': (context) => const TimeManagementPage(),
-        '/edit_check': (context) => const EditCheckPage(),
-        '/edit_personal': (context) => const EditPersonalPage(),
-        '/level_up': (context) => const LevelUpPage(),
-        '/reset_pass': (context) => ResetPassPage(),
-        '/screen': (context) => ScreenPage(),
-        '/new_password': (context) => NewPasswordPage(),
-        '/account_personal': (context) => const AccountPersonalPage(),
-      },
-    );
-  }
+    ),
+    home: const LoginPage(),
+    routes: {
+      '/login': (context) => const LoginPage(),
+      '/register': (context) => const RegisterPage(),
+      '/pdpa': (context) => const PDPAPage(),
+      '/hat': (context) => const HatPage(),
+      '/capture': (context) => const CapturePage(),
+      '/home': (context) => const HomePage(),
+      '/hat_2': (context) => const Hat2Page(),
+      '/account': (context) => const AccountPage(),
+      '/capture_checkin': (context) => const CheckinMatchPage(),
+      '/Home_admin': (context) => const HomeAdminPage(),
+      '/Home_personal': (context) => const HomePersonalPage(),
+      '/edit_student': (context) => const EditStudentPage(),
+      '/time': (context) => const TimeManagementPage(),
+      '/edit_check': (context) => const EditCheckPage(), // มีอยู่แล้ว ✅
+      '/edit_personal': (context) => const EditPersonalPage(),
+      '/level_up': (context) => const LevelUpPage(),
+      '/reset_pass': (context) => const ResetPassPage(),
+      '/screen': (context) => const ScreenPage(),
+      '/new_password': (context) => const NewPasswordPage(),
+      '/account_personal': (context) => const AccountPersonalPage(),
+    },
+  );
+}
 }
