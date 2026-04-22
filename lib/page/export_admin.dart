@@ -7,7 +7,7 @@ import 'package:excel/excel.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:intl/intl.dart';
-import 'package:permission_handler/permission_handler.dart'; // เพิ่ม package นี้
+import 'package:permission_handler/permission_handler.dart';
 
 class ExportAdminPage extends StatefulWidget {
   const ExportAdminPage({super.key});
@@ -23,7 +23,7 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
   bool _isLoading = false;
   bool _isAdminVerified = false;
   bool _isResetting = false;
-  List<Map<String, dynamic>> _studentsWithHighMissedCount = [];
+  List<Map<String, dynamic>> _studentsWithLowMissedCount = [];
   int _totalCount = 0;
 
   @override
@@ -47,7 +47,7 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
             setState(() {
               _isAdminVerified = true;
             });
-            _loadStudentsWithHighMissedCount();
+            _loadStudentsWithLowMissedCount();
           } else {
             _showErrorSnackBar('คุณไม่มีสิทธิ์เข้าถึงหน้านี้');
             Future.delayed(const Duration(seconds: 2), () {
@@ -64,8 +64,8 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
     }
   }
 
-  // โหลดข้อมูลนักศึกษาที่มี missed_count >= 14
-  Future<void> _loadStudentsWithHighMissedCount() async {
+  // โหลดข้อมูลนักศึกษาที่มี missed_count <= 14 (ไม่เกิน 14 ครั้ง)
+  Future<void> _loadStudentsWithLowMissedCount() async {
     setState(() {
       _isLoading = true;
     });
@@ -92,7 +92,8 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
           missedCount = missedCountValue.toInt();
         }
 
-        if (missedCount >= 14) {
+        // ✅ เปลี่ยนเงื่อนไขจาก >= 14 เป็น <= 14 (ไม่เกิน 14 ครั้ง)
+        if (missedCount <= 14) {
           students.add({
             'studentId': data['studentId'] ?? '',
             'firstName': data['firstName'] ?? '',
@@ -105,17 +106,18 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
         }
       }
 
-      students.sort((a, b) => b['missedCount'].compareTo(a['missedCount']));
+      // เรียงลำดับตาม missed_count จากน้อยไปมาก (แสดงคนที่ขาดน้อยก่อน)
+      students.sort((a, b) => a['missedCount'].compareTo(b['missedCount']));
 
       setState(() {
-        _studentsWithHighMissedCount = students;
+        _studentsWithLowMissedCount = students;
         _totalCount = students.length;
         _isLoading = false;
       });
 
       if (students.isEmpty) {
         _showInfoSnackBar(
-            'ไม่มีนักศึกษาที่มีจำนวนขาดกิจกรรมหน้าเสาธงตั้งแต่ 14 ครั้งขึ้นไป');
+            'ไม่มีนักศึกษาที่มีจำนวนขาดกิจกรรมหน้าเสาธงไม่เกิน 14 ครั้ง');
       } else {
         _showSuccessSnackBar('พบข้อมูล ${students.length} รายการ');
       }
@@ -131,7 +133,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
   // ขอ permission สำหรับ iOS
   Future<bool> _requestPermissions() async {
     if (Platform.isIOS) {
-      // สำหรับ iOS 14+ อาจต้องขอ permission พิเศษ
       var status = await Permission.storage.status;
       if (!status.isGranted) {
         status = await Permission.storage.request();
@@ -212,7 +213,7 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
 
       if (errors.isEmpty) {
         _showSuccessSnackBar('รีเซ็ตข้อมูลสำเร็จ $updatedCount รายการ');
-        _loadStudentsWithHighMissedCount();
+        _loadStudentsWithLowMissedCount();
       } else {
         _showErrorSnackBar(
             'รีเซ็ตข้อมูลสำเร็จ $updatedCount รายการ แต่มีข้อผิดพลาด ${errors.length} รายการ');
@@ -229,12 +230,11 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
 
   // สร้างไฟล์ Excel ที่รองรับ iOS
   Future<void> _exportToExcel() async {
-    if (_studentsWithHighMissedCount.isEmpty) {
+    if (_studentsWithLowMissedCount.isEmpty) {
       _showErrorSnackBar('ไม่มีข้อมูลสำหรับส่งออก');
       return;
     }
 
-    // ขอ permission สำหรับ iOS
     if (!await _requestPermissions()) {
       _showErrorSnackBar('ไม่ได้รับอนุญาตให้เข้าถึงไฟล์');
       return;
@@ -245,10 +245,8 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
     });
 
     try {
-      // สร้าง Excel file
       var excel = Excel.createExcel();
 
-      // ลบ Sheet ที่มีอยู่แล้วทั้งหมด
       List<String> sheetsToDelete = [];
       for (var sheet in excel.sheets.keys) {
         sheetsToDelete.add(sheet);
@@ -257,7 +255,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
         excel.delete(sheet);
       }
 
-      // สร้าง Sheet ใหม่
       Sheet sheetObject = excel['Sheet1'];
 
       // กำหนดความกว้างของคอลัมน์
@@ -273,7 +270,7 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
       var cellA1 = sheetObject
           .cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: 0));
       cellA1.value = TextCellValue(
-          'รายงานรายชื่อนักเรียนนักศึกษาที่ติดกิจกรรมเข้าแถวหน้าเสาธง');
+          'รายงานรายชื่อนักเรียนนักศึกษาที่ขาดกิจกรรมเข้าแถวหน้าเสาธงไม่เกิน 14 ครั้ง'); // ✅ แก้ไขข้อความ
 
       sheetObject.merge(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: 0),
           CellIndex.indexByColumnRow(columnIndex: 6, rowIndex: 0));
@@ -285,8 +282,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
         fontSize: 14,
         bold: true,
       );
-
-      // แถวที่ 2: เว้นว่าง
 
       // แถวที่ 3: หัวข้อตาราง
       List<String> headers = [
@@ -314,11 +309,10 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
       }
 
       // ใส่ข้อมูลตั้งแต่แถวที่ 4
-      for (int i = 0; i < _studentsWithHighMissedCount.length; i++) {
-        var student = _studentsWithHighMissedCount[i];
+      for (int i = 0; i < _studentsWithLowMissedCount.length; i++) {
+        var student = _studentsWithLowMissedCount[i];
         int rowIndex = 3 + i;
 
-        // ลำดับ
         var cellA = sheetObject.cell(
             CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: rowIndex));
         cellA.value = IntCellValue(i + 1);
@@ -327,7 +321,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
           verticalAlign: VerticalAlign.Center,
         );
 
-        // รหัสประจำตัว
         var cellB = sheetObject.cell(
             CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: rowIndex));
         cellB.value = TextCellValue(student['studentId']?.toString() ?? '');
@@ -336,7 +329,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
           verticalAlign: VerticalAlign.Center,
         );
 
-        // ชื่อ-สกุล
         var cellC = sheetObject.cell(
             CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: rowIndex));
         String fullName =
@@ -347,7 +339,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
           verticalAlign: VerticalAlign.Center,
         );
 
-        // ระดับการศึกษา
         var cellD = sheetObject.cell(
             CellIndex.indexByColumnRow(columnIndex: 3, rowIndex: rowIndex));
         cellD.value =
@@ -357,7 +348,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
           verticalAlign: VerticalAlign.Center,
         );
 
-        // ชั้นปี
         var cellE = sheetObject.cell(
             CellIndex.indexByColumnRow(columnIndex: 4, rowIndex: rowIndex));
         cellE.value = TextCellValue(student['year']?.toString() ?? '');
@@ -366,7 +356,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
           verticalAlign: VerticalAlign.Center,
         );
 
-        // แผนก
         var cellF = sheetObject.cell(
             CellIndex.indexByColumnRow(columnIndex: 5, rowIndex: rowIndex));
         cellF.value = TextCellValue(student['department']?.toString() ?? '');
@@ -375,7 +364,6 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
           verticalAlign: VerticalAlign.Center,
         );
 
-        // จำนวนครั้งที่ขาด
         var cellG = sheetObject.cell(
             CellIndex.indexByColumnRow(columnIndex: 6, rowIndex: rowIndex));
         cellG.value = IntCellValue(student['missedCount'] ?? 0);
@@ -385,14 +373,11 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
         );
       }
 
-      // บันทึกไฟล์
       var fileBytes = excel.save();
       if (fileBytes != null) {
-        // สร้างชื่อไฟล์พร้อมวันที่และเวลา
         String dateTime = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
         String fileName = 'missed_count_report_$dateTime.xlsx';
 
-        // สำหรับ iOS ใช้ Application Documents Directory
         Directory appDir;
         if (Platform.isIOS) {
           appDir = await getApplicationDocumentsDirectory();
@@ -403,22 +388,18 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
         String filePath = '${appDir.path}/$fileName';
         File file = File(filePath);
         
-        // เขียนไฟล์
         await file.writeAsBytes(fileBytes);
         
-        // ตรวจสอบว่าไฟล์ถูกสร้างสำเร็จ
         if (await file.exists()) {
           print('✅ File created successfully at: $filePath');
           print('📊 File size: ${await file.length()} bytes');
           
-          // แชร์ไฟล์
           await Share.shareXFiles(
             [XFile(filePath)],
-            text: 'รายงานนักศึกษาที่ขาดกิจกรรมเข้าแถวตั้งแต่ 14 ครั้งขึ้นไป',
-            subject: 'รายงานการขาดกิจกรรม', // สำหรับ iOS
+            text: 'รายงานนักศึกษาที่ขาดกิจกรรมเข้าแถวหน้าเสาธงไม่เกิน 14 ครั้ง', // ✅ แก้ไขข้อความ
+            subject: 'รายงานการขาดกิจกรรม',
           );
           
-          // ลบไฟล์ชั่วคราวหลังจากแชร์ (รอสักครู่)
           Future.delayed(const Duration(seconds: 5), () async {
             try {
               if (await file.exists()) {
@@ -449,9 +430,9 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
     }
   }
 
-  // ทางเลือกสำหรับ iOS: สร้าง CSV ถ้า Excel ไม่ทำงาน
+  // สร้างไฟล์ CSV
   Future<void> _exportToCSV() async {
-    if (_studentsWithHighMissedCount.isEmpty) {
+    if (_studentsWithLowMissedCount.isEmpty) {
       _showErrorSnackBar('ไม่มีข้อมูลสำหรับส่งออก');
       return;
     }
@@ -464,18 +445,12 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
       String dateTime = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
       String fileName = 'missed_count_report_$dateTime.csv';
       
-      // สร้างเนื้อหา CSV
       StringBuffer csvContent = StringBuffer();
-      
-      // เพิ่ม BOM สำหรับ UTF-8 (สำคัญสำหรับ Excel บน Windows/Mac)
       csvContent.write('\uFEFF');
-      
-      // หัวข้อ
       csvContent.writeln('ลำดับ,รหัสประจำตัว,ชื่อ-สกุล,ระดับการศึกษา,ชั้นปี,แผนก,จำนวนครั้งที่ขาด');
       
-      // ข้อมูล
-      for (int i = 0; i < _studentsWithHighMissedCount.length; i++) {
-        var student = _studentsWithHighMissedCount[i];
+      for (int i = 0; i < _studentsWithLowMissedCount.length; i++) {
+        var student = _studentsWithLowMissedCount[i];
         String fullName = '${student['firstName'] ?? ''} ${student['lastName'] ?? ''}'.trim();
         
         csvContent.writeln(
@@ -489,20 +464,17 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
         );
       }
       
-      // บันทึกไฟล์
       Directory appDir = await getApplicationDocumentsDirectory();
       String filePath = '${appDir.path}/$fileName';
       File file = File(filePath);
       await file.writeAsString(csvContent.toString());
       
-      // แชร์ไฟล์
       await Share.shareXFiles(
         [XFile(filePath)],
-        text: 'รายงานนักศึกษาที่ขาดกิจกรรมเข้าแถวตั้งแต่ 14 ครั้งขึ้นไป (CSV)',
+        text: 'รายงานนักศึกษาที่ขาดกิจกรรมเข้าแถวหน้าเสาธงไม่เกิน 14 ครั้ง (CSV)', // ✅ แก้ไขข้อความ
         subject: 'รายงานการขาดกิจกรรม',
       );
       
-      // ลบไฟล์หลังจากแชร์
       Future.delayed(const Duration(seconds: 5), () async {
         try {
           if (await file.exists()) {
@@ -665,10 +637,10 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
                 ),
               ),
             ),
-          if (_studentsWithHighMissedCount.isNotEmpty && !_isResetting)
+          if (_studentsWithLowMissedCount.isNotEmpty && !_isResetting)
             IconButton(
               icon: const Icon(Icons.refresh),
-              onPressed: _loadStudentsWithHighMissedCount,
+              onPressed: _loadStudentsWithLowMissedCount,
               tooltip: 'โหลดข้อมูลใหม่',
             ),
         ],
@@ -724,11 +696,11 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
                         const Row(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Icon(Icons.warning_amber_rounded,
+                            Icon(Icons.info_outline,
                                 color: Colors.white, size: 30),
                             SizedBox(width: 10),
                             Text(
-                              'รายงานนักศึกษาที่มีความเสี่ยง',
+                              'รายงานนักศึกษาที่ขาดกิจกรรมไม่เกิน 14 ครั้ง', // ✅ แก้ไขข้อความ
                               style: TextStyle(
                                 color: Colors.white,
                                 fontSize: 18,
@@ -747,8 +719,8 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
                               Icons.people,
                             ),
                             _buildSummaryItem(
-                              'ขาดกิจกรรมเข้าแถวขั้นต่ำ',
-                              '14 ครั้ง',
+                              'ขาดกิจกรรมเข้าแถวสูงสุด',
+                              '14 ครั้ง', // ✅ แก้ไขข้อความ
                               Icons.event_busy,
                             ),
                           ],
@@ -757,18 +729,18 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
                     ),
                   ),
 
-                  // ปุ่มส่งออก (เปลี่ยนเป็นปุ่มเลือก format)
+                  // ปุ่มส่งออก
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
                     child: ElevatedButton.icon(
-                      onPressed: _studentsWithHighMissedCount.isEmpty
+                      onPressed: _studentsWithLowMissedCount.isEmpty
                           ? null
                           : _showExportOptions,
                       icon: const Icon(Icons.download_rounded),
                       label: Text(
-                        _studentsWithHighMissedCount.isEmpty
+                        _studentsWithLowMissedCount.isEmpty
                             ? 'ไม่มีข้อมูลสำหรับส่งออก'
-                            : 'ส่งออกข้อมูล (${_studentsWithHighMissedCount.length} รายการ)',
+                            : 'ส่งออกข้อมูล (${_studentsWithLowMissedCount.length} รายการ)',
                       ),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFF6A1B9A),
@@ -786,7 +758,7 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
 
                   // แสดงตัวอย่างข้อมูล
                   Expanded(
-                    child: _studentsWithHighMissedCount.isEmpty
+                    child: _studentsWithLowMissedCount.isEmpty
                         ? Center(
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,
@@ -798,7 +770,7 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
                                 ),
                                 const SizedBox(height: 16),
                                 Text(
-                                  'ไม่มีนักศึกษาที่ขาดกิจกรรมเข้าแถวหน้าเสาธง 14 ครั้งขึ้นไป',
+                                  'ไม่มีนักศึกษาที่ขาดกิจกรรมเข้าแถวหน้าเสาธงไม่เกิน 14 ครั้ง', // ✅ แก้ไขข้อความ
                                   style: TextStyle(
                                     fontSize: 16,
                                     color: Colors.grey[600],
@@ -817,28 +789,33 @@ class _ExportAdminPageState extends State<ExportAdminPage> {
                           )
                         : ListView.builder(
                             padding: const EdgeInsets.all(16),
-                            itemCount: _studentsWithHighMissedCount.length,
+                            itemCount: _studentsWithLowMissedCount.length,
                             itemBuilder: (context, index) {
                               final student =
-                                  _studentsWithHighMissedCount[index];
+                                  _studentsWithLowMissedCount[index];
                               int missedCount = student['missedCount'] ?? 0;
 
+                              // ✅ ปรับสีตามจำนวนครั้งที่ขาด (น้อยครั้ง = สีเขียว)
                               Color backgroundColor;
                               Color textColor;
                               Color circleColor;
 
-                              if (missedCount >= 20) {
-                                backgroundColor = Colors.red.shade50;
-                                textColor = Colors.red;
-                                circleColor = Colors.red;
-                              } else if (missedCount >= 14) {
-                                backgroundColor = Colors.orange.shade50;
-                                textColor = Colors.orange.shade800;
-                                circleColor = Colors.orange;
-                              } else {
+                              if (missedCount <= 3) {
+                                backgroundColor = Colors.green.shade50;
+                                textColor = Colors.green;
+                                circleColor = Colors.green;
+                              } else if (missedCount <= 7) {
+                                backgroundColor = Colors.lightGreen.shade50;
+                                textColor = Colors.lightGreen.shade800;
+                                circleColor = Colors.lightGreen;
+                              } else if (missedCount <= 10) {
                                 backgroundColor = Colors.yellow.shade50;
                                 textColor = Colors.amber.shade800;
                                 circleColor = Colors.amber;
+                              } else {
+                                backgroundColor = Colors.orange.shade50;
+                                textColor = Colors.orange.shade800;
+                                circleColor = Colors.orange;
                               }
 
                               return Container(
