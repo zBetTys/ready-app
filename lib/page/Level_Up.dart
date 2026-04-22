@@ -30,11 +30,17 @@ class _LevelUpPageState extends State<LevelUpPage>
   bool _isUpdatingDiploma = false;
   bool _isDeletingGraduated = false;
 
+  // ตัวแปรใหม่สำหรับสถานะ active
+  bool _isUpdatingActiveStatus = false;
+  bool _isUpdatingInactiveStatus = false;
+
   // สถิติ
   int _vocationalCount = 0;
   int _diplomaCount = 0;
   int _graduatedCount = 0;
   int _invalidYearCount = 0;
+  int _activeCount = 0; // สถิติผู้ใช้ที่ active = true
+  int _inactiveCount = 0; // สถิติผู้ใช้ที่ active = false
 
   @override
   void initState() {
@@ -115,11 +121,21 @@ class _LevelUpPageState extends State<LevelUpPage>
       int diploma = 0;
       int graduated = 0;
       int invalidYear = 0;
+      int active = 0;
+      int inactive = 0;
 
       for (var doc in snapshot.docs) {
         final data = doc.data();
         final educationLevel = data['educationLevel']?.toString() ?? '';
         final year = data['year']?.toString() ?? '';
+        final isActive = data['active'] ?? true; // ค่าเริ่มต้นเป็น true
+
+        // นับสถานะ active
+        if (isActive == true) {
+          active++;
+        } else {
+          inactive++;
+        }
 
         if (year == 'จบการศึกษา') {
           graduated++;
@@ -143,6 +159,8 @@ class _LevelUpPageState extends State<LevelUpPage>
           _diplomaCount = diploma;
           _graduatedCount = graduated;
           _invalidYearCount = invalidYear;
+          _activeCount = active;
+          _inactiveCount = inactive;
         });
       }
     } catch (e) {
@@ -413,6 +431,265 @@ class _LevelUpPageState extends State<LevelUpPage>
     }
   }
 
+  // ========== 🆕 ฟังก์ชันอัพเดทสถานะ active ==========
+
+  /// อัพเดทสถานะ active = true สำหรับนักศึกษาทุกคน
+  Future<void> _updateActiveStatusTrue() async {
+    if (!_isAdminVerified) {
+      _showErrorSnackBar('คุณไม่มีสิทธิ์ดำเนินการนี้');
+      return;
+    }
+
+    final confirmed = await _showActiveStatusConfirmationDialog(
+      'เปิดใช้งานนักศึกษาทุกคน',
+      'คุณแน่ใจหรือไม่ที่จะเปิดใช้งานนักศึกษาทุกคนในระบบ?\n\n'
+          'เมื่อเปิดใช้งานแล้ว นักศึกษาจะสามารถเช็คชื่อและใช้งานระบบได้ตามปกติ',
+      'เปิดใช้งาน',
+      Colors.green,
+    );
+
+    if (confirmed != true) return;
+
+    setState(() => _isUpdatingActiveStatus = true);
+
+    try {
+      final snapshot = await _firestore
+          .collection('users')
+          .where('role', isEqualTo: 'student')
+          .get();
+
+      int updatedCount = 0;
+      int alreadyActiveCount = 0;
+      final batch = _firestore.batch();
+
+      for (var doc in snapshot.docs) {
+        final data = doc.data();
+        final currentActive = data['active'] ?? true;
+
+        if (currentActive == true) {
+          alreadyActiveCount++;
+          continue;
+        }
+
+        // อัพเดท active = true
+        batch.update(doc.reference, {
+          'active': true,
+          'updatedAt': FieldValue.serverTimestamp(),
+          'updatedBy': _auth.currentUser?.uid,
+          'updatedByEmail': _auth.currentUser?.email,
+        });
+        updatedCount++;
+      }
+
+      if (updatedCount > 0) {
+        await batch.commit();
+        await _loadStatistics();
+
+        await _safeAddAdminLog({
+          'adminId': _auth.currentUser?.uid,
+          'adminEmail': _auth.currentUser?.email,
+          'action': 'activate_all_students',
+          'updatedCount': updatedCount,
+          'alreadyActiveCount': alreadyActiveCount,
+        });
+
+        _showSuccessSnackBar('✅ เปิดใช้งานนักศึกษาทุกคนสำเร็จ!\n'
+            'อัพเดท: $updatedCount คน\n'
+            'เปิดใช้งานอยู่แล้ว: $alreadyActiveCount คน');
+      } else {
+        _showInfoSnackBar('นักศึกษาทุกคนเปิดใช้งานอยู่แล้ว');
+      }
+    } catch (e) {
+      _showErrorSnackBar('เกิดข้อผิดพลาด: ${e.toString()}');
+    } finally {
+      if (mounted) {
+        setState(() => _isUpdatingActiveStatus = false);
+      }
+    }
+  }
+
+  /// อัพเดทสถานะ active = false สำหรับนักศึกษาทุกคน (หยุดการนับขาดกิจกรรมเข้าแถว)
+  Future<void> _updateActiveStatusFalse() async {
+    if (!_isAdminVerified) {
+      _showErrorSnackBar('คุณไม่มีสิทธิ์ดำเนินการนี้');
+      return;
+    }
+
+    final confirmed = await _showActiveStatusConfirmationDialog(
+      'หยุดการนับขาดกิจกรรมเข้าแถว',
+      '⚠️ คำเตือนสำคัญ!\n\n'
+          'คุณแน่ใจหรือไม่ที่จะหยุดการนับขาดกิจกรรมเข้าแถวของนักศึกษาทุกคน?',
+      'หยุดการนับขาดกิจกรรม',
+      Colors.red,
+    );
+
+    if (confirmed != true) return;
+
+    setState(() => _isUpdatingInactiveStatus = true);
+
+    try {
+      final snapshot = await _firestore
+          .collection('users')
+          .where('role', isEqualTo: 'student')
+          .get();
+
+      int updatedCount = 0;
+      int alreadyInactiveCount = 0;
+      final batch = _firestore.batch();
+
+      for (var doc in snapshot.docs) {
+        final data = doc.data();
+        final currentActive = data['active'] ?? true;
+
+        if (currentActive == false) {
+          alreadyInactiveCount++;
+          continue;
+        }
+
+        // อัพเดท active = false
+        batch.update(doc.reference, {
+          'active': false,
+          'updatedAt': FieldValue.serverTimestamp(),
+          'updatedBy': _auth.currentUser?.uid,
+          'updatedByEmail': _auth.currentUser?.email,
+        });
+        updatedCount++;
+      }
+
+      if (updatedCount > 0) {
+        await batch.commit();
+        await _loadStatistics();
+
+        await _safeAddAdminLog({
+          'adminId': _auth.currentUser?.uid,
+          'adminEmail': _auth.currentUser?.email,
+          'action': 'deactivate_all_students',
+          'updatedCount': updatedCount,
+          'alreadyInactiveCount': alreadyInactiveCount,
+        });
+
+        _showSuccessSnackBar('✅ หยุดการนับขาดกิจกรรมเข้าแถวสำเร็จ!\n'
+            'อัพเดท: $updatedCount คน\n'
+            'หยุดอยู่แล้ว: $alreadyInactiveCount คน');
+      } else {
+        _showInfoSnackBar('นักศึกษาทุกคนหยุดการนับขาดกิจกรรมอยู่แล้ว');
+      }
+    } catch (e) {
+      _showErrorSnackBar('เกิดข้อผิดพลาด: ${e.toString()}');
+    } finally {
+      if (mounted) {
+        setState(() => _isUpdatingInactiveStatus = false);
+      }
+    }
+  }
+
+  /// แสดง dialog ยืนยันการอัพเดทสถานะ active
+  Future<bool?> _showActiveStatusConfirmationDialog(
+    String title,
+    String content,
+    String confirmText,
+    Color confirmColor,
+  ) {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
+        backgroundColor: Colors.white,
+        title: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: confirmColor.withOpacity(0.1),
+                shape: BoxShape.circle,
+                border: Border.all(
+                    color: confirmColor.withOpacity(0.2), width: 1.5),
+              ),
+              child: Icon(
+                title.contains('เปิด')
+                    ? Icons.check_circle_rounded
+                    : Icons.warning_amber_rounded,
+                color: confirmColor,
+                size: 32,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              title,
+              style: const TextStyle(
+                color: Color(0xFF6A1B9A),
+                fontWeight: FontWeight.bold,
+                fontSize: 20,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+        content: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: confirmColor.withOpacity(0.05),
+            borderRadius: BorderRadius.circular(15),
+          ),
+          child: Text(
+            content,
+            style: const TextStyle(fontSize: 14, color: Colors.black87),
+            textAlign: TextAlign.left,
+          ),
+        ),
+        actions: [
+          Row(
+            children: [
+              Expanded(
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: const Text(
+                    'ยกเลิก',
+                    style: TextStyle(
+                      color: Color(0xFF6A1B9A),
+                      fontWeight: FontWeight.w600,
+                      fontSize: 15,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: confirmColor,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    elevation: 2,
+                  ),
+                  child: Text(
+                    confirmText,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   // ========== ฟังก์ชันอัพเดทชั้นปี (ไม่มี previousYear) ==========
 
   /// อัพเดทชั้นปีสำหรับนักศึกษา ปวช
@@ -653,7 +930,7 @@ class _LevelUpPageState extends State<LevelUpPage>
     }
   }
 
-  // ========== 🔥 ฟังก์ชันลบนักศึกษาที่จบการศึกษา (ลบ Auth user ได้เลย) ==========
+  // ========== ฟังก์ชันลบนักศึกษาที่จบการศึกษา (ลบ Auth user ได้เลย) ==========
 
   /// ฟังก์ชันลบผู้ใช้จาก Firebase Authentication ผ่าน Cloud Function
   Future<void> _deleteAuthUser(String uid) async {
@@ -1323,12 +1600,14 @@ class _LevelUpPageState extends State<LevelUpPage>
     return WillPopScope(
       onWillPop: () async => !(_isUpdatingVocational ||
           _isUpdatingDiploma ||
-          _isDeletingGraduated),
+          _isDeletingGraduated ||
+          _isUpdatingActiveStatus ||
+          _isUpdatingInactiveStatus),
       child: Scaffold(
         backgroundColor: const Color(0xFFF5F5F5),
         appBar: AppBar(
           title: const Text(
-            'อัพเดทชั้นปีนักศึกษา',
+            'อัพเดทสถานะนักศึกษา',
             style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
           ),
           backgroundColor: const Color(0xFF6A1B9A),
@@ -1339,7 +1618,9 @@ class _LevelUpPageState extends State<LevelUpPage>
             icon: const Icon(Icons.arrow_back_rounded),
             onPressed: (_isUpdatingVocational ||
                     _isUpdatingDiploma ||
-                    _isDeletingGraduated)
+                    _isDeletingGraduated ||
+                    _isUpdatingActiveStatus ||
+                    _isUpdatingInactiveStatus)
                 ? null
                 : () => Navigator.pop(context),
           ),
@@ -1444,30 +1725,58 @@ class _LevelUpPageState extends State<LevelUpPage>
                       const SizedBox(height: 30),
                       _buildStatisticsCard(),
                       const SizedBox(height: 30),
+
+                      // 🆕 ปุ่มเปิดใช้งานนักศึกษาทุกคน
                       SlideTransition(
                         position: _slideAnimation,
-                        child: _buildLevelButton(
-                          level: 'ปวช',
-                          icon: Icons.school_rounded,
-                          color: const Color(0xFF6A1B9A),
-                          onUpdate: _updateVocationalLevel,
-                          onPreview: () => _showPreview('ปวช'),
-                          isUpdating: _isUpdatingVocational,
-                          count: _vocationalCount,
+                        child: _buildActiveStatusButton(
+                          title: 'เปิดใช้งานนักศึกษาทุกคน',
+                          subtitle: 'ทำให้นักศึกษาทุกคนสามารถเช็คชื่อได้',
+                          icon: Icons.play_circle_rounded,
+                          color: Colors.green,
+                          onPressed: _updateActiveStatusTrue,
+                          isUpdating: _isUpdatingActiveStatus,
+                          count: _inactiveCount,
+                          countLabel: 'คนที่ปิดใช้งาน',
                         ),
                       ),
                       const SizedBox(height: 20),
+
+                      // 🆕 ปุ่มหยุดการนับขาดกิจกรรมเข้าแถว
                       SlideTransition(
                         position: _slideAnimation,
-                        child: _buildLevelButton(
-                          level: 'ปวส',
-                          icon: Icons.business_center_rounded,
-                          color: const Color(0xFF9C27B0),
-                          onUpdate: _updateDiplomaLevel,
-                          onPreview: () => _showPreview('ปวส'),
-                          isUpdating: _isUpdatingDiploma,
-                          count: _diplomaCount,
+                        child: _buildActiveStatusButton(
+                          title: 'หยุดการนับขาดกิจกรรมเข้าแถว',
+                          subtitle:
+                              'ปิดการใช้งานนักศึกษาทุกคน (ไม่สามารถเช็คชื่อได้)',
+                          icon: Icons.pause_circle_rounded,
+                          color: Colors.red,
+                          onPressed: _updateActiveStatusFalse,
+                          isUpdating: _isUpdatingInactiveStatus,
+                          count: _activeCount,
+                          countLabel: 'คนที่เปิดใช้งาน',
                         ),
+                      ),
+                      const SizedBox(height: 20),
+
+                      _buildLevelButton(
+                        level: 'ปวช',
+                        icon: Icons.school_rounded,
+                        color: const Color(0xFF6A1B9A),
+                        onUpdate: _updateVocationalLevel,
+                        onPreview: () => _showPreview('ปวช'),
+                        isUpdating: _isUpdatingVocational,
+                        count: _vocationalCount,
+                      ),
+                      const SizedBox(height: 20),
+                      _buildLevelButton(
+                        level: 'ปวส',
+                        icon: Icons.business_center_rounded,
+                        color: const Color(0xFF9C27B0),
+                        onUpdate: _updateDiplomaLevel,
+                        onPreview: () => _showPreview('ปวส'),
+                        isUpdating: _isUpdatingDiploma,
+                        count: _diplomaCount,
                       ),
                       if (_invalidYearCount > 0)
                         Padding(
@@ -1506,6 +1815,129 @@ class _LevelUpPageState extends State<LevelUpPage>
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // 🆕 สร้างปุ่มสำหรับจัดการสถานะ active
+  Widget _buildActiveStatusButton({
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required Color color,
+    required VoidCallback onPressed,
+    required bool isUpdating,
+    required int count,
+    required String countLabel,
+  }) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(25),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.15),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+            spreadRadius: 0,
+          ),
+        ],
+        border: Border.all(color: color.withOpacity(0.2), width: 2),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: color, size: 32),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: color,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey.shade600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (count > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: color.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: color.withOpacity(0.2)),
+                  ),
+                  child: Text(
+                    '$count $countLabel',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: color,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: isUpdating ? null : onPressed,
+              icon: isUpdating
+                  ? SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : Icon(icon, size: 20),
+              label: Text(
+                isUpdating ? 'กำลังดำเนินการ...' : title,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: color,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                elevation: 4,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1552,7 +1984,7 @@ class _LevelUpPageState extends State<LevelUpPage>
             ),
             const SizedBox(height: 15),
             const Text(
-              'อัพเดทชั้นปีนักศึกษา',
+              'อัพเดทสถานะนักศึกษา',
               style: TextStyle(
                 fontSize: 24,
                 fontWeight: FontWeight.bold,
