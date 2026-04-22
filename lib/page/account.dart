@@ -4,7 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../page/Login.dart';
-import '../page/new_password.dart'; // 🔥 เพิ่ม import
+import '../page/new_password.dart';
 
 class AccountPage extends StatefulWidget {
   const AccountPage({super.key});
@@ -18,15 +18,15 @@ class _AccountPageState extends State<AccountPage>
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
-  // Animation Controller
   late AnimationController _animationController;
   late Animation<double> _fadeAnimation;
   late Animation<Offset> _slideAnimation;
 
   bool _isLoading = true;
+  bool _isExitBlocked =
+      false; // 🔥 true = ถูกบล็อกไม่ให้ออก, false = ออกได้ปกติ
   Map<String, dynamic> _userData = {};
 
-  // สีหลักตามโทนม่วง
   final Color _primaryColor = const Color(0xFF6A1B9A);
   final Color _backgroundColor = const Color(0xFFF5F5F5);
 
@@ -34,7 +34,6 @@ class _AccountPageState extends State<AccountPage>
   void initState() {
     super.initState();
 
-    // Initialize animations
     _animationController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1000),
@@ -73,10 +72,14 @@ class _AccountPageState extends State<AccountPage>
       if (user != null) {
         final doc = await _firestore.collection('users').doc(user.uid).get();
         if (doc.exists) {
+          final data = doc.data()!;
           setState(() {
-            _userData = doc.data()!;
+            _userData = data;
+            // 🔥 exit == true → ถูกบล็อก (ห้ามออก), exit == false → ออกได้
+            _isExitBlocked = data['exit'] ?? false;
           });
-          print('✅ โหลดข้อมูลผู้ใช้สำเร็จ: ${_userData['email']}');
+          print(
+              '✅ โหลดข้อมูลสำเร็จ: ${_userData['email']}, exit = ${data['exit']}, isExitBlocked = $_isExitBlocked');
         } else {
           print('⚠️ ไม่พบเอกสารผู้ใช้');
         }
@@ -88,7 +91,89 @@ class _AccountPageState extends State<AccountPage>
     }
   }
 
-  void _showLogoutDialog() {
+  // 🔥 แสดง Dialog แจ้งเตือนเมื่อถูกบล็อกไม่ให้ออกจากระบบ (exit == true)
+  void _showBlockedExitDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(25),
+          ),
+          backgroundColor: Colors.white,
+          titlePadding: const EdgeInsets.only(top: 24, bottom: 8),
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+          actionsPadding: const EdgeInsets.all(16),
+          title: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.red.withOpacity(0.1),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: Colors.red.withOpacity(0.2),
+                    width: 1.5,
+                  ),
+                ),
+                child: const Icon(
+                  Icons.block_rounded,
+                  color: Colors.red,
+                  size: 32,
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'ไม่สามารถออกจากระบบได้',
+                style: TextStyle(
+                  color: Color(0xFF6A1B9A),
+                  fontWeight: FontWeight.bold,
+                  fontSize: 20,
+                ),
+              ),
+            ],
+          ),
+          content: Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: const Color(0xFF6A1B9A).withOpacity(0.05),
+              borderRadius: BorderRadius.circular(15),
+            ),
+            child: const Text(
+              '⚠️ ไม่สามารถออกจากระบบได้ในขณะนี้\n\n'
+              'เนื่องจากระบบเช็คชื่อกำลังทำงานอยู่\n'
+              'กรุณารอจนกระทั่งระบบเช็คชื่อปิดลง\n\n'
+              'เพื่อป้องกันการทุจริตในการเช็คชื่อ',
+              style: TextStyle(fontSize: 14, color: Colors.black87),
+              textAlign: TextAlign.center,
+            ),
+          ),
+          actions: [
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _primaryColor,
+                foregroundColor: Colors.white,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 30, vertical: 12),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text('ตกลง',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // 🔥 แสดง Dialog ยืนยันการออกจากระบบ (exit == false เท่านั้น)
+  void _showLogoutConfirmDialog() {
     showDialog(
       context: context,
       builder: (BuildContext context) {
@@ -195,12 +280,22 @@ class _AccountPageState extends State<AccountPage>
     );
   }
 
+  // 🔥 ฟังก์ชันหลักสำหรับจัดการการกดปุ่มออกจากระบบ
+  void _handleLogoutPress() {
+    if (_isExitBlocked) {
+      // exit == true → แสดง dialog เตือน (ห้ามออก)
+      _showBlockedExitDialog();
+    } else {
+      // exit == false → แสดง dialog ยืนยัน (ออกได้ปกติ)
+      _showLogoutConfirmDialog();
+    }
+  }
+
   Future<void> _logout() async {
     Navigator.of(context).pop(); // ปิด dialog
 
     setState(() => _isLoading = true);
     try {
-      // ล้างข้อมูลที่บันทึกไว้
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove('saved_email');
       await prefs.remove('saved_password');
@@ -433,13 +528,11 @@ class _AccountPageState extends State<AccountPage>
     );
   }
 
-  // 🔥 เพิ่มฟังก์ชันสำหรับเปลี่ยนรหัสผ่าน
   void _navigateToChangePassword() {
     Navigator.push(
       context,
       MaterialPageRoute(builder: (context) => const NewPasswordPage()),
     ).then((_) {
-      // เมื่อกลับมาจากหน้าเปลี่ยนรหัสผ่าน ให้โหลดข้อมูลใหม่
       _loadUserData();
     });
   }
@@ -557,21 +650,16 @@ class _AccountPageState extends State<AccountPage>
                   opacity: _fadeAnimation,
                   child: Column(
                     children: [
-                      // Profile Header
                       SlideTransition(
                         position: _slideAnimation,
                         child: _buildProfileHeader(),
                       ),
                       const SizedBox(height: 25),
-
-                      // Info Card
                       SlideTransition(
                         position: _slideAnimation,
                         child: _buildInfoCard(),
                       ),
                       const SizedBox(height: 25),
-
-                      // 🔥 Action Buttons Section (เปลี่ยนรหัสผ่าน + ออกจากระบบ)
                       SlideTransition(
                         position: _slideAnimation,
                         child: Container(
@@ -593,7 +681,6 @@ class _AccountPageState extends State<AccountPage>
                           ),
                           child: Column(
                             children: [
-                              // 🔥 ปุ่มเปลี่ยนรหัสผ่าน
                               SizedBox(
                                 width: double.infinity,
                                 height: 50,
@@ -620,33 +707,45 @@ class _AccountPageState extends State<AccountPage>
                               ),
                               const SizedBox(height: 16),
 
-                              // ข้อความแจ้งเตือน
+                              // 🔥 แสดงสถานะการออกจากระบบ
                               Container(
-                                padding: const EdgeInsets.all(16),
+                                padding: const EdgeInsets.all(12),
                                 decoration: BoxDecoration(
-                                  color: Colors.red.withOpacity(0.05),
+                                  color: _isExitBlocked
+                                      ? Colors.red.withOpacity(0.05)
+                                      : Colors.green.withOpacity(0.05),
                                   borderRadius: BorderRadius.circular(15),
                                   border: Border.all(
-                                    color: Colors.red.withOpacity(0.2),
+                                    color: _isExitBlocked
+                                        ? Colors.red.withOpacity(0.2)
+                                        : Colors.green.withOpacity(0.2),
                                     width: 1,
                                   ),
                                 ),
-                                child: Column(
+                                child: Row(
                                   children: [
-                                    const Text(
-                                      'เมื่อออกจากระบบแล้ว',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w500,
-                                        color: Colors.red,
-                                      ),
+                                    Icon(
+                                      _isExitBlocked
+                                          ? Icons.warning_amber_rounded
+                                          : Icons.check_circle_outline,
+                                      color: _isExitBlocked
+                                          ? Colors.red
+                                          : Colors.green,
+                                      size: 20,
                                     ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      'จะต้องเข้าสู่ระบบใหม่อีกครั้ง',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: Colors.grey[600],
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(
+                                        _isExitBlocked
+                                            ? '🔒 ระบบเช็คชื่อกำลังทำงาน ไม่สามารถออกจากระบบได้'
+                                            : '✅ สามารถออกจากระบบได้',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: _isExitBlocked
+                                              ? Colors.red[700]
+                                              : Colors.green[700],
+                                          fontWeight: FontWeight.w500,
+                                        ),
                                       ),
                                     ),
                                   ],
@@ -659,7 +758,8 @@ class _AccountPageState extends State<AccountPage>
                                 width: double.infinity,
                                 height: 50,
                                 child: ElevatedButton.icon(
-                                  onPressed: _showLogoutDialog,
+                                  onPressed:
+                                      _handleLogoutPress, // 🔥 ใช้ฟังก์ชันจัดการใหม่
                                   icon: const Icon(Icons.logout_rounded,
                                       size: 20),
                                   label: const Text(
