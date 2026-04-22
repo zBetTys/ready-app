@@ -89,6 +89,81 @@
 	<key>NSFaceIDUsageDescription</key>
 	<string>ต้องการใช้ Face ID สำหรับยืนยันตัวตน</string>
 
+	<!-- ==================== FILE SHARING & EXPORT (เพิ่มสำหรับ iOS Export) ==================== -->
+	
+	<!-- สำหรับการแชร์ไฟล์และส่งออก Excel/CSV -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	
+	<!-- สำหรับการบันทึกไฟล์ลงใน Files app -->
+	<key>UISupportsDocumentBrowser</key>
+	<true/>
+	
+	<!-- Document types ที่รองรับ -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Excel File</string>
+			<key>LSHandlerRank</key>
+			<string>Default</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.openxmlformats.spreadsheetml.sheet</string>
+				<string>com.microsoft.excel.xlsx</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>CSV File</string>
+			<key>LSHandlerRank</key>
+			<string>Default</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.comma-separated-values-text</string>
+				<string>public.csv</string>
+			</array>
+		</dict>
+	</array>
+	
+	<!-- Imported/Exported Type Identifiers -->
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>org.openxmlformats.spreadsheetml.sheet</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>xlsx</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>application/vnd.openxmlformats-officedocument.spreadsheetml.sheet</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>public.comma-separated-values-text</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>csv</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>text/csv</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+
 	<!-- ==================== FIREBASE & NOTIFICATIONS ==================== -->
 	
 	<!-- Firebase App Delegate Proxy (ต้องเป็น false สำหรับ background tasks) -->
