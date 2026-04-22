@@ -31,12 +31,13 @@ class _HomePageState extends State<HomePage>
   String _userEmail = '';
   bool _isAdmin = false;
 
-  // ✅ ตัวแปรสำหรับนับ Missed (ดึงมาจาก Firebase อย่างเดียว)
+  // ✅ ตัวแปรสำหรับนับ Missed
   int _missedCount = 0;
 
-  // ✅ ตัวแปรสำหรับประกาศประชาสัมพันธ์
+  // ✅ ตัวแปรสำหรับประกาศประชาสัมพันธ์ (ปรับปรุง)
   String _announcementDetail = '';
   bool _hasAnnouncement = false;
+  bool _isInitialDataLoaded = false; // เพิ่มตัวแปรเช็คว่าโหลดข้อมูลครั้งแรกหรือยัง
 
   // ตัวแปรสำหรับวันหยุดและชั้นเรียนพิเศษ
   List<Map<String, dynamic>> _holidays = [];
@@ -45,7 +46,7 @@ class _HomePageState extends State<HomePage>
   TimeOfDay? _todaySpecialStart;
   TimeOfDay? _todaySpecialEnd;
 
-  // ตัวแปรสำหรับติดตามการเช็คชื่อวันนี้ (เก็บไว้ใช้ภายในแต่ไม่แสดง)
+  // ตัวแปรสำหรับติดตามการเช็คชื่อวันนี้
   List<DateTime> _todayCheckIns = [];
   bool _hasCheckedToday = false;
 
@@ -68,7 +69,7 @@ class _HomePageState extends State<HomePage>
     // Initialize animations
     _animationController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1000),
+      duration: const Duration(milliseconds: 800),
     );
 
     _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
@@ -79,7 +80,7 @@ class _HomePageState extends State<HomePage>
     );
 
     _slideAnimation = Tween<Offset>(
-      begin: const Offset(0, 0.3),
+      begin: const Offset(0, 0.2),
       end: Offset.zero,
     ).animate(
       CurvedAnimation(
@@ -88,7 +89,12 @@ class _HomePageState extends State<HomePage>
       ),
     );
 
-    _animationController.forward();
+    // เริ่ม animation หลังจาก build เสร็จ
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _animationController.forward();
+      }
+    });
 
     // Add scroll listener
     _scrollController.addListener(() {
@@ -112,13 +118,10 @@ class _HomePageState extends State<HomePage>
       if (!mounted) return;
 
       if (user == null) {
-        // ผู้ใช้ออกจากระบบ
         print('👋 ผู้ใช้ออกจากระบบ - ล้างข้อมูล');
         _clearUserData();
       } else {
-        // ผู้ใช้เข้าสู่ระบบ
         print('🔑 ผู้ใช้เข้าสู่ระบบ: ${user.email}');
-        // โหลดข้อมูลสำหรับผู้ใช้ใหม่
         _loadDataForCurrentUser();
       }
     });
@@ -128,23 +131,24 @@ class _HomePageState extends State<HomePage>
   Future<void> _loadDataForCurrentUser() async {
     final user = _auth.currentUser;
     if (user == null) return;
-
-    // โหลดข้อมูล
     await _loadUserData();
   }
 
   // ล้างข้อมูลผู้ใช้
   void _clearUserData() {
-    setState(() {
-      _userName = 'ผู้ใช้';
-      _userEmail = '';
-      _isAdmin = false;
-      _missedCount = 0; // ✅ เคลียร์ missed count
-      _todayCheckIns = [];
-      _hasCheckedToday = false;
-      _announcementDetail = '';
-      _hasAnnouncement = false;
-    });
+    if (mounted) {
+      setState(() {
+        _userName = 'ผู้ใช้';
+        _userEmail = '';
+        _isAdmin = false;
+        _missedCount = 0;
+        _todayCheckIns = [];
+        _hasCheckedToday = false;
+        _announcementDetail = '';
+        _hasAnnouncement = false;
+        _isInitialDataLoaded = false;
+      });
+    }
   }
 
   @override
@@ -153,7 +157,6 @@ class _HomePageState extends State<HomePage>
     _animationController.dispose();
     _scrollController.dispose();
 
-    // Cancel all subscriptions
     _checkInSettingsSubscription?.cancel();
     _holidaysSubscription?.cancel();
     _specialClassesSubscription?.cancel();
@@ -169,8 +172,8 @@ class _HomePageState extends State<HomePage>
     _setupCheckInSettingsListener();
     _setupHolidaysListener();
     _setupSpecialClassesListener();
-    _setupUserDataListener(); // ✅ ดึง missed_count จากที่นี่
-    _setupCheckInsListener(); // ยังเก็บไว้สำหรับ internal use
+    _setupUserDataListener();
+    _setupCheckInsListener();
   }
 
   void _setupCheckInSettingsListener() {
@@ -181,8 +184,16 @@ class _HomePageState extends State<HomePage>
         .listen((snapshot) {
       if (!mounted) return;
 
+      print('📢 Firestore data updated: ${snapshot.exists}');
+      
       if (snapshot.exists) {
         final data = snapshot.data()!;
+        
+        // ดึงข้อมูล announcementDetail
+        final newAnnouncement = data['announcementDetail']?.toString() ?? '';
+        final hasNewAnnouncement = newAnnouncement.isNotEmpty;
+        
+        print('📢 Announcement: "$newAnnouncement" (has: $hasNewAnnouncement)');
 
         setState(() {
           _checkInStart = TimeOfDay(
@@ -201,15 +212,30 @@ class _HomePageState extends State<HomePage>
             }
           }
 
-          // ✅ ดึงข้อความประกาศประชาสัมพันธ์
-          _announcementDetail = data['announcementDetail'] ?? '';
-          _hasAnnouncement = _announcementDetail.isNotEmpty;
+          // ✅ อัพเดทประกาศ
+          _announcementDetail = newAnnouncement;
+          _hasAnnouncement = hasNewAnnouncement;
+          _isInitialDataLoaded = true;
         });
-
-        _checkTodayStatus();
+      } else {
+        // ถ้าไม่มี document ให้ตั้งค่าเริ่มต้น
+        if (mounted) {
+          setState(() {
+            _announcementDetail = '';
+            _hasAnnouncement = false;
+            _isInitialDataLoaded = true;
+          });
+        }
       }
+
+      _checkTodayStatus();
     }, onError: (error) {
       print('Error listening to check-in settings: $error');
+      if (mounted) {
+        setState(() {
+          _isInitialDataLoaded = true;
+        });
+      }
     });
   }
 
@@ -300,12 +326,11 @@ class _HomePageState extends State<HomePage>
           if (_userName.isEmpty) _userName = 'ผู้ใช้';
           _userEmail = user.email ?? '';
           _isAdmin = data['role'] == 'admin';
-          // ✅ ดึง missed_count จาก Firebase มาแสดงอย่างเดียว
           _missedCount = data['missed_count'] ?? 0;
           _isLoading = false;
         });
 
-        print('📊 ข้อมูลผู้ใช้: $_userName, missed: $_missedCount');
+        print('📊 User data: $_userName, missed: $_missedCount');
       }
     }, onError: (error) {
       print('Error listening to user data: $error');
@@ -346,9 +371,6 @@ class _HomePageState extends State<HomePage>
             .toList();
         _hasCheckedToday = _todayCheckIns.isNotEmpty;
       });
-
-      print(
-          '📝 อัพเดทเช็คชื่อวันนี้: ${_todayCheckIns.length} ครั้ง (internal use)');
     }, onError: (error) {
       print('Error listening to check-ins: $error');
     });
@@ -437,7 +459,7 @@ class _HomePageState extends State<HomePage>
     );
   }
 
-  // ตรวจสอบว่าเวลาปัจจุบันอยู่ในช่วงเวลาที่กำหนดหรือไม่ (สำหรับ UI)
+  // ตรวจสอบว่าเวลาปัจจุบันอยู่ในช่วงเวลาที่กำหนดหรือไม่
   bool _isWithinCheckInTime() {
     final now = DateTime.now();
     final currentTime = TimeOfDay.fromDateTime(now);
@@ -459,7 +481,6 @@ class _HomePageState extends State<HomePage>
     int startMinutes = startTime.hour * 60 + startTime.minute;
     int endMinutes = endTime.hour * 60 + endTime.minute;
 
-    // จัดการกรณีข้ามวัน
     if (endMinutes < startMinutes) {
       endMinutes += 24 * 60;
     }
@@ -470,16 +491,15 @@ class _HomePageState extends State<HomePage>
     return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
   }
 
-  // ตรวจสอบว่าสามารถเช็คชื่อได้หรือไม่ (สำหรับ UI)
+  // ตรวจสอบว่าสามารถเช็คชื่อได้หรือไม่
   bool _canCheckInToday() {
     if (_todayStatus == 'วันหยุด' || _todayStatus == 'วันงดเช็คชื่อ') {
       return false;
     }
-
     return _isWithinCheckInTime();
   }
 
-  // จัดรูปแบบเวลา (HH:MM)
+  // จัดรูปแบบเวลา
   String _formatTime(TimeOfDay time) {
     return '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
   }
@@ -499,13 +519,98 @@ class _HomePageState extends State<HomePage>
           if (_userName.isEmpty) _userName = 'ผู้ใช้';
           _userEmail = user.email ?? '';
           _isAdmin = data['role'] == 'admin';
-          // ✅ ดึง missed_count จาก Firebase
           _missedCount = data['missed_count'] ?? 0;
         });
-        print('📊 โหลดข้อมูลผู้ใช้: $_userName, missed: $_missedCount');
+        print('📊 Loaded user data: $_userName, missed: $_missedCount');
       }
     } catch (e) {
       print('Error loading user data: $e');
+    }
+  }
+
+  int _getRemainingMinutes() {
+    final now = DateTime.now();
+    final currentTime = TimeOfDay.fromDateTime(now);
+    int currentMinutes = currentTime.hour * 60 + currentTime.minute;
+
+    TimeOfDay endTime;
+    if (_todayStatus == 'ชั้นเรียนพิเศษ' &&
+        _todaySpecialStart != null &&
+        _todaySpecialEnd != null) {
+      endTime = _todaySpecialEnd!;
+    } else {
+      endTime = _checkInEnd;
+    }
+
+    int endMinutes = endTime.hour * 60 + endTime.minute;
+
+    if (endMinutes < _checkInStart.hour * 60 + _checkInStart.minute) {
+      endMinutes += 24 * 60;
+    }
+    if (currentMinutes < _checkInStart.hour * 60 + _checkInStart.minute) {
+      currentMinutes += 24 * 60;
+    }
+
+    return endMinutes - currentMinutes;
+  }
+
+  void _checkCheckInTime() {
+    final canCheckIn = _canCheckInToday();
+
+    if (_todayStatus == 'วันหยุด') {
+      _showHolidayAlert();
+    } else if (_todayStatus == 'วันงดเช็คชื่อ') {
+      _showDisabledDayAlert();
+    } else if (!_isWithinCheckInTime()) {
+      _showTimeAlert();
+    } else if (canCheckIn) {
+      Navigator.pushNamed(context, '/hat_2');
+    } else {
+      _showTimeAlert();
+    }
+  }
+
+  String _getCheckInTitle() {
+    switch (_todayStatus) {
+      case 'วันหยุด':
+        return 'วันหยุด';
+      case 'วันงดเช็คชื่อ':
+        return 'วันงดเช็คชื่อ';
+      default:
+        return 'เช็คชื่อเข้าแถว';
+    }
+  }
+
+  String _getCheckInDescription() {
+    switch (_todayStatus) {
+      case 'วันหยุด':
+        return 'วันนี้เป็นวันหยุด\nไม่มีกิจกรรมเช็คชื่อ';
+      case 'วันงดเช็คชื่อ':
+        return 'วันนี้เป็นวันงดเช็คชื่อ\nไม่มีกิจกรรมเช็คชื่อ';
+      default:
+        return 'ใช้ระบบจดจำใบหน้าเพื่อเช็คชื่อ\nรวดเร็ว ปลอดภัย แม่นยำ';
+    }
+  }
+
+  IconData _getCheckInIcon() {
+    switch (_todayStatus) {
+      case 'วันหยุด':
+        return Icons.beach_access_rounded;
+      case 'วันงดเช็คชื่อ':
+        return Icons.event_busy_rounded;
+      default:
+        return Icons.camera_alt_rounded;
+    }
+  }
+
+  String _getCheckInButtonText() {
+    switch (_todayStatus) {
+      case 'วันหยุด':
+        return 'วันหยุด';
+      case 'วันงดเช็คชื่อ':
+        return 'งดเช็คชื่อ';
+      default:
+        return 'เช็คชื่อ';
     }
   }
 
@@ -652,33 +757,25 @@ class _HomePageState extends State<HomePage>
           SingleChildScrollView(
             controller: _scrollController,
             padding: const EdgeInsets.all(20),
-            child: FadeTransition(
-              opacity: _fadeAnimation,
-              child: Column(
-                children: [
-                  // ✅ เพิ่มประกาศประชาสัมพันธ์ (แสดงด้านบนสุด)
-                  if (_hasAnnouncement)
-                    SlideTransition(
-                      position: _slideAnimation,
-                      child: _buildAnnouncementBanner(),
-                    ),
-                  if (_hasAnnouncement) const SizedBox(height: 20),
-                  SlideTransition(
-                    position: _slideAnimation,
-                    child: _buildWelcomeCard(),
-                  ),
-                  const SizedBox(height: 25),
-                  SlideTransition(
-                    position: _slideAnimation,
-                    child: _buildCheckInSection(),
-                  ),
-                  const SizedBox(height: 25),
-                  SlideTransition(
-                    position: _slideAnimation,
-                    child: _buildTimeAndStatus(),
-                  ),
-                ],
-              ),
+            child: Column(
+              children: [
+                // ✅ แสดงประกาศประชาสัมพันธ์ (ปรับปรุงให้แสดงบน iOS)
+                if (_hasAnnouncement && _announcementDetail.isNotEmpty)
+                  _buildAnnouncementBanner(),
+                if (_hasAnnouncement && _announcementDetail.isNotEmpty)
+                  const SizedBox(height: 20),
+                
+                // Welcome Card
+                _buildWelcomeCard(),
+                const SizedBox(height: 25),
+                
+                // Check-in Section
+                _buildCheckInSection(),
+                const SizedBox(height: 25),
+                
+                // Time and Status
+                _buildTimeAndStatus(),
+              ],
             ),
           ),
         ],
@@ -686,19 +783,18 @@ class _HomePageState extends State<HomePage>
     );
   }
 
-  // ✅ สร้าง Widget สำหรับแสดงป้ายประกาศประชาสัมพันธ์
+  // ✅ ปรับปรุง Widget แสดงป้ายประกาศให้ทำงานบน iOS
   Widget _buildAnnouncementBanner() {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        gradient: LinearGradient(
+        gradient: const LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
           colors: [
-            const Color(0xFFFF9800),
-            const Color(0xFFFF6B00),
-            const Color(0xFFFF9800).withOpacity(0.9),
+            Color(0xFFFF9800),
+            Color(0xFFFF6B00),
           ],
         ),
         borderRadius: BorderRadius.circular(20),
@@ -707,7 +803,6 @@ class _HomePageState extends State<HomePage>
             color: Colors.orange.withOpacity(0.3),
             blurRadius: 15,
             offset: const Offset(0, 5),
-            spreadRadius: 0,
           ),
         ],
         border: Border.all(
@@ -752,15 +847,14 @@ class _HomePageState extends State<HomePage>
                     color: Colors.white,
                     height: 1.4,
                   ),
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ],
             ),
           ),
           GestureDetector(
-            onTap: () {
-              // กดเพื่อดูรายละเอียดเพิ่มเติม (สามารถปรับแต่งได้)
-              _showAnnouncementDetailDialog();
-            },
+            onTap: () => _showAnnouncementDetailDialog(),
             child: Container(
               padding: const EdgeInsets.all(6),
               decoration: BoxDecoration(
@@ -791,12 +885,12 @@ class _HomePageState extends State<HomePage>
           child: Container(
             padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
-              gradient: LinearGradient(
+              gradient: const LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
                 colors: [
                   Colors.white,
-                  const Color(0xFFFFF3E0),
+                  Color(0xFFFFF3E0),
                 ],
               ),
               borderRadius: BorderRadius.circular(25),
@@ -840,14 +934,16 @@ class _HomePageState extends State<HomePage>
                       color: Colors.orange.withOpacity(0.2),
                     ),
                   ),
-                  child: Text(
-                    _announcementDetail,
-                    style: const TextStyle(
-                      fontSize: 16,
-                      color: Colors.black87,
-                      height: 1.5,
+                  child: SingleChildScrollView(
+                    child: Text(
+                      _announcementDetail,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        color: Colors.black87,
+                        height: 1.5,
+                      ),
+                      textAlign: TextAlign.center,
                     ),
-                    textAlign: TextAlign.center,
                   ),
                 ),
                 const SizedBox(height: 24),
@@ -880,8 +976,6 @@ class _HomePageState extends State<HomePage>
       },
     );
   }
-
-  // ================ UI Components ================
 
   Widget _buildWelcomeCard() {
     Color statusColor;
@@ -982,7 +1076,6 @@ class _HomePageState extends State<HomePage>
           ),
           const SizedBox(height: 20),
 
-          // Status Badge
           Container(
             margin: const EdgeInsets.only(bottom: 15),
             padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
@@ -1051,8 +1144,7 @@ class _HomePageState extends State<HomePage>
                       border: Border.all(color: Colors.white.withOpacity(0.2)),
                     ),
                     child: Text(
-                      _todayStatus == 'วันหยุด' ||
-                              _todayStatus == 'วันงดเช็คชื่อ'
+                      _todayStatus == 'วันหยุด' || _todayStatus == 'วันงดเช็คชื่อ'
                           ? 'วันนี้ไม่มีเช็คชื่อ'
                           : _todayStatus == 'ชั้นเรียนพิเศษ'
                               ? '${_formatTime(_todaySpecialStart!)} - ${_formatTime(_todaySpecialEnd!)} น.'
@@ -1070,7 +1162,6 @@ class _HomePageState extends State<HomePage>
             ),
           ),
 
-          // ✅ แสดงจำนวน Missed (ดึงมาจาก Firebase)
           Container(
             margin: const EdgeInsets.only(top: 12),
             padding: const EdgeInsets.all(16),
@@ -1401,8 +1492,7 @@ class _HomePageState extends State<HomePage>
             decoration: BoxDecoration(
               color: statusColor.withOpacity(0.05),
               borderRadius: BorderRadius.circular(18),
-              border:
-                  Border.all(color: statusColor.withOpacity(0.2), width: 1.5),
+              border: Border.all(color: statusColor.withOpacity(0.2), width: 1.5),
             ),
             child: Column(
               children: [
@@ -1474,9 +1564,8 @@ class _HomePageState extends State<HomePage>
                     ),
                   ],
                 ),
-                if (_todayStatus == 'ชั้นเรียนพิเศษ')
+                if (_todayStatus == 'ชั้นเรียนพิเศษ') ...[
                   const SizedBox(height: 12),
-                if (_todayStatus == 'ชั้นเรียนพิเศษ')
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -1494,42 +1583,7 @@ class _HomePageState extends State<HomePage>
                       ),
                     ],
                   ),
-
-                // แสดงเตือนถ้ายังไม่ได้เช็คชื่อและใกล้หมดเวลา
-                if (_todayStatus != 'วันหยุด' &&
-                    _todayStatus != 'วันงดเช็คชื่อ' &&
-                    _todayCheckIns.isEmpty &&
-                    _isWithinCheckInTime() &&
-                    _getRemainingMinutes() < 30 &&
-                    _getRemainingMinutes() > 0)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 12),
-                    child: Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: Colors.orange.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(8),
-                        border:
-                            Border.all(color: Colors.orange.withOpacity(0.3)),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(Icons.timer, color: Colors.orange, size: 16),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              'เหลือเวลาเช็คชื่ออีก ${_getRemainingMinutes()} นาที',
-                              style: const TextStyle(
-                                color: Colors.orange,
-                                fontWeight: FontWeight.w500,
-                                fontSize: 13,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
+                ],
               ],
             ),
           ),
@@ -1567,92 +1621,6 @@ class _HomePageState extends State<HomePage>
         ],
       ),
     );
-  }
-
-  int _getRemainingMinutes() {
-    final now = DateTime.now();
-    final currentTime = TimeOfDay.fromDateTime(now);
-    int currentMinutes = currentTime.hour * 60 + currentTime.minute;
-
-    TimeOfDay endTime;
-    if (_todayStatus == 'ชั้นเรียนพิเศษ' &&
-        _todaySpecialStart != null &&
-        _todaySpecialEnd != null) {
-      endTime = _todaySpecialEnd!;
-    } else {
-      endTime = _checkInEnd;
-    }
-
-    int endMinutes = endTime.hour * 60 + endTime.minute;
-
-    if (endMinutes < _checkInStart.hour * 60 + _checkInStart.minute) {
-      endMinutes += 24 * 60;
-    }
-    if (currentMinutes < _checkInStart.hour * 60 + _checkInStart.minute) {
-      currentMinutes += 24 * 60;
-    }
-
-    return endMinutes - currentMinutes;
-  }
-
-  void _checkCheckInTime() {
-    final canCheckIn = _canCheckInToday();
-
-    if (_todayStatus == 'วันหยุด') {
-      _showHolidayAlert();
-    } else if (_todayStatus == 'วันงดเช็คชื่อ') {
-      _showDisabledDayAlert();
-    } else if (!_isWithinCheckInTime()) {
-      _showTimeAlert();
-    } else if (canCheckIn) {
-      Navigator.pushNamed(context, '/hat_2');
-    } else {
-      _showTimeAlert();
-    }
-  }
-
-  String _getCheckInTitle() {
-    switch (_todayStatus) {
-      case 'วันหยุด':
-        return 'วันหยุด';
-      case 'วันงดเช็คชื่อ':
-        return 'วันงดเช็คชื่อ';
-      default:
-        return 'เช็คชื่อเข้าแถว';
-    }
-  }
-
-  String _getCheckInDescription() {
-    switch (_todayStatus) {
-      case 'วันหยุด':
-        return 'วันนี้เป็นวันหยุด\nไม่มีกิจกรรมเช็คชื่อ';
-      case 'วันงดเช็คชื่อ':
-        return 'วันนี้เป็นวันงดเช็คชื่อ\nไม่มีกิจกรรมเช็คชื่อ';
-      default:
-        return 'ใช้ระบบจดจำใบหน้าเพื่อเช็คชื่อ\nรวดเร็ว ปลอดภัย แม่นยำ';
-    }
-  }
-
-  IconData _getCheckInIcon() {
-    switch (_todayStatus) {
-      case 'วันหยุด':
-        return Icons.beach_access_rounded;
-      case 'วันงดเช็คชื่อ':
-        return Icons.event_busy_rounded;
-      default:
-        return Icons.camera_alt_rounded;
-    }
-  }
-
-  String _getCheckInButtonText() {
-    switch (_todayStatus) {
-      case 'วันหยุด':
-        return 'วันหยุด';
-      case 'วันงดเช็คชื่อ':
-        return 'งดเช็คชื่อ';
-      default:
-        return 'เช็คชื่อ';
-    }
   }
 
   void _showHolidayAlert() {
