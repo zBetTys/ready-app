@@ -1645,7 +1645,7 @@ class _CapturePageState extends State<CapturePage>
                 const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20),
             onPressed: () {
               _detectionTimer?.cancel();
-              _iosRetryTimer?.cancel();
+              
               // เปลี่ยนจาก Navigator.pop(context) เป็นไปที่ HatPage
               Navigator.pushReplacement(
                 context,
