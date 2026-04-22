@@ -1439,6 +1439,51 @@ void _startIOSImageStream() {
     return ((similarity + 1) / 2).clamp(0.0, 1.0);
   }
 
+  // ✅ NEW: Update exit status to true
+  Future<void> _updateExitStatus() async {
+    try {
+      if (_targetUserId == null || _targetUserId!.isEmpty) {
+        _addDebugLog('⚠️ ไม่สามารถอัปเดต exit: targetUserId เป็น null');
+        return;
+      }
+
+      _addDebugLog('🔄 กำลังอัปเดต exit = true สำหรับผู้ใช้: $_targetUserId');
+      
+      final userRef = _firestore.collection('users').doc(_targetUserId);
+      
+      // ใช้ set พร้อม merge: true เพื่ออัปเดตเฉพาะฟิลด์ exit
+      await userRef.set({
+        'exit': true,
+        'exit_timestamp': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      
+      _addDebugLog('✅ อัปเดต exit = true สำเร็จ');
+      
+      // ตรวจสอบการอัปเดต
+      final verifyDoc = await userRef.get();
+      if (verifyDoc.exists) {
+        final exitValue = verifyDoc.data()?['exit'];
+        _addDebugLog('📊 ยืนยัน exit status: $exitValue');
+      }
+      
+    } catch (e) {
+      _addDebugLog('❌ Error updating exit status: $e');
+      
+      // Fallback: พยายามอัปเดตอีกครั้งด้วย update
+      try {
+        _addDebugLog('🔄 พยายามอัปเดต exit อีกครั้ง (fallback)...');
+        await _firestore.collection('users').doc(_targetUserId).update({
+          'exit': true,
+          'exit_timestamp': FieldValue.serverTimestamp(),
+        });
+        _addDebugLog('✅ Fallback อัปเดตสำเร็จ');
+      } catch (fallbackError) {
+        _addDebugLog('❌ Fallback error: $fallbackError');
+        // ไม่ throw เพื่อไม่ให้กระทบการทำงานหลัก
+      }
+    }
+  }
+
   Future<void> _handleMatchSuccess(String? profileId, double score) async {
     setState(() {
       _matchSuccess = true;
@@ -1450,7 +1495,11 @@ void _startIOSImageStream() {
     _showSuccessAnimation = true;
     _successController.forward();
 
+    // ✅ บันทึกข้อมูล checkin
     await _saveCheckinRecord(score, profileId);
+    
+    // ✅ 🔥 NEW: อัปเดตสถานะ exit เป็น true
+    await _updateExitStatus();
 
     await Future.delayed(const Duration(seconds: 3));
 
