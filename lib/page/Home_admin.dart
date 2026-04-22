@@ -786,8 +786,8 @@ class _HomeAdminPageState extends State<HomeAdminPage>
             Expanded(
               child: _buildMenuCard(
                 icon: Icons.trending_up_rounded,
-                title: 'อัพเกรดชั้นเรียน',
-                subtitle: 'เลื่อนชั้นนักศึกษา ปวช และ ปวส',
+                title: 'อัพเดทสถานะนักศึกษา',
+                subtitle: 'เลื่อนชั้นนักศึกษา ปวช และ ปวส อัพเดทสถานะข้อมูล',
                 color: Colors.purple,
                 gradientColors: [
                   Colors.purple.shade400,
