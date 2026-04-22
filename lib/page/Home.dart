@@ -34,6 +34,10 @@ class _HomePageState extends State<HomePage>
   // ✅ ตัวแปรสำหรับนับ Missed (ดึงมาจาก Firebase อย่างเดียว)
   int _missedCount = 0;
 
+  // ✅ ตัวแปรสำหรับประกาศประชาสัมพันธ์
+  String _announcementDetail = '';
+  bool _hasAnnouncement = false;
+
   // ตัวแปรสำหรับวันหยุดและชั้นเรียนพิเศษ
   List<Map<String, dynamic>> _holidays = [];
   List<Map<String, dynamic>> _specialClasses = [];
@@ -138,6 +142,8 @@ class _HomePageState extends State<HomePage>
       _missedCount = 0; // ✅ เคลียร์ missed count
       _todayCheckIns = [];
       _hasCheckedToday = false;
+      _announcementDetail = '';
+      _hasAnnouncement = false;
     });
   }
 
@@ -194,6 +200,10 @@ class _HomePageState extends State<HomePage>
               _disabledDays[i] = disabledDaysData[i] == true;
             }
           }
+
+          // ✅ ดึงข้อความประกาศประชาสัมพันธ์
+          _announcementDetail = data['announcementDetail'] ?? '';
+          _hasAnnouncement = _announcementDetail.isNotEmpty;
         });
 
         _checkTodayStatus();
@@ -646,6 +656,13 @@ class _HomePageState extends State<HomePage>
               opacity: _fadeAnimation,
               child: Column(
                 children: [
+                  // ✅ เพิ่มประกาศประชาสัมพันธ์ (แสดงด้านบนสุด)
+                  if (_hasAnnouncement)
+                    SlideTransition(
+                      position: _slideAnimation,
+                      child: _buildAnnouncementBanner(),
+                    ),
+                  if (_hasAnnouncement) const SizedBox(height: 20),
                   SlideTransition(
                     position: _slideAnimation,
                     child: _buildWelcomeCard(),
@@ -660,13 +677,207 @@ class _HomePageState extends State<HomePage>
                     position: _slideAnimation,
                     child: _buildTimeAndStatus(),
                   ),
-                  // ❌ ลบส่วน _buildCheckInHistory() ออก
                 ],
               ),
             ),
           ),
         ],
       ),
+    );
+  }
+
+  // ✅ สร้าง Widget สำหรับแสดงป้ายประกาศประชาสัมพันธ์
+  Widget _buildAnnouncementBanner() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            const Color(0xFFFF9800),
+            const Color(0xFFFF6B00),
+            const Color(0xFFFF9800).withOpacity(0.9),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.orange.withOpacity(0.3),
+            blurRadius: 15,
+            offset: const Offset(0, 5),
+            spreadRadius: 0,
+          ),
+        ],
+        border: Border.all(
+          color: Colors.white.withOpacity(0.3),
+          width: 1.5,
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.2),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(
+              Icons.campaign_rounded,
+              color: Colors.white,
+              size: 24,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '📢 ประกาศประชาสัมพันธ์',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  _announcementDetail,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    color: Colors.white,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          GestureDetector(
+            onTap: () {
+              // กดเพื่อดูรายละเอียดเพิ่มเติม (สามารถปรับแต่งได้)
+              _showAnnouncementDetailDialog();
+            },
+            child: Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.2),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.fullscreen_rounded,
+                color: Colors.white,
+                size: 18,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ✅ แสดง dialog รายละเอียดประกาศ
+  void _showAnnouncementDetailDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return Dialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(25),
+          ),
+          child: Container(
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Colors.white,
+                  const Color(0xFFFFF3E0),
+                ],
+              ),
+              borderRadius: BorderRadius.circular(25),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 60,
+                  height: 60,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFF3E0),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: Colors.orange.withOpacity(0.3),
+                      width: 2,
+                    ),
+                  ),
+                  child: const Icon(
+                    Icons.campaign_rounded,
+                    color: Color(0xFFFF9800),
+                    size: 30,
+                  ),
+                ),
+                const SizedBox(height: 20),
+                const Text(
+                  'ประกาศประชาสัมพันธ์',
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF6A1B9A),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFF8E1),
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(
+                      color: Colors.orange.withOpacity(0.2),
+                    ),
+                  ),
+                  child: Text(
+                    _announcementDetail,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      color: Colors.black87,
+                      height: 1.5,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF6A1B9A),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(15),
+                      ),
+                      elevation: 5,
+                    ),
+                    child: const Text(
+                      'ปิด',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -1283,7 +1494,6 @@ class _HomePageState extends State<HomePage>
                       ),
                     ],
                   ),
-                // ❌ ลบส่วนที่แสดง _todayCheckIns ออก
 
                 // แสดงเตือนถ้ายังไม่ได้เช็คชื่อและใกล้หมดเวลา
                 if (_todayStatus != 'วันหยุด' &&
@@ -1384,8 +1594,6 @@ class _HomePageState extends State<HomePage>
 
     return endMinutes - currentMinutes;
   }
-
-  // ❌ ลบฟังก์ชัน _buildCheckInHistory() ทั้งหมด
 
   void _checkCheckInTime() {
     final canCheckIn = _canCheckInToday();
