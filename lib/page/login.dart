@@ -34,9 +34,6 @@ class _LoginPageState extends State<LoginPage>
   /// แสดง/ซ่อนรหัสผ่าน (true = ซ่อน, false = แสดง)
   bool _obscurePassword = true;
 
-  /// จดจำการเข้าสู่ระบบ (true = จดจำ, false = ไม่จดจำ)
-  bool _rememberMe = false;
-
   /// กำลังทำการล็อกอินอัตโนมัติ (ใช้สำหรับตอนเปิดแอปครั้งแรก)
   bool _autoLoginInProgress = false;
 
@@ -99,80 +96,32 @@ class _LoginPageState extends State<LoginPage>
     _animationController.forward();
   }
 
-  /// โหลดข้อความประกาศจาก Firestore (ปรับปรุงสำหรับ iOS)
+  /// โหลดข้อความประกาศจาก Firestore
   Future<void> _loadAnnouncement() async {
     try {
-      print('📢 เริ่มโหลดข้อความประกาศ...');
-      
-      // สำหรับ iOS: ใช้ get(source: Source.server) เพื่อดึงข้อมูลสดจาก Server
       final doc = await _firestore
           .collection('system_settings')
           .doc('checkin_time')
-          .get(const GetOptions(source: Source.server));
-      
-      // ถ้าไม่ได้ข้อมูลจาก server ให้ลองดึงจาก cache
-      // if (!doc.exists) {
-      //   final cachedDoc = await _firestore
-      //       .collection('system_settings')
-      //       .doc('checkin_time')
-      //       .get(const GetOptions(source: Source.cache));
-      //   if (cachedDoc.exists) {
-      //     doc = cachedDoc;
-      //   }
-      // }
+          .get();
 
       if (doc.exists) {
         final data = doc.data();
         final announcement = data?['announcementDetail'] ?? '';
-        
-        print('📢 ข้อมูลที่ได้จาก Firestore:');
-        print('   - มีข้อมูล: ${doc.exists}');
-        print('   - announcementDetail: ${announcement.isNotEmpty ? announcement : '(ว่างเปล่า)'}');
-        
-        // ตรวจสอบฟิลด์อื่นๆ เพื่อ debug
-        print('   - ฟิลด์ทั้งหมด: ${data?.keys.join(', ')}');
-        
+
         setState(() {
           _announcementText = announcement;
           _isLoadingAnnouncement = false;
         });
 
-        if (announcement.isNotEmpty) {
-          print('📢 ✅ โหลดข้อความประกาศสำเร็จ: "$announcement"');
-        } else {
-          print('📢 ⚠️ ไม่มีข้อความประกาศใน Firestore');
-        }
+        print(
+            '📢 โหลดข้อความประกาศ: ${announcement.isNotEmpty ? announcement : 'ไม่มีประกาศ'}');
       } else {
-        print('📢 ❌ ไม่พบเอกสาร checkin_time ใน system_settings');
         setState(() {
           _isLoadingAnnouncement = false;
         });
       }
     } catch (e) {
-      print('📢 ❌ Error loading announcement: $e');
-      
-      // ลองโหลดจาก cache อีกครั้ง
-      try {
-        print('📢 🔄 ลองโหลดจาก cache...');
-        final cachedDoc = await _firestore
-            .collection('system_settings')
-            .doc('checkin_time')
-            .get(const GetOptions(source: Source.cache));
-        
-        if (cachedDoc.exists) {
-          final data = cachedDoc.data();
-          final announcement = data?['announcementDetail'] ?? '';
-          print('📢 ✅ โหลดจาก cache สำเร็จ: "$announcement"');
-          setState(() {
-            _announcementText = announcement;
-            _isLoadingAnnouncement = false;
-          });
-          return;
-        }
-      } catch (cacheError) {
-        print('📢 ❌ โหลดจาก cache ก็ไม่ได้: $cacheError');
-      }
-      
+      print('❌ Error loading announcement: $e');
       setState(() {
         _isLoadingAnnouncement = false;
       });
@@ -195,18 +144,15 @@ class _LoginPageState extends State<LoginPage>
     try {
       // อ่านข้อมูลจาก SharedPreferences (หน่วยความจำของเครื่อง)
       final prefs = await SharedPreferences.getInstance();
-      final savedRememberMe =
-          prefs.getBool('remember_me') ?? false; // ค่าจดจำหรือไม่
       final savedEmail = prefs.getString('saved_email'); // อีเมลที่บันทึก
       final savedPassword =
           prefs.getString('saved_password'); // รหัสผ่านที่บันทึก
 
-      // ถ้ามีการจดจำ และมีอีเมล+รหัสผ่าน ให้ทำการล็อกอินอัตโนมัติ
-      if (savedRememberMe && savedEmail != null && savedPassword != null) {
+      // ถ้ามีอีเมลและรหัสผ่าน ให้ทำการล็อกอินอัตโนมัติ
+      if (savedEmail != null && savedPassword != null) {
         setState(() {
           _emailController.text = savedEmail; // ใส่ข้อมูลลงในช่อง
           _passwordController.text = savedPassword;
-          _rememberMe = true; // เปลี่ยนสถานะจดจำ
           _autoLoginInProgress = true; // เริ่มกระบวนการล็อกอินอัตโนมัติ
         });
 
@@ -573,12 +519,8 @@ class _LoginPageState extends State<LoginPage>
 
       final user = userCredential.user!; // ดึงข้อมูลผู้ใช้
 
-      // บันทึกข้อมูลถ้าเลือก Remember Me
-      if (_rememberMe) {
-        await _saveCredentials(email, password);
-      } else {
-        await _clearSavedCredentials();
-      }
+      // บันทึกข้อมูลอัตโนมัติเสมอ (ลบเงื่อนไข _rememberMe)
+      await _saveCredentials(email, password);
 
       // ตรวจสอบและนำทางตาม collection (users, user_personal, user_Personnel)
       await _checkCollectionAndNavigate(user.uid, email, false);
@@ -780,11 +722,10 @@ class _LoginPageState extends State<LoginPage>
 
   // ==================== ระบบบันทึกข้อมูลล็อกอิน (SharedPreferences) ====================
 
-  /// บันทึกข้อมูลล็อกอิน (อีเมลและรหัสผ่าน) ลงในเครื่อง
+  /// บันทึกข้อมูลล็อกอิน (อีเมลและรหัสผ่าน) ลงในเครื่อง (บันทึกอัตโนมัติเสมอ)
   Future<void> _saveCredentials(String email, String password) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool('remember_me', true); // บันทึกว่าจดจำ
       await prefs.setString('saved_email', email); // บันทึกอีเมล
       await prefs.setString('saved_password', password); // บันทึกรหัสผ่าน
     } catch (e) {
@@ -796,7 +737,6 @@ class _LoginPageState extends State<LoginPage>
   Future<void> _clearSavedCredentials() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool('remember_me', false); // ยกเลิกการจดจำ
       await prefs.remove('saved_email'); // ลบอีเมล
       await prefs.remove('saved_password'); // ลบรหัสผ่าน
     } catch (e) {
@@ -1176,8 +1116,9 @@ class _LoginPageState extends State<LoginPage>
 
                       const SizedBox(height: 40),
 
-                      // ========== 🆕 ป้ายประกาศ (Announcement Banner) - ปรับปรุงสำหรับ iOS ==========
-                      if (!_isLoadingAnnouncement && _announcementText.isNotEmpty)
+                      // ========== 🆕 ป้ายประกาศ (Announcement Banner) ==========
+                      if (!_isLoadingAnnouncement &&
+                          _announcementText.isNotEmpty)
                         FadeTransition(
                           opacity: _fadeAnimation,
                           child: Container(
@@ -1186,20 +1127,20 @@ class _LoginPageState extends State<LoginPage>
                             decoration: BoxDecoration(
                               gradient: LinearGradient(
                                 colors: [
-                                  Colors.blue.withOpacity(0.15),
-                                  Colors.blue.withOpacity(0.08),
+                                  Colors.orange.withOpacity(0.15),
+                                  Colors.orange.withOpacity(0.08),
                                 ],
                                 begin: Alignment.topLeft,
                                 end: Alignment.bottomRight,
                               ),
                               borderRadius: BorderRadius.circular(16),
                               border: Border.all(
-                                color: Colors.blue.withOpacity(0.5),
+                                color: Colors.orange.withOpacity(0.5),
                                 width: 1.5,
                               ),
                               boxShadow: [
                                 BoxShadow(
-                                  color: Colors.blue.withOpacity(0.1),
+                                  color: Colors.orange.withOpacity(0.1),
                                   blurRadius: 8,
                                   offset: const Offset(0, 2),
                                 ),
@@ -1211,12 +1152,12 @@ class _LoginPageState extends State<LoginPage>
                                 Container(
                                   padding: const EdgeInsets.all(8),
                                   decoration: BoxDecoration(
-                                    color: Colors.blue.withOpacity(0.2),
+                                    color: Colors.orange.withOpacity(0.2),
                                     borderRadius: BorderRadius.circular(12),
                                   ),
                                   child: Icon(
                                     Icons.campaign_rounded,
-                                    color: Colors.blue.shade700,
+                                    color: Colors.orange.shade700,
                                     size: 24,
                                   ),
                                 ),
@@ -1231,7 +1172,7 @@ class _LoginPageState extends State<LoginPage>
                                         style: TextStyle(
                                           fontSize: 14,
                                           fontWeight: FontWeight.bold,
-                                          color: Colors.blue.shade800,
+                                          color: Colors.orange.shade800,
                                         ),
                                       ),
                                       const SizedBox(height: 4),
@@ -1248,33 +1189,6 @@ class _LoginPageState extends State<LoginPage>
                                 ),
                               ],
                             ),
-                          ),
-                        ),
-
-                      // ถ้ายังโหลดประกาศอยู่ให้แสดงตัวโหลดเล็กๆ
-                      if (_isLoadingAnnouncement)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 20),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: _primaryColor,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                "กำลังโหลดประกาศ...",
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.grey.shade500,
-                                ),
-                              ),
-                            ],
                           ),
                         ),
 
@@ -1499,56 +1413,6 @@ class _LoginPageState extends State<LoginPage>
                                       ),
                                     ),
 
-                                    // Remember Me (จดจำรหัสผ่าน)
-                                    const SizedBox(height: 15),
-                                    Row(
-                                      children: [
-                                        Container(
-                                          width: 24,
-                                          height: 24,
-                                          decoration: BoxDecoration(
-                                            color: _rememberMe
-                                                ? _primaryColor
-                                                : Colors.white,
-                                            borderRadius:
-                                                BorderRadius.circular(6),
-                                            border: Border.all(
-                                              color: _rememberMe
-                                                  ? _primaryColor
-                                                  : Colors.grey[400]!,
-                                              width: 2,
-                                            ),
-                                          ),
-                                          child: Checkbox(
-                                            value: _rememberMe,
-                                            onChanged: (value) {
-                                              setState(() {
-                                                _rememberMe = value ?? false;
-                                              });
-                                            },
-                                            activeColor: Colors.transparent,
-                                            checkColor: Colors.white,
-                                            fillColor:
-                                                MaterialStateProperty.all(
-                                              Colors.transparent,
-                                            ),
-                                            shape: RoundedRectangleBorder(
-                                              borderRadius:
-                                                  BorderRadius.circular(4),
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 10),
-                                        Text(
-                                          "จดจำรหัสผ่าน",
-                                          style: TextStyle(
-                                            color: _primaryColor,
-                                            fontSize: 14,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-
                                     const SizedBox(height: 20),
 
                                     // ปุ่มเข้าสู่ระบบ
@@ -1635,67 +1499,6 @@ class _LoginPageState extends State<LoginPage>
                       ),
 
                       const SizedBox(height: 30),
-                      const SizedBox(height: 20),
-
-                      // ========== ลิงก์สมัครสมาชิก ==========
-                      FadeTransition(
-                        opacity: _fadeAnimation,
-                        child: Container(
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: _primaryColor.withOpacity(0.2),
-                            ),
-                          ),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Text(
-                                "ยังไม่มีบัญชี? ",
-                                style: TextStyle(
-                                  color: Colors.grey.shade600,
-                                  fontSize: 14,
-                                ),
-                              ),
-                              GestureDetector(
-                                onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => const RegisterPage(),
-                                    ),
-                                  );
-                                },
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 16,
-                                    vertical: 6,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: _primaryColor.withOpacity(0.1),
-                                    borderRadius: BorderRadius.circular(20),
-                                    border: Border.all(
-                                      color: _primaryColor.withOpacity(0.3),
-                                    ),
-                                  ),
-                                  child: Text(
-                                    "สมัครสมาชิก",
-                                    style: TextStyle(
-                                      color: _primaryColor,
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 14,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-
-                      const SizedBox(height: 15),
 
                       // ========== ลิงก์ลืมรหัสผ่าน ==========
                       FadeTransition(
