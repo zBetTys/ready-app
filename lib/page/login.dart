@@ -1250,7 +1250,7 @@ class _LoginPageState extends State<LoginPage>
                                     ),
                                     const SizedBox(height: 4),
                                     Text(
-                                      "ใช้อีเมลส่วนตัวของนักศึกษา",
+                                      "ใช้อีเมลวิทยาลัยของนักศึกษา",
                                       style: TextStyle(
                                         fontSize: 13,
                                         color: Colors.grey.shade700,
@@ -1267,7 +1267,7 @@ class _LoginPageState extends State<LoginPage>
                                         borderRadius: BorderRadius.circular(12),
                                       ),
                                       child: Text(
-                                        "รหัสผ่านเริ่มต้น: 12345678",
+                                        "รหัสผ่านเริ่มต้น: หมายเลขบัตรประชาชนของนักศึกษา",
                                         style: TextStyle(
                                           fontSize: 13,
                                           fontWeight: FontWeight.bold,
